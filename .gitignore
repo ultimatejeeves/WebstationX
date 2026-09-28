@@ -1,0 +1,12 @@
+node_modules/
+dist/
+work/
+.env
+data/
+library/*/*.chd
+library/*/*.bin
+library/*/*.cue
+Games/
+bios/*.BIN
+bios/*.bin
+*.log

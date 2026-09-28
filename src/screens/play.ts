@@ -1,0 +1,493 @@
+/**
+ * Play screen: loads the disc (from cache when possible), runs the emulator, and hosts the
+ * pause menu. On quit it suspends the game (save state + memory card) so "Continue" works.
+ */
+import { api } from '../core/api';
+import { app, type Screen } from '../core/app';
+import { clear, fmtWhen, h, icon } from '../core/dom';
+import { deviceLabel, input } from '../core/input';
+import { sfx } from '../core/sfx';
+import { store } from '../core/store';
+import type { GameMeta, NavEvent, SaveSummary } from '../core/types';
+import { fetchCached } from '../emu/disc-cache';
+import { keymapHints } from '../emu/keymap';
+import { EmuSession, type SessionPlayers } from '../emu/player';
+import { openKeybindDialog } from '../ui/keybind-dialog';
+import { button, confirmDialog, Dialog } from '../ui/components';
+import { openSettings } from './settings';
+
+const MEMCARD_FLUSH_MS = 30_000;
+const MAX_SAVES = 8;
+
+export class PlayScreen implements Screen {
+  name = 'play';
+  el: HTMLElement;
+  private game: GameMeta;
+  private players: SessionPlayers;
+  private resumeSlot: string | null;
+  private onQuit: () => void;
+  private onChangePlayers: () => void;
+  private onRelaunch: () => void;
+  private session: EmuSession;
+  private canvasWrap: HTMLElement;
+  private canvas: HTMLCanvasElement;
+  private loader: HTMLElement;
+  private loaderBar: HTMLElement;
+  private loaderText: HTMLElement;
+  private menu: Dialog | null = null;
+  private flushTimer = 0;
+  private lastMemcardHash = '';
+  private quitting = false;
+  private ready = false;
+  private log: string[] = [];
+  private unsubs: (() => void)[] = [];
+
+  constructor(
+    game: GameMeta,
+    players: SessionPlayers,
+    resumeSlot: string | null,
+    onQuit: () => void,
+    onChangePlayers: () => void,
+    onRelaunch: () => void,
+  ) {
+    this.game = game;
+    this.players = players;
+    this.resumeSlot = resumeSlot;
+    this.onQuit = onQuit;
+    this.onChangePlayers = onChangePlayers;
+    this.onRelaunch = onRelaunch;
+    this.session = new EmuSession(game, (l) => this.pushLog(l));
+    this.canvas = h('canvas.game-canvas', { tabindex: 0 }) as HTMLCanvasElement;
+    this.canvasWrap = h('div.canvas-wrap', this.canvas, h('div.crt-overlay'));
+    this.loaderBar = h('div.loader-bar', h('div.loader-fill'));
+    this.loaderText = h('div.loader-text', 'Preparing');
+    this.loader = h(
+      'div.loader',
+      h('div.loader-disc', h('img', { src: '/assets/hero-disc.png', alt: '' })),
+      h(
+        'div.loader-panel',
+        game.coverUrl ? h('img.loader-cover', { src: game.coverUrl, alt: '' }) : null,
+        h('div.loader-title', game.title),
+        h(
+          'div.loader-players',
+          players.map((p, i) => (p ? h(`span.pill.p${i + 1}`, `P${i + 1} · ${deviceLabel(p)}`) : null)),
+        ),
+        this.loaderBar,
+        this.loaderText,
+      ),
+    );
+    this.el = h('div.play', h('div.bg-play'), this.canvasWrap, this.loader);
+  }
+
+  async mount() {
+    this.applyPictureSettings();
+    this.unsubs.push(store.subscribe(() => this.applyPictureSettings()));
+    window.addEventListener('resize', this.fitCanvas);
+    document.addEventListener('visibilitychange', this.onVisibility);
+    window.addEventListener('beforeunload', this.onBeforeUnload);
+    this.fitCanvas();
+    try {
+      await this.load();
+    } catch (err) {
+      console.error(err);
+      this.fail(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  unmount() {
+    this.quitting = true;
+    clearInterval(this.flushTimer);
+    window.removeEventListener('resize', this.fitCanvas);
+    document.removeEventListener('visibilitychange', this.onVisibility);
+    window.removeEventListener('beforeunload', this.onBeforeUnload);
+    for (const u of this.unsubs) u();
+    input.suspended = false;
+    this.session.exit();
+  }
+
+  /* ---------- Loading ---------- */
+
+  private progress(text: string, frac: number) {
+    this.loaderText.textContent = text;
+    (this.loaderBar.firstElementChild as HTMLElement).style.width = `${Math.round(Math.max(0, Math.min(1, frac)) * 100)}%`;
+  }
+
+  private async load() {
+    const pid = store.profile?.id;
+    const bios = store.catalog.bios;
+
+    this.progress('Reading disc', 0);
+    const disc = await fetchCached(this.game.discUrl, (l, t) => this.progress(l < t ? `Downloading disc · ${Math.round((l / t) * 100)}%` : 'Disc ready', (l / t) * 0.8));
+    let biosBlob: Blob | null = null;
+    if (bios) {
+      this.progress('Loading system', 0.82);
+      biosBlob = await fetchCached(bios);
+    }
+    let memcard: Blob | null = null;
+    let state: Blob | null = null;
+    if (pid) {
+      this.progress('Inserting memory card', 0.86);
+      memcard = await api.memcard(pid, this.game.id).catch(() => null);
+      if (this.resumeSlot) {
+        this.progress('Restoring your game', 0.9);
+        state = await api.state(pid, this.game.id, this.resumeSlot).catch(() => null);
+      }
+    }
+    if (memcard) this.lastMemcardHash = await hashBlob(memcard);
+    if (this.quitting) return;
+
+    this.progress('Starting', 0.95);
+    input.suspended = true;
+    await this.session.launch({
+      game: this.game,
+      disc,
+      bios: biosBlob,
+      players: this.players,
+      prefs: store.prefs,
+      memcard,
+      state,
+      canvas: this.canvas,
+    });
+    if (this.quitting) return;
+    this.ready = true;
+    (window as unknown as { __wsx: unknown }).__wsx = { session: this.session, screen: this };
+    this.progress('Go!', 1);
+    store.lastGameId = this.game.id;
+    setTimeout(() => this.loader.classList.add('hide'), 250);
+    this.fitCanvas();
+    this.canvas.focus();
+    this.flushTimer = window.setInterval(() => void this.flushMemcard(), MEMCARD_FLUSH_MS);
+    if (state) app.toast('Game restored', 'ok');
+    app.toast('Esc or Select+Start opens the menu', 'info', 3500);
+  }
+
+  private fail(msg: string) {
+    input.suspended = false;
+    this.loader.classList.remove('hide');
+    this.progress('Something went wrong', 0);
+    const dlg = new Dialog({
+      title: 'Could not start the game',
+      body: h('div', h('p', msg), h('pre.log', this.log.slice(-12).join('\n'))),
+      actions: [{ label: 'Back to library', icon: 'home', variant: 'primary', focusDefault: true, onClick: () => (dlg.close(), this.onQuit()) }],
+      onCancel: () => (dlg.close(), this.onQuit()),
+    });
+    dlg.open();
+  }
+
+  private pushLog(l: string) {
+    this.log.push(l);
+    if (this.log.length > 200) this.log.shift();
+    if (import.meta.env.DEV) console.debug('[core]', l);
+  }
+
+  /* ---------- Picture ---------- */
+
+  private applyPictureSettings() {
+    const { filter, aspect } = store.prefs;
+    this.el.dataset.filter = filter;
+    this.el.dataset.aspect = aspect;
+    this.fitCanvas();
+  }
+
+  private fitCanvas = () => {
+    // Use the viewport, not the element rect: screen transitions scale the element briefly.
+    const fill = store.prefs.aspect === 'fill';
+    let w = window.innerWidth;
+    let hgt = window.innerHeight;
+    if (!fill) {
+      if (w / hgt > 4 / 3) w = hgt * (4 / 3);
+      else hgt = w * (3 / 4);
+    }
+    this.canvasWrap.style.width = `${Math.floor(w)}px`;
+    this.canvasWrap.style.height = `${Math.floor(hgt)}px`;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const pw = Math.floor(w * dpr);
+    const ph = Math.floor(hgt * dpr);
+    if (this.ready) this.session.resize(pw, ph);
+    else {
+      this.canvas.width = pw;
+      this.canvas.height = ph;
+    }
+  };
+
+  /* ---------- Saving ---------- */
+
+  private async flushMemcard(force = false): Promise<boolean> {
+    const pid = store.profile?.id;
+    if (!pid || !this.ready) return false;
+    const blob = await this.session.saveMemcard();
+    if (!blob) return false;
+    const hash = await hashBlob(blob);
+    if (!force && hash === this.lastMemcardHash) return false;
+    this.lastMemcardHash = hash;
+    await api.putMemcard(pid, this.game.id, blob);
+    return true;
+  }
+
+  private async saveSlot(slot: string, label: string) {
+    const pid = store.profile?.id;
+    if (!pid) throw new Error('No profile');
+    const { state, thumbnail } = await this.session.saveState();
+    await api.putState(pid, this.game.id, slot, state, thumbnail, label);
+    await this.flushMemcard();
+  }
+
+  private async pruneSaves(summary: SaveSummary) {
+    const pid = store.profile?.id;
+    if (!pid) return;
+    const manual = summary.slots.filter((s) => s.slot !== 'suspend');
+    for (const s of manual.slice(MAX_SAVES)) await api.deleteState(pid, this.game.id, s.slot);
+  }
+
+  /* ---------- Pause menu ---------- */
+
+  private openMenu() {
+    if (!this.ready || this.menu) return;
+    this.session.pause();
+    input.suspended = false;
+    const body = h(
+      'div.pause-body',
+      h(
+        'div.pause-players',
+        this.players.map((p, i) => (p ? h(`span.pill.p${i + 1}`, icon(p === 'kb' ? 'keyboard' : 'pad'), `P${i + 1} ${deviceLabel(p)}`) : null)),
+      ),
+    );
+    const dlg = new Dialog({
+      title: this.game.title,
+      body,
+      actions: [
+        { label: 'Resume', icon: 'play', variant: 'primary', focusDefault: true, onClick: () => this.closeMenu() },
+        { label: 'Save progress', icon: 'save', onClick: () => void this.quickSave() },
+        { label: 'Load progress', icon: 'load', onClick: () => void this.loadMenu() },
+        { label: 'Settings', icon: 'gear', onClick: () => openSettings({ inGame: true }) },
+        { label: 'Controls', icon: 'pad', onClick: () => this.controlsDialog() },
+        { label: 'Restart game', icon: 'restart', onClick: () => void this.restart() },
+        { label: 'Change players', icon: 'users', onClick: () => void this.changePlayers() },
+        { label: 'Quit to library', icon: 'home', variant: 'danger', onClick: () => void this.quit() },
+      ],
+      onCancel: () => this.closeMenu(),
+    });
+    dlg.el.classList.add('pause-menu');
+    this.menu = dlg;
+    dlg.open();
+  }
+
+  private closeMenu() {
+    if (!this.menu) return;
+    this.menu.close();
+    this.menu = null;
+    app.closeAllModals();
+    input.suspended = true;
+    this.session.resume();
+    sfx.close();
+  }
+
+  private async quickSave() {
+    try {
+      const slot = `s${Date.now().toString(36)}`;
+      await this.saveSlot(slot, `Saved ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
+      const summary = await api.saves(store.profile!.id, this.game.id);
+      await this.pruneSaves(summary);
+      sfx.saved();
+      app.toast('Progress saved', 'ok');
+      this.closeMenu();
+    } catch (e) {
+      app.toast(`Save failed: ${e instanceof Error ? e.message : e}`, 'warn');
+    }
+  }
+
+  private async loadMenu() {
+    const pid = store.profile?.id;
+    if (!pid) return;
+    const summary = await api.saves(pid, this.game.id);
+    if (summary.slots.length === 0) return app.toast('No saved progress yet', 'info');
+    const list = h('div.save-list', { 'data-scroll': 'y' });
+    const render = () => {
+      clear(list);
+      for (const s of summary.slots) {
+        list.appendChild(
+          h(
+            'div.save-row',
+            h(
+              'button.save-item',
+              {
+                type: 'button',
+                'data-focus': true,
+                tabindex: -1,
+                onClick: async () => {
+                  try {
+                    const blob = await api.state(pid, this.game.id, s.slot);
+                    if (!blob) throw new Error('missing');
+                    await this.session.loadState(blob);
+                    dlg.close();
+                    sfx.saved();
+                    app.toast('Progress loaded', 'ok');
+                    this.closeMenu();
+                  } catch {
+                    app.toast('Could not load that save', 'warn');
+                  }
+                },
+              },
+              s.thumbnail ? h('img.save-thumb', { src: s.thumbnail, alt: '' }) : h('div.save-thumb.empty', icon('save')),
+              h('div.save-text', h('b', s.label ?? (s.slot === 'suspend' ? 'Suspended game' : 'Save')), h('span', fmtWhen(s.updatedAt))),
+            ),
+            h(
+              'button.save-delete',
+              {
+                type: 'button',
+                'data-focus': true,
+                tabindex: -1,
+                title: 'Delete',
+                onClick: async () => {
+                  await api.deleteState(pid, this.game.id, s.slot);
+                  summary.slots = summary.slots.filter((x) => x !== s);
+                  render();
+                  dlg.ring.revalidate();
+                },
+              },
+              icon('trash'),
+            ),
+          ),
+        );
+      }
+    };
+    render();
+    const dlg = new Dialog({ title: 'Load progress', wide: true, body: list, actions: [{ label: 'Back', onClick: () => dlg.close() }] });
+    dlg.open();
+  }
+
+  private controlsDialog() {
+    const hasKeyboard = this.players.includes('kb');
+    const keyGrid = h('div.keyhelp-grid');
+    const renderKeys = () =>
+      keyGrid.replaceChildren(...keymapHints(store.prefs.keymap).map((k) => h('div.keyhelp-item', h('kbd', k.key), h('span', k.does))));
+    renderKeys();
+    let pendingApply = false;
+    const dlg = new Dialog({
+      title: 'Controls',
+      wide: true,
+      body: h(
+        'div.controls-help',
+        h(
+          'div.controls-ports',
+          this.players.map((p, i) =>
+            h(
+              `div.port-mini.p${i + 1}${p ? '' : '.empty'}`,
+              h('div.port-mini-num', `${i + 1}`),
+              h('div.port-mini-label', p ? deviceLabel(p) : 'Empty'),
+            ),
+          ),
+        ),
+        h(
+          'div.keyhelp',
+          h(
+            'div.keyhelp-head',
+            h('div.keyhelp-title', icon('keyboard'), 'Keyboard & mouse'),
+            button({
+              label: 'Change bindings',
+              icon: 'gear',
+              size: 'sm',
+              onClick: async () => {
+                const { changed } = await openKeybindDialog();
+                renderKeys();
+                if (changed) {
+                  pendingApply = true;
+                  applyBtn.disabled = false;
+                  applyBtn.classList.add('attention');
+                  app.toast(hasKeyboard ? 'Saved. Press Apply now to use the new bindings in this game.' : 'Bindings saved', 'ok', 3200);
+                }
+              },
+            }),
+          ),
+          keyGrid,
+        ),
+        h('p.settings-note', 'Controllers use their standard layout. Open this menu any time with Esc, the Home button, or Select + Start.'),
+      ),
+      actions: [
+        {
+          label: 'Apply now',
+          icon: 'zap',
+          variant: 'primary',
+          disabled: true,
+          hint: 'Reloads the game from a quick save',
+          onClick: () => {
+            if (!pendingApply) return;
+            dlg.close();
+            void this.relaunch();
+          },
+        },
+        { label: 'Back', focusDefault: true, onClick: () => dlg.close() },
+      ],
+    });
+    const applyBtn = dlg.el.querySelector<HTMLButtonElement>('.dialog-actions .btn')!;
+    dlg.open();
+  }
+
+  /** Suspend and start the same session again so new bindings take effect. */
+  private async relaunch() {
+    await this.suspend();
+    this.onRelaunch();
+  }
+
+  private async restart() {
+    if (!(await confirmDialog('Restart the game?', 'Unsaved progress since your last save will be lost.', 'Restart'))) return;
+    this.session.restart();
+    this.session.pause();
+    app.toast('Game restarted', 'info');
+    this.closeMenu();
+  }
+
+  private async changePlayers() {
+    await this.suspend();
+    this.onChangePlayers();
+  }
+
+  private async quit() {
+    await this.suspend();
+    this.onQuit();
+  }
+
+  /** Save a "suspend" state plus the memory card, then leave. */
+  private async suspend() {
+    if (!this.ready) return;
+    app.toast('Suspending…', 'info', 1200);
+    try {
+      await this.saveSlot('suspend', 'Suspended game');
+      await this.flushMemcard(true);
+    } catch (e) {
+      console.warn('suspend failed', e);
+    }
+  }
+
+  /* ---------- Events ---------- */
+
+  private onVisibility = () => {
+    if (!this.ready) return;
+    if (document.hidden) {
+      this.session.pause();
+      void this.flushMemcard();
+    } else if (!this.menu) this.session.resume();
+  };
+
+  private onBeforeUnload = () => {
+    // Best effort: the memory card is flushed every 30s and on hide, so little is lost.
+  };
+
+  onNav(e: NavEvent) {
+    if (e.action === 'menu') {
+      if (this.menu) this.closeMenu();
+      else this.openMenu();
+      return true;
+    }
+    if (!this.ready && e.action === 'back') {
+      this.onQuit();
+      return true;
+    }
+    return false;
+  }
+}
+
+async function hashBlob(b: Blob): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-1', await b.arrayBuffer());
+  return [...new Uint8Array(buf)].map((x) => x.toString(16).padStart(2, '0')).join('');
+}

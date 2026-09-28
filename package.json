@@ -1,0 +1,29 @@
+{
+  "name": "webstationx",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c blue,magenta \"npm:server:dev\" \"vite --host\"",
+    "server:dev": "tsx watch server/index.ts",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "start": "tsx server/index.ts",
+    "ingest": "node tools/ingest-game.mjs",
+    "assets": "node tools/gen-assets.mjs"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "nostalgist": "^0.22.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.6.0",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.0.0",
+    "puppeteer-core": "^25.12.0",
+    "sharp": "^0.35.5",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.7"
+  }
+}
