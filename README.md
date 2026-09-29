@@ -48,9 +48,11 @@ Codes live in `data/invites.json`; the cookie secret is generated into `data/sec
 The server is light: it hands out files, stores saves and brokers online sessions. All emulation and video encoding happen in the players' browsers, so a small container is plenty.
 
 ```bash
-docker compose up -d --build           # or add the image in Unraid's Docker tab
-docker exec webstationx node tools/invite.mjs add "Mike"
+tools/deploy-unraid.sh                 # from this PC: upload, build on the box, (re)create the container
+docker exec webstationx node tools/invite.mjs add "Mike"   # on the box
 ```
+
+`tools/deploy-unraid.sh` talks to `user@your-server` with `~/.ssh/id_webstationx` (override with `WSX_HOST` / `WSX_KEY`). It never touches `data/`, so re-running it is a safe upgrade. Unraid has no compose plugin; `tools/unraid-run.sh` is the plain `docker run` equivalent of the compose file and lives on the box as `/mnt/user/appdata/webstationx/run.sh`. If you prefer compose elsewhere: `docker compose up -d --build`.
 
 `docker-compose.yml` maps `library/`, `bios/` and `data/` to `/mnt/user/appdata/webstationx/…`. Publish games on your PC with `npm run ingest` and copy the `library/<game>/` folder (plus `catalog.json`) into the share, or run the ingest inside the container.
 
