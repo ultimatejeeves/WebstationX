@@ -241,7 +241,9 @@ export class PlayScreen implements Screen {
     }
     this.canvasWrap.style.width = `${Math.floor(w)}px`;
     this.canvasWrap.style.height = `${Math.floor(hgt)}px`;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // While hosting online, keep the canvas at 1x: every extra pixel is captured and encoded
+    // for each remote player, and PS1 output is upscaled anyway.
+    const dpr = this.host ? 1 : Math.min(window.devicePixelRatio || 1, 2);
     const pw = Math.floor(w * dpr);
     const ph = Math.floor(hgt * dpr);
     if (this.ready) this.session.resize(pw, ph);
@@ -294,7 +296,12 @@ export class PlayScreen implements Screen {
       const statsEl = onlineLine.querySelector('.pause-online-stats')!;
       void this.host!.stats().then((rows) => {
         statsEl.textContent = rows.length
-          ? rows.map((r) => `${r.name}: ${r.state}${r.rttMs !== null ? ` · ${r.rttMs} ms` : ''}${r.kbps ? ` · ${(r.kbps / 1000).toFixed(1)} Mbps` : ''}`).join('   ')
+          ? rows
+              .map(
+                (r) =>
+                  `${r.name}: ${r.state}${r.rttMs !== null ? ` · ${r.rttMs} ms` : ''}${r.fps ? ` · ${Math.round(r.fps)} fps` : ''}${r.kbps ? ` · ${(r.kbps / 1000).toFixed(1)} Mbps` : ''}`,
+              )
+              .join('   ')
           : 'No remote players connected';
       });
     }

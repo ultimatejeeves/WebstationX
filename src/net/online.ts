@@ -30,8 +30,9 @@ import {
 } from './protocol';
 import { SignalClient, type SignalMsg } from './signal';
 
-const VIDEO_MAX_BITRATE = 8_000_000;
-const VIDEO_TARGET_HEIGHT = 720;
+// PS1 output is 240p/480p; 540p keeps it crisp while roughly halving encode work vs 720p.
+const VIDEO_MAX_BITRATE = 5_000_000;
+const VIDEO_TARGET_HEIGHT = 540;
 const PING_MS = 2000;
 
 function rtcConfig(): RTCConfiguration {

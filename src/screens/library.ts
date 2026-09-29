@@ -86,6 +86,7 @@ export class LibraryScreen implements Screen {
   }
 
   async mount() {
+    window.addEventListener('pointerdown', markPointer, { capture: true });
     this.renderPads();
     input.onGamepadsChanged = () => this.renderPads();
     this.unsub.push(store.subscribe(() => this.renderDetail()));
@@ -93,6 +94,7 @@ export class LibraryScreen implements Screen {
   }
 
   unmount() {
+    window.removeEventListener('pointerdown', markPointer, { capture: true });
     this.bar.dispose();
     input.onGamepadsChanged = null;
     for (const u of this.unsub) u();
@@ -257,7 +259,9 @@ export class LibraryScreen implements Screen {
   }
 
   onNav(e: NavEvent) {
-    if (e.action !== 'any') lastDevice = e.device;
+    // Whoever pressed a real button last becomes Player 1 for single player. Stick drift
+    // (axis events) and auto-repeats are ignored so an idle pad cannot steal the slot.
+    if (e.action !== 'any' && !e.repeat && e.raw !== 'axis') lastDevice = e.device;
     switch (e.action) {
       case 'up':
       case 'down':
@@ -281,3 +285,6 @@ export class LibraryScreen implements Screen {
 
 /** Device that last produced a navigation event; a mouse click counts as the keyboard. */
 let lastDevice: DeviceId = 'kb';
+const markPointer = () => {
+  lastDevice = 'kb';
+};

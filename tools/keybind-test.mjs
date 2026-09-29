@@ -51,6 +51,23 @@ try {
   await page.goto(URL, { waitUntil: 'networkidle0' });
   await wait(800);
   await page.keyboard.press('Enter');
+  // Invite gate: sign in with --code or the first active invite in data/invites.json.
+  await page.waitForFunction(() => document.querySelector('.login, .profile-card, .library'), { timeout: 15000 });
+  if (await page.$('.login')) {
+    let code = arg('code', null);
+    if (!code) {
+      try {
+        const list = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'data', 'invites.json'), 'utf8'));
+        code = list.find((i) => !i.revokedAt)?.code ?? null;
+      } catch {
+        /* no local invites */
+      }
+    }
+    if (!code) throw new Error('Sign-in screen shown but no invite code: pass --code');
+    await page.keyboard.type(code, { delay: 30 });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => !document.querySelector('.login'), { timeout: 10000 });
+  }
   await page.waitForSelector('.profile-card', { timeout: 10000 });
   const hasSmoke = await page.evaluate(() => [...document.querySelectorAll('.profile-card')].some((c) => c.textContent.includes('Smoke')));
   if (!hasSmoke) throw new Error('Run smoke-test first to create the Smoke profile');
@@ -104,7 +121,8 @@ try {
   await wait(500);
   const prefs = await page.evaluate(() => JSON.parse(localStorage.getItem('wsx.prefs.smoke') || '{}').keymap);
   console.log('   saved keymap b/a/l:', prefs?.b, prefs?.a, prefs?.l);
-  const server = await (await fetch(`${URL}/api/profiles`)).json();
+  // Ask from inside the page so the request carries the session cookie.
+  const server = await page.evaluate(() => fetch('/api/profiles').then((r) => r.json()));
   const sp = server.find((p) => p.id === 'smoke');
   console.log('   server keymap b/a/l:', sp?.prefs?.keymap?.b, sp?.prefs?.keymap?.a, sp?.prefs?.keymap?.l);
   console.log('   help grid:', await page.$$eval('.keyhelp-item', (a) => a.slice(0, 3).map((e) => e.textContent).join(' | ')));

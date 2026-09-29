@@ -241,13 +241,13 @@ class InputService {
         const key = `${dev}:axis:${axis}`;
         const action: NavAction = axis === 'x' ? (dir[axis] > 0 ? 'right' : 'left') : dir[axis] > 0 ? 'down' : 'up';
         if (dir[axis] !== 0 && dir[axis] !== pd[axis]) {
-          this.emit({ action, device: dev, repeat: false });
+          this.emit({ action, device: dev, repeat: false, raw: 'axis' });
           this.held.set(key, { since: now, last: now });
         } else if (dir[axis] !== 0) {
           const hstate = this.held.get(key);
           if (hstate && now - hstate.since > REPEAT_DELAY && now - hstate.last > REPEAT_RATE) {
             hstate.last = now;
-            this.emit({ action, device: dev, repeat: true });
+            this.emit({ action, device: dev, repeat: true, raw: 'axis' });
           }
         } else this.held.delete(key);
       }

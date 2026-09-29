@@ -120,6 +120,10 @@ export function buildRetroarchConfig(args: Pick<LaunchArgs, 'players' | 'prefs' 
   const padDevice = game.pad === 'analog' ? PSX_DUALSHOCK : RETRO_DEVICE_JOYPAD;
   const kbKeys = PSX_BUTTONS.map((b) => b.id);
   const keymap = prefs.keymap;
+  const active = players.filter(Boolean);
+  // Solo play with a local controller: port 1 also gets the keyboard binds, so the keyboard
+  // works no matter which device happened to press Play.
+  const soloKeyboard = active.length === 1 && active[0] !== 'kb' && !String(active[0]).startsWith('net:');
 
   for (let port = 1; port <= 8; port++) {
     const dev = players[port - 1] ?? null;
@@ -150,8 +154,14 @@ export function buildRetroarchConfig(args: Pick<LaunchArgs, 'players' | 'prefs' 
       // Local pads by Gamepad API index; remote players by their virtual pad's index.
       cfg[`input_player${port}_joypad_index`] = dev.startsWith('net:') ? (padIndexFor(dev) ?? 32 + port) : Number(dev.slice(3));
       for (const k of kbKeys) {
-        cfg[`input_player${port}_${k}`] = 'nul';
-        cfg[`input_player${port}_${k}_mbtn`] = 'nul';
+        const v = soloKeyboard && port === 1 ? keymap[k] || 'nul' : 'nul';
+        if (isMouseBinding(v)) {
+          cfg[`input_player${port}_${k}`] = 'nul';
+          cfg[`input_player${port}_${k}_mbtn`] = Number(v.slice(6));
+        } else {
+          cfg[`input_player${port}_${k}`] = v;
+          cfg[`input_player${port}_${k}_mbtn`] = 'nul';
+        }
       }
     }
   }

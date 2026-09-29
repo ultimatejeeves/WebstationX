@@ -19,7 +19,8 @@ export function installAudioTap() {
   if (!Real) return;
   class TappedAudioContext extends Real {
     constructor(options?: AudioContextOptions) {
-      super(options);
+      // Ask for the smallest output buffer the platform allows; the emulator paces itself.
+      super({ latencyHint: 'interactive', ...options });
       try {
         const realDest = this.destination;
         const tap = this.createGain();
