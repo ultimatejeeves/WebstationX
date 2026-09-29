@@ -6,13 +6,17 @@
  *  - Serve the enclosed game library (library/) and BIOS (bios/) with range + caching.
  *  - Persist player profiles, preferences, memory cards and save states as plain files under data/.
  *
- * This is a private LAN/friends deployment: profiles are nickname based (no passwords).
+ * Access is gated by invite codes (see auth.ts); profiles themselves are nickname based.
+ * Online play uses the WebSocket signaling endpoint in signaling.ts.
  */
 import express from 'express';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Auth } from './auth';
+import { attachSignaling } from './signaling';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dataDir = path.join(root, 'data');
@@ -25,6 +29,60 @@ fs.mkdirSync(path.join(dataDir, 'saves'), { recursive: true });
 
 const app = express();
 app.disable('x-powered-by');
+// Behind a reverse proxy (Unraid + Nginx Proxy Manager / SWAG / Cloudflare Tunnel) trust the
+// forwarded protocol so session cookies are marked Secure and rate limits see real IPs.
+if (process.env.WSX_TRUST_PROXY !== '0') app.set('trust proxy', true);
+
+/* ---------- Access gate ---------- */
+
+const auth = new Auth(dataDir);
+app.use(express.json({ limit: '1mb' }));
+
+app.get('/api/session', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const s = auth.enabled ? auth.sessionOf(req) : { name: 'Open access', code: '', owner: true };
+  res.json({
+    signedIn: !!s,
+    name: s?.name ?? null,
+    owner: !!s?.owner,
+    gated: auth.enabled,
+    ice: iceServers(),
+  });
+});
+
+app.post('/api/login', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  if (!auth.enabled) return res.json({ ok: true, name: 'Open access' });
+  if (auth.throttled(req.ip ?? 'unknown')) return res.status(429).json({ error: 'Too many tries. Wait a minute.' });
+  const invite = auth.find(String(req.body?.code ?? ''));
+  if (!invite) return res.status(401).json({ error: 'That code is not valid' });
+  auth.setCookie(req, res, auth.issue(invite));
+  auth.touch(invite);
+  res.json({ ok: true, name: invite.name });
+});
+
+app.post('/api/logout', (req, res) => {
+  auth.clearCookie(req, res);
+  res.json({ ok: true });
+});
+
+/** STUN/TURN servers handed to browsers. Set WSX_ICE_SERVERS to a JSON array to add TURN. */
+function iceServers(): unknown[] {
+  const raw = process.env.WSX_ICE_SERVERS;
+  if (raw) {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      console.error('WSX_ICE_SERVERS is not valid JSON; using public STUN only');
+    }
+  }
+  return [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+}
+
+const gate = auth.require();
+app.use('/api', gate);
+app.use('/library', gate);
+app.use('/bios', gate);
 
 /* ---------- Library ---------- */
 
@@ -93,7 +151,6 @@ app.use('/api', (_req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
 });
-app.use(express.json({ limit: '1mb' }));
 const raw = express.raw({ type: () => true, limit: '64mb' });
 
 app.get('/api/profiles', (_req, res) => {
@@ -253,6 +310,17 @@ if (fs.existsSync(distDir)) {
   app.get(/^\/(?!api|library|bios).*/, (_req, res) => res.sendFile(path.join(distDir, 'index.html')));
 }
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`WebStationX server on http://localhost:${PORT}  (library: ${readCatalog().length} game(s))`);
+const server = http.createServer(app);
+const signaling = attachSignaling(server, auth);
+
+server.listen(PORT, '0.0.0.0', () => {
+  const invites = auth.invites().filter((i) => !i.revokedAt).length;
+  console.log(`WebStationX server on http://localhost:${PORT}  (library: ${readCatalog().length} game(s), invites: ${invites})`);
+  if (!auth.enabled) console.log('No invite codes yet: access is OPEN. Create one with: npm run invite -- add "Name"');
+});
+
+process.on('SIGTERM', () => {
+  console.log('shutting down', signaling.stats());
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000).unref();
 });

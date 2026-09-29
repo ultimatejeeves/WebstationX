@@ -3,6 +3,8 @@
  * the same NavEvents so every screen is driven by one handler. Each event carries the
  * device that produced it, which lets the lobby do "press any button to join".
  */
+import { realGetGamepads } from '../emu/virtual-pads';
+import { netLabel } from './net-labels';
 import type { DeviceId, NavAction, NavEvent } from './types';
 
 type Listener = (e: NavEvent) => void;
@@ -82,7 +84,7 @@ class InputService {
   private refreshPads = () => {
     const before = [...this.gamepads.keys()].join(',');
     this.gamepads.clear();
-    for (const p of navigator.getGamepads?.() ?? []) if (p) this.gamepads.set(p.index, p.id);
+    for (const p of realGetGamepads()) if (p) this.gamepads.set(p.index, p.id);
     if ([...this.gamepads.keys()].join(',') !== before) this.onGamepadsChanged?.();
   };
 
@@ -175,7 +177,7 @@ class InputService {
 
   private loop = () => {
     this.raf = requestAnimationFrame(this.loop);
-    const pads = navigator.getGamepads?.() ?? [];
+    const pads = realGetGamepads();
     this.onFrame?.(pads);
     if (this.capture) return;
     if (this._suspended) {
@@ -263,6 +265,7 @@ export const input = new InputService();
 
 export function deviceLabel(dev: DeviceId): string {
   if (dev === 'kb') return 'Keyboard';
+  if (dev.startsWith('net:')) return netLabel(dev);
   const idx = Number(dev.slice(3));
   const id = input.gamepads.get(idx) ?? 'Controller';
   return prettyPadName(id);

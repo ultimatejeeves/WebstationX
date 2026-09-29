@@ -74,8 +74,11 @@ export type SaveSummary = {
   slots: { slot: string; updatedAt: string; size: number; thumbnail: string | null; label?: string }[];
 };
 
-/** An input device that can occupy a player slot. */
-export type DeviceId = 'kb' | `gp:${number}`;
+/**
+ * An input device that can occupy a player slot: the keyboard, a local gamepad by Gamepad
+ * API index, or a remote player's device (`net:<peer>:<ord>`, see net/protocol.ts).
+ */
+export type DeviceId = 'kb' | `gp:${number}` | `net:${string}`;
 
 export type PlayerSlot = {
   index: number; // 0..3

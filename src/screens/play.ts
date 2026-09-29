@@ -11,7 +11,10 @@ import { store } from '../core/store';
 import type { GameMeta, NavEvent, SaveSummary } from '../core/types';
 import { fetchCached } from '../emu/disc-cache';
 import { keymapHints } from '../emu/keymap';
+import { setStreamingKeepAlive } from '../emu/keepalive';
 import { EmuSession, type SessionPlayers } from '../emu/player';
+import { online } from '../net/online';
+import { isNetDevice } from '../net/protocol';
 import { openKeybindDialog } from '../ui/keybind-dialog';
 import { button, confirmDialog, Dialog } from '../ui/components';
 import { openSettings } from './settings';
@@ -41,6 +44,8 @@ export class PlayScreen implements Screen {
   private ready = false;
   private log: string[] = [];
   private unsubs: (() => void)[] = [];
+  private streaming = false;
+  private audioRetry = 0;
 
   constructor(
     game: GameMeta,
@@ -97,6 +102,8 @@ export class PlayScreen implements Screen {
   unmount() {
     this.quitting = true;
     clearInterval(this.flushTimer);
+    clearInterval(this.audioRetry);
+    this.stopStreaming();
     window.removeEventListener('resize', this.fitCanvas);
     document.removeEventListener('visibilitychange', this.onVisibility);
     window.removeEventListener('beforeunload', this.onBeforeUnload);
@@ -153,12 +160,46 @@ export class PlayScreen implements Screen {
     (window as unknown as { __wsx: unknown }).__wsx = { session: this.session, screen: this };
     this.progress('Go!', 1);
     store.lastGameId = this.game.id;
+    this.startStreaming();
     setTimeout(() => this.loader.classList.add('hide'), 250);
     this.fitCanvas();
     this.canvas.focus();
     this.flushTimer = window.setInterval(() => void this.flushMemcard(), MEMCARD_FLUSH_MS);
     if (state) app.toast('Game restored', 'ok');
     app.toast('Esc or Select+Start opens the menu', 'info', 3500);
+  }
+
+  /* ---------- Online (host) ---------- */
+
+  private get host() {
+    return online.host;
+  }
+
+  /** Stream the canvas + audio to remote players whenever any port is held by one. */
+  private startStreaming() {
+    const host = this.host;
+    if (!host || !this.players.some(isNetDevice)) {
+      host?.setPhase('playing');
+      return;
+    }
+    host.startStreaming(this.canvas);
+    host.setPhase('playing');
+    host.onLeave = (dev) => app.toast(`${deviceLabel(dev)} left the game`, 'info', 2000);
+    host.onJoin = null;
+    host.onSwap = null;
+    this.streaming = true;
+    setStreamingKeepAlive(true);
+    // The core's audio context appears a moment after launch; attach it when it does.
+    this.audioRetry = window.setInterval(() => host.refreshAudio(), 500);
+    setTimeout(() => clearInterval(this.audioRetry), 15_000);
+  }
+
+  private stopStreaming() {
+    if (!this.streaming) return;
+    this.streaming = false;
+    setStreamingKeepAlive(false);
+    this.host?.stopStreaming();
+    if (this.host) this.host.onLeave = null;
   }
 
   private fail(msg: string) {
@@ -244,13 +285,26 @@ export class PlayScreen implements Screen {
   private openMenu() {
     if (!this.ready || this.menu) return;
     this.session.pause();
+    this.host?.setPhase('paused');
     input.suspended = false;
+    const onlineLine = this.host
+      ? h('div.pause-online', icon('globe'), h('span', 'Online code ', h('b', this.host.code)), h('span.pause-online-stats', ''))
+      : null;
+    if (onlineLine && this.streaming) {
+      const statsEl = onlineLine.querySelector('.pause-online-stats')!;
+      void this.host!.stats().then((rows) => {
+        statsEl.textContent = rows.length
+          ? rows.map((r) => `${r.name}: ${r.state}${r.rttMs !== null ? ` · ${r.rttMs} ms` : ''}${r.kbps ? ` · ${(r.kbps / 1000).toFixed(1)} Mbps` : ''}`).join('   ')
+          : 'No remote players connected';
+      });
+    }
     const body = h(
       'div.pause-body',
       h(
         'div.pause-players',
-        this.players.map((p, i) => (p ? h(`span.pill.p${i + 1}`, icon(p === 'kb' ? 'keyboard' : 'pad'), `P${i + 1} ${deviceLabel(p)}`) : null)),
+        this.players.map((p, i) => (p ? h(`span.pill.p${i + 1}`, icon(p === 'kb' ? 'keyboard' : isNetDevice(p) ? 'globe' : 'pad'), `P${i + 1} ${deviceLabel(p)}`) : null)),
       ),
+      onlineLine,
     );
     const dlg = new Dialog({
       title: this.game.title,
@@ -279,6 +333,7 @@ export class PlayScreen implements Screen {
     app.closeAllModals();
     input.suspended = true;
     this.session.resume();
+    this.host?.setPhase('playing');
     sfx.close();
   }
 
@@ -463,6 +518,7 @@ export class PlayScreen implements Screen {
 
   private onVisibility = () => {
     if (!this.ready) return;
+    if (this.streaming) return; // remote players keep playing; the keep-alive drives frames
     if (document.hidden) {
       this.session.pause();
       void this.flushMemcard();
@@ -488,6 +544,17 @@ export class PlayScreen implements Screen {
 }
 
 async function hashBlob(b: Blob): Promise<string> {
-  const buf = await crypto.subtle.digest('SHA-1', await b.arrayBuffer());
-  return [...new Uint8Array(buf)].map((x) => x.toString(16).padStart(2, '0')).join('');
+  const bytes = new Uint8Array(await b.arrayBuffer());
+  // crypto.subtle only exists on secure origins; plain-http LAN play falls back to FNV-1a.
+  if (globalThis.crypto?.subtle) {
+    const buf = await crypto.subtle.digest('SHA-1', bytes);
+    return [...new Uint8Array(buf)].map((x) => x.toString(16).padStart(2, '0')).join('');
+  }
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (const x of bytes) {
+    h1 = Math.imul(h1 ^ x, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 + x, 0x9e3779b1) >>> 0;
+  }
+  return `${h1.toString(16)}-${h2.toString(16)}-${bytes.length}`;
 }

@@ -5,21 +5,28 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n server,web -c blue,magenta \"npm:server:dev\" \"vite --host\"",
+    "dev:alt": "cross-env WSX_PORT=8091 WSX_WEB_PORT=5174 concurrently -k -n server,web -c blue,magenta \"npm:server:dev\" \"vite --host\"",
     "server:dev": "tsx watch server/index.ts",
-    "build": "tsc -p tsconfig.json --noEmit && vite build",
-    "start": "tsx server/index.ts",
+    "build": "tsc -p tsconfig.json --noEmit && vite build && npm run build:server",
+    "build:server": "esbuild server/index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/server.js",
+    "start": "node dist/server.js",
+    "start:dev": "tsx server/index.ts",
+    "invite": "node tools/invite.mjs",
     "ingest": "node tools/ingest-game.mjs",
     "assets": "node tools/gen-assets.mjs"
   },
   "dependencies": {
     "express": "^5.1.0",
-    "nostalgist": "^0.22.0"
+    "nostalgist": "^0.22.0",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^24.6.0",
+    "@types/ws": "^8.18.1",
     "concurrently": "^9.2.1",
     "cross-env": "^10.0.0",
+    "esbuild": "^0.28.2",
     "puppeteer-core": "^25.12.0",
     "sharp": "^0.35.5",
     "tsx": "^4.20.6",

@@ -17,6 +17,15 @@ const URL = arg('url', 'http://localhost:5173');
 const SHOTS = arg('shots', 'work/shots');
 fs.mkdirSync(SHOTS, { recursive: true });
 
+function firstInviteCode() {
+  try {
+    const list = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'data', 'invites.json'), 'utf8'));
+    return list.find((i) => !i.revokedAt)?.code ?? null;
+  } catch {
+    return null;
+  }
+}
+
 const chrome = ['C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'].find((p) =>
   fs.existsSync(p),
 );
@@ -75,6 +84,18 @@ try {
   await shot('01-boot');
   await page.keyboard.press('Enter'); // skip boot
   await wait(800);
+
+  step('Sign in');
+  await page.waitForFunction(() => document.querySelector('.login, .profile-card, .library'), { timeout: 15000 });
+  if (await page.$('.login')) {
+    const code = arg('code', firstInviteCode());
+    if (!code) throw new Error('Sign-in screen shown but no invite code: pass --code or create one with npm run invite');
+    await shot('01b-login');
+    await page.keyboard.type(code, { delay: 30 });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => !document.querySelector('.login'), { timeout: 10000 });
+    console.log('   signed in');
+  } else console.log('   no gate (open access or already signed in)');
 
   step('Profile');
   await page.waitForSelector('.profile-card', { timeout: 10000 });

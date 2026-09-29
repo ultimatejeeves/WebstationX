@@ -35,11 +35,13 @@ export class LibraryScreen implements Screen {
   private saves = new Map<string, SaveSummary>();
   private onLaunch: (intent: LaunchIntent) => void;
   private onSwitchProfile: () => void;
+  private onJoinOnline: () => void;
   private unsub: (() => void)[] = [];
 
-  constructor(onLaunch: (i: LaunchIntent) => void, onSwitchProfile: () => void) {
+  constructor(onLaunch: (i: LaunchIntent) => void, onSwitchProfile: () => void, onJoinOnline: () => void) {
     this.onLaunch = onLaunch;
     this.onSwitchProfile = onSwitchProfile;
+    this.onJoinOnline = onJoinOnline;
     this.shelf = h('div.shelf', { 'data-scroll': 'x' });
     this.detail = h('div.detail');
     this.padCount = h('span.padcount');
@@ -55,9 +57,15 @@ export class LibraryScreen implements Screen {
       icon('gear'),
       h('span', 'Settings'),
     );
+    const joinBtn = h(
+      'button.chip.chip-online',
+      { type: 'button', 'data-focus': true, tabindex: -1, title: "Join a friend's session", onClick: () => this.onJoinOnline() },
+      icon('globe'),
+      h('span', 'Join online'),
+    );
     this.bar = topBar({
       left: h('div.brand', h('img.brand-emblem', { src: '/assets/emblem.png', alt: '' }), h('span.brand-text', h('b', 'WEBSTATION'), 'X')),
-      right: h('div.topbar-tools', this.padCount, settingsBtn, profileChip),
+      right: h('div.topbar-tools', this.padCount, joinBtn, settingsBtn, profileChip),
     });
     this.el = h(
       'div.library',

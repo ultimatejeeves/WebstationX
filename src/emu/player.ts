@@ -9,6 +9,7 @@
 import { Nostalgist } from 'nostalgist';
 import type { DeviceId, GameMeta, Prefs } from '../core/types';
 import { isMouseBinding, PSX_BUTTONS } from './keymap';
+import { padIndexFor } from './virtual-pads';
 
 export type SessionPlayers = (DeviceId | null)[]; // index = PSX player 0..3
 
@@ -146,13 +147,16 @@ export function buildRetroarchConfig(args: Pick<LaunchArgs, 'players' | 'prefs' 
         }
       }
     } else {
-      cfg[`input_player${port}_joypad_index`] = Number(dev.slice(3));
+      // Local pads by Gamepad API index; remote players by their virtual pad's index.
+      cfg[`input_player${port}_joypad_index`] = dev.startsWith('net:') ? (padIndexFor(dev) ?? 32 + port) : Number(dev.slice(3));
       for (const k of kbKeys) {
         cfg[`input_player${port}_${k}`] = 'nul';
         cfg[`input_player${port}_${k}_mbtn`] = 'nul';
       }
     }
   }
+  // Dev-only escape hatch so the headless tests can prove RetroArch reads a given pad.
+  if (import.meta.env.DEV) Object.assign(cfg, (window as unknown as { __wsxCfgOverride?: Record<string, string | number | boolean> }).__wsxCfgOverride ?? {});
   return cfg;
 }
 
@@ -237,6 +241,10 @@ export class EmuSession {
 
   get status() {
     return this.inst?.getStatus() ?? 'initial';
+  }
+  /** Raw Emscripten module (FS, HEAP...). Used by the headless tests to read retroarch.cfg. */
+  get module(): unknown {
+    return this.inst?.getEmscriptenModule() ?? null;
   }
   get running() {
     return this.status === 'running';

@@ -3,7 +3,7 @@
  * Preferences live on the server profile and are mirrored to localStorage so the UI
  * feels instant and still works when the server is briefly unreachable.
  */
-import { api } from './api';
+import { api, type SessionState } from './api';
 import { sfx } from './sfx';
 import { normalizeKeymap } from '../emu/keymap';
 import { DEFAULT_PREFS, type Catalog, type GameMeta, type Prefs, type Profile } from './types';
@@ -17,6 +17,8 @@ type Listener = () => void;
 
 class Store {
   catalog: Catalog = { games: [], bios: null };
+  /** Who is signed in (invite name) and the ICE servers for online play. */
+  session: SessionState = { signedIn: false, name: null, owner: false, gated: false, ice: [] };
   profile: Profile | null = null;
   prefs: Prefs = { ...DEFAULT_PREFS };
   private listeners = new Set<Listener>();

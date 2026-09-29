@@ -1,0 +1,8 @@
+node_modules
+dist
+work
+Games
+data
+.env
+*.log
+.git

@@ -1,6 +1,7 @@
 /**
  * Preferences dialog. Every option is a horizontal chooser so it works with a d-pad.
  */
+import { api } from '../core/api';
 import { app } from '../core/app';
 import { h, icon } from '../core/dom';
 import { sfx } from '../core/sfx';
@@ -9,7 +10,7 @@ import type { Prefs } from '../core/types';
 import { clearDiscCache } from '../emu/disc-cache';
 import { keymapHints } from '../emu/keymap';
 import { openKeybindDialog } from '../ui/keybind-dialog';
-import { button, Dialog } from '../ui/components';
+import { button, Dialog, type ButtonOpts } from '../ui/components';
 
 type Choice<K extends keyof Prefs> = { key: K; label: string; help: string; options: { value: Prefs[K]; label: string }[] };
 
@@ -115,6 +116,19 @@ export function openSettings(extra?: { inGame?: boolean }) {
           app.toast('Disc cache cleared', 'ok');
         },
       },
+      ...(store.session.gated
+        ? [
+            {
+              label: 'Sign out',
+              icon: 'home',
+              hint: store.session.name ? `Signed in as ${store.session.name}` : undefined,
+              onClick: async () => {
+                await api.logout();
+                location.reload();
+              },
+            } satisfies ButtonOpts,
+          ]
+        : []),
       { label: 'Done', icon: 'check', variant: 'primary', onClick: () => dlg.close() },
     ],
     onNav: (e) => {

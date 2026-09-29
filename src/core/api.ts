@@ -1,7 +1,13 @@
 import type { Catalog, Profile, SaveSummary } from './types';
 
+export type SessionState = { signedIn: boolean; name: string | null; owner: boolean; gated: boolean; ice: RTCIceServer[] };
+
+/** Fired on window when the server answers 401: the invite was revoked or the cookie expired. */
+export const UNAUTHORIZED_EVENT = 'wsx:unauthorized';
+
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
+  if (res.status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
   if (!res.ok) throw new Error(`${init?.method ?? 'GET'} ${url} -> ${res.status}`);
   return (await res.json()) as T;
 }
@@ -13,6 +19,15 @@ const jsonBody = (method: string, body: unknown): RequestInit => ({
 });
 
 export const api = {
+  session: () => json<SessionState>('/api/session'),
+  async login(code: string): Promise<{ ok: true; name: string }> {
+    const res = await fetch('/api/login', jsonBody('POST', { code }));
+    const body = (await res.json().catch(() => ({}))) as { error?: string; name?: string };
+    if (!res.ok) throw new Error(body.error ?? `Sign in failed (${res.status})`);
+    return { ok: true, name: body.name ?? '' };
+  },
+  logout: () => fetch('/api/logout', { method: 'POST' }),
+
   catalog: () => json<Catalog>('/api/catalog'),
 
   profiles: () => json<Profile[]>('/api/profiles'),
