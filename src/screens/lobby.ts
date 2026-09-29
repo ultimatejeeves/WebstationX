@@ -13,7 +13,6 @@ import type { DeviceId, GameMeta, NavEvent } from '../core/types';
 import type { SessionPlayers } from '../emu/player';
 import { ensureHosting, online, type HostSession } from '../net/online';
 import { isNetDevice } from '../net/protocol';
-import { slotTakenByVirtualPad } from '../emu/virtual-pads';
 import { button, hintBar } from '../ui/components';
 
 const COLORS = ['p1', 'p2', 'p3', 'p4'];
@@ -183,12 +182,6 @@ export class LobbyScreen implements Screen {
 
   private join(dev: DeviceId, remote = false): boolean {
     if (this.slots.includes(dev)) return true;
-    if (dev.startsWith('gp:') && slotTakenByVirtualPad(Number(dev.slice(3)))) {
-      // The emulator only sees four controller slots; an online player already holds this one.
-      sfx.error();
-      app.toast('That controller slot is used by an online player. Connect controllers before friends join.', 'warn', 3200);
-      return false;
-    }
     const free = this.slots.indexOf(null);
     if (free < 0) {
       if (!remote) {

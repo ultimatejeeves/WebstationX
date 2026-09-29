@@ -98,9 +98,10 @@ export function installVirtualPads() {
   // Nostalgist re-announces every pad at launch with `new GamepadEvent(type, { gamepad })`,
   // which rejects anything that is not a native Gamepad. Hand out a plain event instead.
   const RealGamepadEvent = window.GamepadEvent;
+  const NativeGamepad = window.Gamepad;
   if (RealGamepadEvent) {
     const Patched = function (this: unknown, type: string, init?: GamepadEventInit) {
-      if (init?.gamepad instanceof VirtualPad) {
+      if (init?.gamepad && !(NativeGamepad && init.gamepad instanceof NativeGamepad)) {
         const ev = new Event(type, init);
         Object.defineProperty(ev, 'gamepad', { value: init.gamepad, enumerable: true });
         return ev;
@@ -112,13 +113,31 @@ export function installVirtualPads() {
   }
   navigator.getGamepads = function patchedGetGamepads(): (Gamepad | null)[] {
     const real = orig() as (Gamepad | null)[];
+    if (portMap) {
+      // While a game runs, slot N-1 holds whatever device plays port N (see setPortMap).
+      return portMap.map((src, slot) => {
+        if (!src) return null;
+        if (src.kind === 'virtual') return src.pad.connected ? viewOf(src.pad, slot) : null;
+        const g = real[src.realIndex];
+        return g ? viewOf(g, slot) : null;
+      });
+    }
     if (!pads.some(Boolean)) return real;
-    // A virtual pad owns its slot until released, even if a controller is plugged in later
-    // (the lobby refuses that controller instead of letting two devices share one slot).
     const out: (Gamepad | null)[] = [];
     for (let i = 0; i < Math.max(PAD_SLOTS, real.length); i++) out.push((pads[i] as unknown as Gamepad | null) ?? real[i] ?? null);
     return out;
   };
+  // While the port map is active, native hotplug events would tell the emulator about the
+  // browser's slot numbers, which no longer match ours. Swallow them; the map is fixed per game.
+  if (RealGamepadEvent)
+    for (const type of ['gamepadconnected', 'gamepaddisconnected'] as const)
+      window.addEventListener(
+        type,
+        (e) => {
+          if (portMap && e instanceof RealGamepadEvent) e.stopImmediatePropagation();
+        },
+        { capture: true },
+      );
 }
 
 function dispatch(type: 'gamepadconnected' | 'gamepaddisconnected', pad: VirtualPad) {
@@ -130,10 +149,10 @@ function dispatch(type: 'gamepadconnected' | 'gamepaddisconnected', pad: Virtual
 /** Create a virtual pad in a free slot, or null when all four slots hold a controller. */
 export function allocateVirtualPad(label: string): VirtualPad | null {
   installVirtualPads();
-  const real = realGetGamepads();
+  // Any free virtual slot will do: the port map relocates pads to their port's slot at launch.
   let slot = -1;
   for (let i = 0; i < PAD_SLOTS; i++) {
-    if (!pads[i] && !real[i]) {
+    if (!pads[i]) {
       slot = i;
       break;
     }
@@ -161,6 +180,51 @@ export function releaseVirtualPad(pad: VirtualPad) {
 
 export function virtualPads(): VirtualPad[] {
   return pads.filter((p): p is VirtualPad => !!p);
+}
+
+/* ---------- Port map: gamepad slot N-1 <-> emulator port N ----------
+ * RetroArch's web joypad driver reads the gamepad at the same index as the port it is
+ * polling, regardless of the configured joypad index. So for the game's lifetime we present
+ * the pad chosen for port N in slot N-1, whatever slot the browser or the lobby gave it. */
+type SlotSource = { kind: 'real'; realIndex: number } | { kind: 'virtual'; pad: VirtualPad } | null;
+let portMap: SlotSource[] | null = null;
+
+/** A Gamepad-shaped snapshot of `g` that claims to live in `slot`. */
+function viewOf(g: Gamepad | VirtualPad, slot: number): Gamepad {
+  return {
+    id: g.id,
+    index: slot,
+    connected: g.connected,
+    mapping: g.mapping,
+    timestamp: g.timestamp,
+    buttons: g.buttons,
+    axes: g.axes,
+    hapticActuators: (g as unknown as { hapticActuators?: unknown[] }).hapticActuators ?? [],
+    vibrationActuator: (g as Gamepad).vibrationActuator ?? null,
+  } as unknown as Gamepad;
+}
+
+/** Devices per port (index 0 = port 1): 'gp:N' local pad, 'net:..' remote pad, 'kb'/null = no pad. */
+export function setPortMap(players: (string | null)[]) {
+  installVirtualPads();
+  const map: SlotSource[] = [];
+  for (let i = 0; i < Math.max(PAD_SLOTS, players.length); i++) {
+    const dev = players[i] ?? null;
+    if (dev?.startsWith('gp:')) map.push({ kind: 'real', realIndex: Number(dev.slice(3)) });
+    else if (dev?.startsWith('net:')) {
+      const pad = devicePads.get(dev);
+      map.push(pad ? { kind: 'virtual', pad } : null);
+    } else map.push(null);
+  }
+  portMap = map;
+}
+
+export function clearPortMap() {
+  portMap = null;
+}
+
+export function portMapActive() {
+  return !!portMap;
 }
 
 /* Which virtual pad backs a `net:` device id (set by the host session, read at launch). */

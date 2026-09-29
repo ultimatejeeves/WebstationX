@@ -9,7 +9,7 @@
 import { Nostalgist } from 'nostalgist';
 import type { DeviceId, GameMeta, Prefs } from '../core/types';
 import { isMouseBinding, PSX_BUTTONS } from './keymap';
-import { padIndexFor } from './virtual-pads';
+import { clearPortMap, setPortMap } from './virtual-pads';
 
 export type SessionPlayers = (DeviceId | null)[]; // index = PSX player 0..3
 
@@ -76,6 +76,10 @@ const HOTKEYS_OFF = [
   'input_turbo_fire_toggle',
   'input_enable_hotkey',
 ];
+
+/** W3C standard gamepad mapping -> RetroArch joypad button / axis binds. */
+const STD_BTN: Partial<Record<string, number>> = { b: 0, a: 1, y: 2, x: 3, l: 4, r: 5, l2: 6, r2: 7, select: 8, start: 9, l3: 10, r3: 11, up: 12, down: 13, left: 14, right: 15 };
+const STD_AXIS: Partial<Record<string, string>> = { l_x_minus: '-0', l_x_plus: '+0', l_y_minus: '-1', l_y_plus: '+1', r_x_minus: '-2', r_x_plus: '+2', r_y_minus: '-3', r_y_plus: '+3' };
 
 const RETRO_DEVICE_NONE = 0;
 const RETRO_DEVICE_JOYPAD = 1;
@@ -151,8 +155,10 @@ export function buildRetroarchConfig(args: Pick<LaunchArgs, 'players' | 'prefs' 
         }
       }
     } else {
-      // Local pads by Gamepad API index; remote players by their virtual pad's index.
-      cfg[`input_player${port}_joypad_index`] = dev.startsWith('net:') ? (padIndexFor(dev) ?? 32 + port) : Number(dev.slice(3));
+      // The web joypad driver reads gamepad slot N-1 for port N; the port map (virtual-pads.ts)
+      // puts this device there, so the index is simply port-1. Binds are spelled out because
+      // players 2+ have no defaults in this build.
+      cfg[`input_player${port}_joypad_index`] = port - 1;
       for (const k of kbKeys) {
         const v = soloKeyboard && port === 1 ? keymap[k] || 'nul' : 'nul';
         if (isMouseBinding(v)) {
@@ -162,6 +168,8 @@ export function buildRetroarchConfig(args: Pick<LaunchArgs, 'players' | 'prefs' 
           cfg[`input_player${port}_${k}`] = v;
           cfg[`input_player${port}_${k}_mbtn`] = 'nul';
         }
+        cfg[`input_player${port}_${k}_btn`] = STD_BTN[k] ?? 'nul';
+        cfg[`input_player${port}_${k}_axis`] = STD_AXIS[k] ?? 'nul';
       }
     }
   }
@@ -217,6 +225,7 @@ export class EmuSession {
     const retroarchCoreConfig = buildCoreConfig(args);
     this.onLog?.(`ports: ${args.players.map((p, i) => `${i + 1}=${p ?? '-'}`).join(' ')} multitap=${retroarchCoreConfig.pcsx_rearmed_multitap}`);
 
+    setPortMap(args.players);
     const rom = { fileName: `${args.game.id}.chd`, fileContent: args.disc };
     const bios = args.bios ? [{ fileName: 'scph1001.bin', fileContent: args.bios }] : [];
 
@@ -295,6 +304,7 @@ export class EmuSession {
   }
   exit() {
     this.aborted = true;
+    clearPortMap();
     try {
       this.inst?.exit({ removeCanvas: false });
     } catch {
