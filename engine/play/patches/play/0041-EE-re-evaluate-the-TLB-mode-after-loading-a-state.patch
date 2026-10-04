@@ -1,0 +1,25 @@
+From fcab0386362f78951e4b68307c7455d59cdfe6a2 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 21:08:44 -0400
+Subject: [PATCH 41/43] EE: re-evaluate the TLB mode after loading a state
+
+---
+ Source/ee/Ee_SubSystem.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/Source/ee/Ee_SubSystem.cpp b/Source/ee/Ee_SubSystem.cpp
+index f301e998..c78f2cd8 100644
+--- a/Source/ee/Ee_SubSystem.cpp
++++ b/Source/ee/Ee_SubSystem.cpp
+@@ -591,6 +591,8 @@ void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
+ 	m_gif.LoadState(archive);
+ 	m_ipu.LoadState(archive);
+ 	m_os->GetLibMc2().LoadState(archive);
++	//The TLB handlers came back with the BIOS state; the address translator and exception checker follow them.
++	m_os->UpdateTLBEnabledState();
+ 
+ 	//Not part of a state: what idle loop detection counted before the load would make the machine's
+ 	//behaviour after it depend on how long it ran before (WebStationX's determinism check relies on this).
+-- 
+2.51.0.windows.1
+

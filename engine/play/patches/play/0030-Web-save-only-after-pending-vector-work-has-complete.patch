@@ -1,0 +1,137 @@
+From 8f98fc87a9663154fafbeb564c5f39d63fe64759 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 23:28:43 -0400
+Subject: [PATCH 30/43] Web: save only after pending vector work has completed
+
+---
+ Source/PS2VM.cpp       | 47 +++++++++++++++++++++++++++++++++++++-----
+ Source/PS2VM.h         |  9 ++++++++
+ Source/ee/Vpu1Thread.h |  2 ++
+ 3 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/Source/PS2VM.cpp b/Source/PS2VM.cpp
+index 2486fda1..0d41ae8f 100644
+--- a/Source/PS2VM.cpp
++++ b/Source/PS2VM.cpp
+@@ -365,12 +365,40 @@ std::future<bool> CPS2VM::SaveState(const fs::path& statePath)
+ 	auto future = promise->get_future();
+ 	m_mailBox.SendCall(
+ 	    [this, promise, statePath]() {
+-		    auto result = SaveVMState(statePath);
+-		    promise->set_value(result);
++		    if(m_pendingSave)
++		    {
++			    promise->set_value(false);
++			    return;
++		    }
++		    m_pendingSave = std::make_unique<PENDING_SAVE>(PENDING_SAVE{
++		        statePath, promise, std::chrono::steady_clock::now() + std::chrono::seconds(5)});
+ 	    });
+ 	return future;
+ }
+ 
++void CPS2VM::CancelPendingSave()
++{
++	if(!m_pendingSave) return;
++	m_pendingSave->promise->set_value(false);
++	m_pendingSave.reset();
++}
++
++void CPS2VM::PollPendingSave()
++{
++	if(!m_pendingSave) return;
++	m_ee->SyncVpu1(CVpu1Thread::DRAIN_STATE);
++	if(m_ee->m_vpu1Thread && m_ee->m_vpu1Thread->HasPendingWork())
++	{
++		//A VIF interrupt stall is quiescent but not empty. Let the normal VM
++		//loop service it, including EE/IOP/timers, before capturing the machine.
++		//Otherwise already-accepted DMA bytes and queued GS calls are lost.
++		if(std::chrono::steady_clock::now() >= m_pendingSave->deadline) CancelPendingSave();
++		return;
++	}
++	auto pending = std::move(m_pendingSave);
++	pending->promise->set_value(SaveVMState(pending->path));
++}
++
+ std::future<bool> CPS2VM::LoadState(const fs::path& statePath)
+ {
+ 	auto promise = std::make_shared<std::promise<bool>>();
+@@ -496,6 +524,7 @@ void CPS2VM::CreateVM()
+ 
+ void CPS2VM::ResetVM()
+ {
++	CancelPendingSave();
+ 	assert(m_eeRamSize != 0);
+ 	assert(m_iopRamSize != 0);
+ 
+@@ -585,6 +614,7 @@ bool CPS2VM::SaveVMState(const fs::path& statePath)
+ 
+ bool CPS2VM::LoadVMState(const fs::path& statePath)
+ {
++	CancelPendingSave();
+ 	if(m_ee->m_gs == NULL)
+ 	{
+ 		printf("PS2VM: GS Handler was not instancied. Cannot load state.\r\n");
+@@ -942,8 +972,13 @@ void CPS2VM::EmuThread()
+ 		{
+ 			m_mailBox.ReceiveCall();
+ 		}
+-		if(m_nEnd) break;
+-		if(m_nStatus == PAUSED)
++		if(m_nEnd)
++		{
++			CancelPendingSave();
++			break;
++		}
++		PollPendingSave();
++		if(m_nStatus == PAUSED && !m_pendingSave)
+ 		{
+ #ifdef __EMSCRIPTEN__
+ 			//Paused (menus, loading a state): precompile in short slices so calls still get answered quickly.
+@@ -951,7 +986,9 @@ void CPS2VM::EmuThread()
+ #endif
+ 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+ 		}
+-		if(m_nStatus == RUNNING)
++		//A paused save may advance just far enough to empty the worker queues.
++		//Keep the externally visible pause state and stop as soon as it is safe.
++		if(m_nStatus == RUNNING || m_pendingSave)
+ 		{
+ 			if(m_spuUpdateTicks <= 0)
+ 			{
+diff --git a/Source/PS2VM.h b/Source/PS2VM.h
+index d8067117..fd27206d 100644
+--- a/Source/PS2VM.h
++++ b/Source/PS2VM.h
+@@ -120,6 +120,15 @@ private:
+ 	void DestroyVM();
+ 	bool SaveVMState(const fs::path&);
+ 	bool LoadVMState(const fs::path&);
++	void PollPendingSave();
++	void CancelPendingSave();
++	struct PENDING_SAVE
++	{
++		fs::path path;
++		std::shared_ptr<std::promise<bool>> promise;
++		std::chrono::steady_clock::time_point deadline;
++	};
++	std::unique_ptr<PENDING_SAVE> m_pendingSave;
+ 
+ 	void SaveVmTimingState(Framework::CZipArchiveWriter&);
+ 	void LoadVmTimingState(Framework::CZipArchiveReader&);
+diff --git a/Source/ee/Vpu1Thread.h b/Source/ee/Vpu1Thread.h
+index 2b4cec95..49bd4bcf 100644
+--- a/Source/ee/Vpu1Thread.h
++++ b/Source/ee/Vpu1Thread.h
+@@ -108,6 +108,8 @@ public:
+ 	//EE thread: wait until the thread did everything it was sent (or is stalled on the EE). Afterwards,
+ 	//and until the EE sends or kicks again, the thread doesn't touch any state.
+ 	void Drain(DRAIN_REASON = DRAIN_OTHER);
++	//After Drain: a parked worker may still own DMA bytes that aren't in a save state.
++	bool HasPendingWork() const { return m_completed.load() != m_sent.load(); }
+ 	//Drain, then run on the thread (out of band: also while stalled) and wait for it.
+ 	void RunSync(const std::function<void()>&);
+ 	//Drop everything queued (state load, reset).
+-- 
+2.51.0.windows.1
+

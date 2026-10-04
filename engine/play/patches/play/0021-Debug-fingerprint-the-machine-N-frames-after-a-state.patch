@@ -1,0 +1,133 @@
+From 28e322c5a1f3c162984b7e7eeba983ec3743c635 Mon Sep 17 00:00:00 2001
+From: wsx <wsx@localhost>
+Date: Tue, 29 Sep 2026 21:29:56 -0400
+Subject: [PATCH 21/43] Debug: fingerprint the machine N frames after a state
+ load (determinism check)
+
+---
+ Source/ui_js/Main.cpp | 74 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 73 insertions(+), 1 deletion(-)
+
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 248663cd..55e91fca 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -1,6 +1,7 @@
+ #include <cstdio>
+ #include <atomic>
+ #include <future>
++#include <mutex>
+ #include <emscripten/bind.h>
+ #include <AL/al.h>
+ #include "Ps2VmJs.h"
+@@ -13,6 +14,10 @@
+ #include "WsxFrameStats.h"
+ #include "WsxJitCache.h"
+ #include "WsxProfile.h"
++#include "xxhash.h"
++#include "Ps2Const.h"
++#include "ee/Ee_SubSystem.h"
++#include "iop/Iop_SubSystem.h"
+ #include "DefaultAppConfig.h"
+ #include "AppConfig.h"
+ #include "PS2VM_Preferences.h"
+@@ -22,6 +27,41 @@ CPs2VmJs* g_virtualMachine = nullptr;
+ CGSHandler::NewFrameEvent::Connection g_gsNewFrameConnection;
+ CPS2VM::NewFrameEvent::Connection g_vmNewFrameConnection;
+ std::atomic<uint32> g_vblankCount = 0;
++
++// Determinism check (bench): fingerprint the emulated machine a set number of frames after a state
++// load, so two cores can be shown to emulate the same thing (setStateHashFrames, getStateHash).
++static uint32 g_stateHashFrames = 0;
++static uint32 g_stateHashTarget = 0;
++static std::string g_stateHash;
++static std::mutex g_stateHashMutex;
++
++static void CheckStateHash()
++{
++	if((g_stateHashTarget == 0) || (g_vblankCount.load() != g_stateHashTarget)) return;
++	g_stateHashTarget = 0;
++	auto& ee = g_virtualMachine->m_ee;
++	auto& iop = g_virtualMachine->m_iop;
++	auto hash = [](const void* data, size_t size) {
++		char text[20];
++		snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(XXH3_64bits(data, size)));
++		return std::string(text);
++	};
++	std::string result = "{";
++	result += "\"eeRam\":\"" + hash(ee->m_ram, PS2::EE_RAM_SIZE) + "\",";
++	result += "\"spr\":\"" + hash(ee->m_spr, PS2::EE_SPR_SIZE) + "\",";
++	result += "\"eeGpr\":\"" + hash(ee->m_EE.m_State.nGPR, sizeof(ee->m_EE.m_State.nGPR)) + "\",";
++	result += "\"eePc\":\"" + std::to_string(ee->m_EE.m_State.nPC) + "\",";
++	result += "\"vu0Mem\":\"" + hash(ee->m_vuMem0, PS2::VUMEM0SIZE) + "\",";
++	result += "\"vu1Mem\":\"" + hash(ee->m_vuMem1, PS2::VUMEM1SIZE) + "\",";
++	result += "\"vu1Regs\":\"" + hash(ee->m_VU1.m_State.nCOP2, sizeof(ee->m_VU1.m_State.nCOP2)) + "\",";
++	result += "\"iopRam\":\"" + hash(iop->m_ram, PS2::IOP_RAM_SIZE) + "\"";
++	result += "}";
++	{
++		std::lock_guard<std::mutex> lock(g_stateHashMutex);
++		g_stateHash = result;
++	}
++	g_virtualMachine->PauseAsync();
++}
+ std::shared_ptr<CInputProviderEmscripten> g_inputProvider;
+ CSH_WsxRing* g_soundHandler = nullptr;
+ std::future<bool> g_stateOp;
+@@ -75,7 +115,10 @@ static void CreateVm(int width, int height, const CPadHandler::FactoryFunction&
+ 	g_virtualMachine = new CPs2VmJs();
+ 	g_virtualMachine->Initialize();
+ 	//Heartbeat for the page's stall watchdog: counts emulated frames even when the GS draws nothing.
+-	g_vmNewFrameConnection = g_virtualMachine->OnNewFrame.Connect([]() { g_vblankCount++; });
++	g_vmNewFrameConnection = g_virtualMachine->OnNewFrame.Connect([]() {
++		g_vblankCount++;
++		CheckStateHash();
++	});
+ 
+ 	//Sound goes to the page's AudioWorklet through a ring in the heap, in ~11 ms pieces (the default
+ 	//100 SPU blocks per write is ~100 ms of sound at a time).
+@@ -245,6 +288,32 @@ void saveState(std::string path)
+ void loadState(std::string path)
+ {
+ 	g_stateOp = g_virtualMachine->LoadState(path);
++	g_virtualMachine->SendVmCall([]() {
++		if(g_stateHashFrames != 0) g_stateHashTarget = g_vblankCount.load() + g_stateHashFrames;
++	});
++}
++
++// Arms the determinism check for the next state load: the VM pauses that many frames after it and
++// getStateHash() returns the fingerprint (empty until then).
++void setStateHashFrames(uint32 frames)
++{
++	g_stateHashFrames = frames;
++	std::lock_guard<std::mutex> lock(g_stateHashMutex);
++	g_stateHash.clear();
++}
++
++// Arms the determinism check from now (a cold boot): the fingerprint is taken that many frames later.
++void armStateHash()
++{
++	g_virtualMachine->SendVmCall([]() {
++		if(g_stateHashFrames != 0) g_stateHashTarget = g_vblankCount.load() + g_stateHashFrames;
++	});
++}
++
++std::string getStateHash()
++{
++	std::lock_guard<std::mutex> lock(g_stateHashMutex);
++	return g_stateHash;
+ }
+ 
+ int pollStateOp()
+@@ -380,6 +449,9 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("getFrameStatsAddress", &getFrameStatsAddress);
+ 	function("getAudioRingAddress", &getAudioRingAddress);
+ 	function("getVmZoneAddress", &getVmZoneAddress);
++	function("setStateHashFrames", &setStateHashFrames);
++	function("getStateHash", &getStateHash);
++	function("armStateHash", &armStateHash);
+ 	function("jitCacheAlloc", &jitCacheAlloc);
+ 	function("jitCacheLoad", &jitCacheLoad);
+ 	function("jitCacheTakeNew", &jitCacheTakeNew);
+-- 
+2.51.0.windows.1
+

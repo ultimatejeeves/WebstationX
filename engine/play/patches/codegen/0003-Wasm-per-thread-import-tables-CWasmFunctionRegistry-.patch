@@ -1,0 +1,91 @@
+From 0ad9885ed579669845c2946dd6d31cf17b0217f9 Mon Sep 17 00:00:00 2001
+From: wsx <wsx@localhost>
+Date: Tue, 29 Sep 2026 22:34:37 -0400
+Subject: [PATCH 3/6] Wasm: per-thread import tables
+ (CWasmFunctionRegistry::InitializeThread)
+
+---
+ include/Jitter_CodeGen_Wasm.h |  4 ++++
+ src/Jitter_CodeGen_Wasm.cpp   | 29 +++++++++++++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/include/Jitter_CodeGen_Wasm.h b/include/Jitter_CodeGen_Wasm.h
+index 104448a..adde5e2 100644
+--- a/include/Jitter_CodeGen_Wasm.h
++++ b/include/Jitter_CodeGen_Wasm.h
+@@ -15,10 +15,14 @@ namespace Jitter
+ 		{
+ 			int32 id = 0;
+ 			std::string signature;
++			std::string name;
+ 		};
+ 
+ 		static void RegisterFunction(uintptr_t, const char*, const char*);
+ 		static const WASM_FUNCTION_INFO* FindFunction(uintptr_t);
++		//Each thread running compiled code needs its own import table (JS state is per thread): builds
++		//it for the calling thread with the ids the functions were registered with.
++		static void InitializeThread();
+ 
+ 	private:
+ 		static std::map<uintptr_t, WASM_FUNCTION_INFO> m_functions;
+diff --git a/src/Jitter_CodeGen_Wasm.cpp b/src/Jitter_CodeGen_Wasm.cpp
+index a7897cc..03edb42 100644
+--- a/src/Jitter_CodeGen_Wasm.cpp
++++ b/src/Jitter_CodeGen_Wasm.cpp
+@@ -196,10 +196,34 @@ EM_JS(int, RegisterExternFunction, (const char* functionName, const char* functi
+ 	out(`Registered function '${fctName}(${fctSig})' = > id = ${fctId}.`);
+ 	return fctId;
+ });
++EM_JS(void, RegisterExternFunctionAt, (const char* functionName, const char* functionSig, int fctId), {
++	let fctName = UTF8ToString(functionName);
++	let fctSig = UTF8ToString(functionSig);
++	if(Module.codeGenImportTable === undefined) {
++		Module.codeGenImportTable = new WebAssembly.Table({
++			element: 'anyfunc',
++			initial: 32
++		});
++		Module.codeGenImportTableNextIndex = 0;
++	}
++	while(Module.codeGenImportTable.length <= fctId) {
++		Module.codeGenImportTable.grow(16);
++	}
++	Module.codeGenImportTable.set(fctId, convertJsFunctionToWasm(Module[fctName], fctSig));
++	Module.codeGenImportTableNextIndex = Math.max(Module.codeGenImportTableNextIndex, fctId + 1);
++});
+ // clang-format on
+ 
+ std::map<uintptr_t, CWasmFunctionRegistry::WASM_FUNCTION_INFO> CWasmFunctionRegistry::m_functions;
+ 
++void CWasmFunctionRegistry::InitializeThread()
++{
++	for(const auto& [functionPtr, functionInfo] : m_functions)
++	{
++		RegisterExternFunctionAt(functionInfo.name.c_str(), functionInfo.signature.c_str(), functionInfo.id);
++	}
++}
++
+ void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char* functionName, const char* functionSig)
+ {
+ 	{
+@@ -209,6 +233,7 @@ void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char*
+ 	WASM_FUNCTION_INFO functionInfo;
+ 	functionInfo.id = RegisterExternFunction(functionName, functionSig);
+ 	functionInfo.signature = functionSig;
++	functionInfo.name = functionName;
+ 	m_functions.insert(std::make_pair(functionPtr, functionInfo));
+ }
+ 
+@@ -231,6 +256,10 @@ const CWasmFunctionRegistry::WASM_FUNCTION_INFO* CWasmFunctionRegistry::FindFunc
+ 	return &fctInfo;
+ }
+ 
++void CWasmFunctionRegistry::InitializeThread()
++{
++}
++
+ #endif
+ 
+ CCodeGen_Wasm::CCodeGen_Wasm()
+-- 
+2.51.0.windows.1
+

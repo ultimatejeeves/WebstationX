@@ -1,0 +1,1049 @@
+From af84bad2a2951c08dfabb28a3d20b821f89f7401 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 13:56:45 -0400
+Subject: [PATCH 34/43] DMA: channel 1 stays busy until the VPU1 thread took
+ its data; GS: register runs, cached triangle vertices, fewer GL calls per
+ draw; VIF1 status polls during a pending interrupt are idle; debug traces
+
+---
+ Source/WsxProfile.h                         |  14 +
+ Source/ee/DMAC.cpp                          |  18 ++
+ Source/ee/DMAC.h                            |   1 +
+ Source/ee/Dmac_Channel.cpp                  |  37 ++-
+ Source/ee/Dmac_Channel.h                    |  12 +
+ Source/ee/Ee_SubSystem.cpp                  |  16 +
+ Source/ee/Vif.cpp                           |   2 +
+ Source/ee/Vif.h                             |   5 +
+ Source/ee/Vpu1Thread.cpp                    |  11 +-
+ Source/ee/Vpu1Thread.h                      |  12 +
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp         | 342 ++++++++++----------
+ Source/gs/GSH_OpenGL/GSH_OpenGL.h           |  14 +
+ Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp |   5 +
+ Source/gs/GSHandler.cpp                     |  15 +-
+ Source/gs/GSHandler.h                       |   3 +
+ Source/ui_js/Main.cpp                       |   6 +
+ 16 files changed, 332 insertions(+), 181 deletions(-)
+
+diff --git a/Source/WsxProfile.h b/Source/WsxProfile.h
+index ea05e986..1a7f0cd2 100644
+--- a/Source/WsxProfile.h
++++ b/Source/WsxProfile.h
+@@ -6,6 +6,20 @@
+ //Where the VM thread's time goes (WebStationX): the unit being emulated right now is kept in one word
+ //of shared memory, and the page samples it from another thread (cheap enough to leave on: timing each
+ //unit with the clock costs a JS call per read on the web, which made the measured units twice as slow).
++#include <atomic>
++#include <cstdio>
++//Debug: lines left to log of the hand-overs between the EE and the VPU1 thread (vifTrace(n) from the page)
++inline std::atomic<int> g_wsxVifTrace{0};
++#define WSX_VIF_TRACE(...) \
++	do \
++	{ \
++		if(g_wsxVifTrace.load(std::memory_order_relaxed) > 0) \
++		{ \
++			g_wsxVifTrace.fetch_sub(1, std::memory_order_relaxed); \
++			printf("VT " __VA_ARGS__); \
++		} \
++	} while(0)
++
+ namespace WsxProfile
+ {
+ 	enum ZONE : uint32
+diff --git a/Source/ee/DMAC.cpp b/Source/ee/DMAC.cpp
+index 9e8cc3a1..09f12d90 100644
+--- a/Source/ee/DMAC.cpp
++++ b/Source/ee/DMAC.cpp
+@@ -1,6 +1,7 @@
+ #include <cstring>
+ #include <stdio.h>
+ #include "DMAC.h"
++#include "../WsxProfile.h"
+ #include "../Ps2Const.h"
+ #include "Log.h"
+ #include "../states/RegisterStateFile.h"
+@@ -165,6 +166,22 @@ void CDMAC::SetChannelTransferFunction(unsigned int channel, const DmaReceiveHan
+ 	}
+ }
+ 
++void CDMAC::SetChannelBusyHandler(unsigned int channel, const Dmac::CChannel::BusyHandler& handler)
++{
++	switch(channel)
++	{
++	case 1:
++		m_D1.SetBusyHandler(handler);
++		break;
++	case 2:
++		m_D2.SetBusyHandler(handler);
++		break;
++	default:
++		throw std::runtime_error("Unsupported channel.");
++		break;
++	}
++}
++
+ bool CDMAC::IsInterruptPending() const
+ {
+ 	uint16 mask = static_cast<uint16>((m_D_STAT & 0x63FF0000) >> 16);
+@@ -180,6 +197,7 @@ void CDMAC::ResumeDMA0()
+ 
+ void CDMAC::ResumeDMA1()
+ {
++	m_D1.CheckPendingEnd();
+ 	m_D1.Execute();
+ }
+ 
+diff --git a/Source/ee/DMAC.h b/Source/ee/DMAC.h
+index 0339e845..4c92387c 100644
+--- a/Source/ee/DMAC.h
++++ b/Source/ee/DMAC.h
+@@ -125,6 +125,7 @@ public:
+ 	void DisassembleSet(uint32, uint32);
+ 
+ 	bool IsInterruptPending() const;
++	void SetChannelBusyHandler(unsigned int, const Dmac::CChannel::BusyHandler&);
+ 	void ResumeDMA0();
+ 	void ResumeDMA1();
+ 	void ResumeDMA2();
+diff --git a/Source/ee/Dmac_Channel.cpp b/Source/ee/Dmac_Channel.cpp
+index 3e78ee1c..e3b7c8fc 100644
+--- a/Source/ee/Dmac_Channel.cpp
++++ b/Source/ee/Dmac_Channel.cpp
+@@ -38,10 +38,13 @@ void CChannel::Reset()
+ 	m_nSCCTRL = 0;
+ 	m_nASR[0] = 0;
+ 	m_nASR[1] = 0;
++	m_endPending = false;
+ }
+ 
+ void CChannel::SaveState(Framework::CZipArchiveWriter& archive)
+ {
++	//(States are captured with the device's queue empty.)
++	CheckPendingEnd();
+ 	auto path = string_format(STATE_REGS_XML_FORMAT, m_number);
+ 	auto registerFile = std::make_unique<CRegisterStateFile>(path.c_str());
+ 	registerFile->SetRegister32(STATE_REGS_CHCR, m_CHCR);
+@@ -56,6 +59,7 @@ void CChannel::SaveState(Framework::CZipArchiveWriter& archive)
+ 
+ void CChannel::LoadState(Framework::CZipArchiveReader& archive)
+ {
++	m_endPending = false;
+ 	auto path = string_format(STATE_REGS_XML_FORMAT, m_number);
+ 	CRegisterStateFile registerFile(*archive.BeginReadFile(path.c_str()));
+ 	m_CHCR <<= registerFile.GetRegister32(STATE_REGS_CHCR);
+@@ -69,13 +73,34 @@ void CChannel::LoadState(Framework::CZipArchiveReader& archive)
+ 
+ uint32 CChannel::ReadCHCR()
+ {
+-	return m_CHCR;
++	CheckPendingEnd();
++	uint32 value = m_CHCR;
++	if(m_endPending) value |= CDMAC::CHCR_STR;
++	return value;
++}
++
++void CChannel::SetBusyHandler(const BusyHandler& busyHandler)
++{
++	m_busyHandler = busyHandler;
++}
++
++void CChannel::CheckPendingEnd()
++{
++	if(m_endPending && !(m_busyHandler && m_busyHandler()))
++	{
++		m_endPending = false;
++		EndTransfer();
++	}
+ }
+ 
+ void CChannel::WriteCHCR(uint32 nValue)
+ {
+ 	bool nSuspend = false;
+ 
++	//Taking the channel for something else while the device still holds the previous transfer (a download
++	//in the middle of a display list): that transfer is over as far as the channel goes
++	m_endPending = false;
++
+ 	//We need to check if the purpose of this write is to suspend the current transfer
+ 	if(m_dmac.m_D_ENABLE & CDMAC::ENABLE_CPND)
+ 	{
+@@ -565,6 +590,16 @@ void CChannel::ClearSTR()
+ {
+ 	m_CHCR.nSTR = ~m_CHCR.nSTR;
+ 
++	if(m_busyHandler && m_busyHandler())
++	{
++		m_endPending = true;
++		return;
++	}
++	EndTransfer();
++}
++
++void CChannel::EndTransfer()
++{
+ 	//Set interrupt
+ 	m_dmac.m_D_STAT |= (1 << m_number);
+ 
+diff --git a/Source/ee/Dmac_Channel.h b/Source/ee/Dmac_Channel.h
+index a4734c8a..8baafc41 100644
+--- a/Source/ee/Dmac_Channel.h
++++ b/Source/ee/Dmac_Channel.h
+@@ -80,6 +80,14 @@ namespace Dmac
+ 		void ExecuteDestinationChain();
+ 		void SetReceiveHandler(const DmaReceiveHandler&);
+ 
++		//A device that takes transfers before it processes them (the VPU1 thread's queue) tells here whether
++		//it is still working on what the channel sent: the transfer only ends for the EE (STR cleared, the
++		//channel's interrupt) once it isn't. Games tell from the channel that the VIF went through a display
++		//list, interrupt stalls included (ATV Offroad Fury 2 moves on to the next frame's texture list).
++		typedef std::function<bool()> BusyHandler;
++		void SetBusyHandler(const BusyHandler&);
++		void CheckPendingEnd();
++
+ 		CHCR m_CHCR;
+ 		uint32 m_nMADR;
+ 		uint32 m_nQWC;
+@@ -95,6 +103,10 @@ namespace Dmac
+ 
+ 		void ExecuteSourceChainTransfer(bool);
+ 		void ClearSTR();
++		void EndTransfer();
++
++		BusyHandler m_busyHandler;
++		bool m_endPending = false;
+ 
+ 		CDMAC& m_dmac;
+ 		unsigned int m_number = 0;
+diff --git a/Source/ee/Ee_SubSystem.cpp b/Source/ee/Ee_SubSystem.cpp
+index c32f2b55..8323c288 100644
+--- a/Source/ee/Ee_SubSystem.cpp
++++ b/Source/ee/Ee_SubSystem.cpp
+@@ -225,6 +225,8 @@ void CSubSystem::StartVpu1Thread()
+ 	                                  [this](uint32 address, uint32 qwc, uint32, bool tagIncluded) {
+ 		                                  return m_vpu1Thread->SendPath3Dma(address, qwc, tagIncluded);
+ 	                                  });
++	//The queue takes a whole display list at once: the channel stays busy while the thread works through it
++	m_dmac.SetChannelBusyHandler(CDMAC::CHANNEL_ID_VIF1, [this]() { return m_vpu1Thread->HasPendingVif1Dma(); });
+ }
+ 
+ void CSubSystem::StopVpu1Thread()
+@@ -235,6 +237,7 @@ void CSubSystem::StopVpu1Thread()
+ 		m_VU1.m_executor.reset();
+ 		m_VU1.m_emptyBlockHandler = nullptr;
+ 	});
++	m_dmac.SetChannelBusyHandler(CDMAC::CHANNEL_ID_VIF1, nullptr);
+ 	m_vpu1Thread.reset();
+ }
+ 
+@@ -248,6 +251,7 @@ void CSubSystem::SyncVpu1(uint32 reason)
+ 
+ void CSubSystem::DeliverVpu1Interrupts(uint32 lines)
+ {
++	if(lines) WSX_VIF_TRACE("ee irq lines=%x pc=%08x\n", lines, m_EE.m_State.nPC);
+ 	if(lines & (1 << CINTC::INTC_LINE_VIF1))
+ 	{
+ 		//Raised after a delay, like the VIF does itself (CVif::CountTicks)
+@@ -269,6 +273,7 @@ uint32 CSubSystem::Vif1ThreadedReceiveDMA(uint32 address, uint32 qwc, uint32 dir
+ 	{
+ 		//GS to memory: done here, once the thread is done with what it was sent
+ 		m_vpu1Thread->Drain(CVpu1Thread::DRAIN_GS_READBACK);
++		WSX_VIF_TRACE("ee download addr=%08x qwc=%u\n", address, qwc);
+ 		WsxFrameStats::CScope waitScope(WsxFrameStats::g_eeGsWaitUs);
+ 		return m_vpu1->GetVif().ReceiveDMA(address, qwc, direction, tagIncluded);
+ 	}
+@@ -624,6 +629,16 @@ uint32 CSubSystem::IOPortReadHandler(uint32 nAddress)
+ 	{
+ 		SyncVpu1(CVpu1Thread::DRAIN_VIF1_READ);
+ 		nReturn = m_vpu1->GetVif().GetRegister(nAddress);
++		if((nAddress == CVif::VIF1_STAT) && (m_EE.m_State.nPC < PS2::EE_RAM_SIZE) &&
++		   (m_vpu1->GetVif().IsInterruptScheduled() || (m_vpu1Thread && m_vpu1Thread->HasPendingInterrupts())))
++		{
++			//VIF1 raised an interrupt that hasn't reached the EE yet (it gets there a little later, as on
++			//hardware), and stays as it is until the EE serves it. Code polling its status meanwhile is
++			//waiting: skip to the interrupt instead of running the poll a hundred times. (ATV Offroad Fury 2
++			//stalls VIF1 this way before every batch of textures, 130 times a frame, with its main thread
++			//in such a loop: more than half the EE cycles of a frame.)
++			m_EE.m_State.nHasException = MIPS_EXCEPTION_IDLE;
++		}
+ 	}
+ 	else if(nAddress >= 0x10008000 && nAddress <= 0x1000EFFC)
+ 	{
+@@ -708,6 +723,7 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
+ 	else if(nAddress >= CVif::REGS1_START && nAddress < CVif::REGS1_END)
+ 	{
+ 		SyncVpu1(CVpu1Thread::DRAIN_VIF1_WRITE);
++		WSX_VIF_TRACE("ee vif1 write %08x=%08x pc=%08x stat=%08x\n", nAddress, nData, m_EE.m_State.nPC, m_vpu1->GetVif().GetRegister(CVif::VIF1_STAT));
+ 		m_vpu1->GetVif().SetRegister(nAddress, nData);
+ 		if(m_vpu1Thread) m_vpu1Thread->Kick();
+ 	}
+diff --git a/Source/ee/Vif.cpp b/Source/ee/Vif.cpp
+index cb502ed6..0db4082f 100644
+--- a/Source/ee/Vif.cpp
++++ b/Source/ee/Vif.cpp
+@@ -464,6 +464,7 @@ void CVif::ProcessPacket(StreamType& stream)
+ 
+ 		if(m_STAT.nVIS)
+ 		{
++			if(m_number == 1) WSX_VIF_TRACE("  th vif1 stalled, left=%u\n", stream.GetAvailableReadBytes());
+ 			break;
+ 		}
+ 
+@@ -471,6 +472,7 @@ void CVif::ProcessPacket(StreamType& stream)
+ 
+ 		if(m_CODE.nI != 0)
+ 		{
++			if(m_number == 1) WSX_VIF_TRACE("  th vif1 i-bit code=%08x left=%u\n", static_cast<uint32>(m_CODE), stream.GetAvailableReadBytes());
+ 			//Next command will be stalled (if not MARK)
+ 			if(m_CODE.nCMD != CODE_CMD_MARK)
+ 			{
+diff --git a/Source/ee/Vif.h b/Source/ee/Vif.h
+index 967c1042..cdddbc95 100644
+--- a/Source/ee/Vif.h
++++ b/Source/ee/Vif.h
+@@ -91,6 +91,11 @@ public:
+ 	uint32 ProcessThreaded();
+ 	void SetInterruptPoster(std::function<void()>);
+ 	void ScheduleInterrupt();
++	//The VIF is stalled on an interrupt that is on its way to the EE
++	bool IsInterruptScheduled() const
++	{
++		return m_interruptDelayTicks != 0;
++	}
+ 
+ protected:
+ 	enum
+diff --git a/Source/ee/Vpu1Thread.cpp b/Source/ee/Vpu1Thread.cpp
+index d78b0f2b..703d1308 100644
+--- a/Source/ee/Vpu1Thread.cpp
++++ b/Source/ee/Vpu1Thread.cpp
+@@ -228,6 +228,10 @@ uint32 CVpu1Thread::SendVif1Dma(uint32 address, uint32 qwc, bool tagIncluded)
+ 		record->kind = KIND_VIF1_DMA;
+ 		record->dma.tagIncluded = (tagIncluded && (sent == 0)) ? 1 : 0;
+ 		CopyFromEeMemory(record->GetPayload(), m_ram, m_spr, address + (sent * 0x10), chunk * 0x10);
++		WSX_VIF_TRACE("ee vif1 dma seq=%u addr=%08x qwc=%u tag=%d w0=%08x w1=%08x w2=%08x w3=%08x\n", (unsigned)m_nextSeq, address + (sent * 0x10), chunk, (int)record->dma.tagIncluded,
++		              reinterpret_cast<uint32*>(record->GetPayload())[0], reinterpret_cast<uint32*>(record->GetPayload())[1],
++		              reinterpret_cast<uint32*>(record->GetPayload())[2], reinterpret_cast<uint32*>(record->GetPayload())[3]);
++		m_vif1DmaSent = m_nextSeq;
+ 		Publish(*m_vif1Ring, record);
+ 		sent += chunk;
+ 	}
+@@ -263,6 +267,7 @@ uint32 CVpu1Thread::SendPath3Dma(uint32 address, uint32 qwc, bool tagIncluded)
+ 		}
+ 		record->kind = KIND_PATH3_DMA;
+ 		record->dma.tagIncluded = (tagIncluded && (sent == 0)) ? 1 : 0;
++		WSX_VIF_TRACE("ee path3 dma seq=%u addr=%08x qwc=%u\n", (unsigned)m_nextSeq, address + (sent * 0x10), chunk);
+ 		CopyFromEeMemory(record->GetPayload(), m_ram, m_spr, address + (sent * 0x10), chunk * 0x10);
+ 		Publish(*m_path3Ring, record);
+ 		sent += chunk;
+@@ -469,6 +474,7 @@ void CVpu1Thread::ThreadProc()
+ 						delete record->call.function;
+ 					}
+ 					if(record->kind == KIND_VBLANK) m_vblanksDone++;
++					if(record->kind == KIND_VIF1_DMA) m_vif1DmaDone.store(record->seq, std::memory_order_release);
+ 					ring.Pop();
+ 					m_completed++;
+ 				}
+@@ -494,7 +500,7 @@ void CVpu1Thread::ThreadProc()
+ 		}
+ 		lock.lock();
+ 
+-		if(m_completed.load() == m_sent.load())
++		if((m_completed.load() == m_sent.load()) && m_waitingForIdle)
+ 		{
+ 			m_idleCondition.notify_all();
+ 		}
+@@ -569,6 +575,7 @@ bool CVpu1Thread::TryVif1(RECORD& record)
+ 		m_vif1Seq = record.seq;
+ 		if(!m_vif1StreamSet)
+ 		{
++			WSX_VIF_TRACE("  th vif1 dma seq=%u size=%u\n", (unsigned)record.seq, record.size);
+ 			vif1.SetThreadedSource(record.GetPayload(), record.size, record.dma.tagIncluded != 0);
+ 			m_vif1StreamSet = true;
+ 		}
+@@ -580,6 +587,7 @@ bool CVpu1Thread::TryVif1(RECORD& record)
+ 		if(remaining == 0)
+ 		{
+ 			m_vif1StreamSet = false;
++			m_vif1DmaDone.store(record.seq, std::memory_order_release);
+ 			CompleteRecord(*m_vif1Ring);
+ 			return true;
+ 		}
+@@ -644,6 +652,7 @@ bool CVpu1Thread::TryPath3(RECORD& record)
+ 		uint32 done = m_path3Offset / 0x10;
+ 		bool tagIncluded = (record.dma.tagIncluded != 0) && (m_path3Offset == 0);
+ 		uint32 taken = m_gif.ReceiveMemory(record.GetPayload(), record.size, m_path3Offset, qwc - done, tagIncluded);
++		WSX_VIF_TRACE("  th path3 seq=%u qwc=%u taken=%u\n", (unsigned)record.seq, qwc - done, taken);
+ 		m_path3Offset += taken * 0x10;
+ 		if(m_path3Offset == record.size)
+ 		{
+diff --git a/Source/ee/Vpu1Thread.h b/Source/ee/Vpu1Thread.h
+index 2de45f29..39fbd5af 100644
+--- a/Source/ee/Vpu1Thread.h
++++ b/Source/ee/Vpu1Thread.h
+@@ -113,6 +113,11 @@ public:
+ 	//EE thread: wait until the thread did everything it was sent (or is stalled on the EE). Afterwards,
+ 	//and until the EE sends or kicks again, the thread doesn't touch any state.
+ 	void Drain(DRAIN_REASON = DRAIN_OTHER);
++	//Is the thread still working on VIF1 DMA data it was sent (or stalled in it)?
++	bool HasPendingVif1Dma() const
++	{
++		return m_vif1DmaDone.load(std::memory_order_acquire) != m_vif1DmaSent;
++	}
+ 	//After Drain: a parked worker may still own DMA bytes that aren't in a save state.
+ 	bool HasPendingWork() const { return m_completed.load() != m_sent.load(); }
+ 	//Drain, then run on the thread (out of band: also while stalled) and wait for it.
+@@ -124,6 +129,10 @@ public:
+ 
+ 	//EE thread: interrupts raised since the last call (async mode delivers them from CountTicks).
+ 	uint32 TakeInterrupts();
++	bool HasPendingInterrupts() const
++	{
++		return m_pendingInterrupts.load(std::memory_order_relaxed) != 0;
++	}
+ 
+ 	//Thread side: raise an INTC line on the EE.
+ 	void PostInterrupt(uint32 line);
+@@ -172,6 +181,9 @@ private:
+ 	uint64 m_drainedKicks = ~uint64(0);
+ 	uint64 m_nextSeq = 1;
+ 	std::atomic<uint64> m_sent = 0;
++	//Sequence numbers of the last VIF1 DMA record sent (EE side) and completed (or discarded)
++	uint64 m_vif1DmaSent = 0;
++	std::atomic<uint64> m_vif1DmaDone = 0;
+ 	std::atomic<uint64> m_completed = 0;
+ 
+ 	//Current partially processed records.
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 195780af..6eacb0e0 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -183,13 +183,14 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 	for(const auto& layer : dispInfo.layers)
+ 	{
+ 		if(!layer.enabled) continue;
+-		m_swDisplayedPtrs.insert(layer.bufPtr);
+-		m_swTargets.erase(layer.bufPtr);
++		if(m_swDisplayedPtrs.insert(layer.bufPtr).second) printf("WSXSW displayed %x (flip %u)\n", layer.bufPtr, m_swFlipCount);
++		if(m_swTargets.erase(layer.bufPtr)) printf("WSXSW target %x displayed: dropped\n", layer.bufPtr);
+ 	}
+ 	for(auto targetIterator = m_swTargets.begin(); targetIterator != m_swTargets.end();)
+ 	{
+ 		if((m_swFlipCount - targetIterator->second) > SW_TARGET_LIFETIME)
+ 		{
++			printf("WSXSW target %x expired (flip %u)\n", targetIterator->first, m_swFlipCount);
+ 			targetIterator = m_swTargets.erase(targetIterator);
+ 		}
+ 		else
+@@ -198,6 +199,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 		}
+ 	}
+ 	if(m_swTargets.empty()) m_swDepthPtrs.clear();
++	m_ctxDirty = true;
+ 
+ 	const auto& dispLayer = dispInfo.layers[0];
+ 
+@@ -221,6 +223,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 		if(!framebuffer && (dispLayer.bufWidth != 0))
+ 		{
+ 			framebuffer = FramebufferPtr(new CFramebuffer(dispLayer.bufPtr, dispLayer.bufWidth, FRAMEBUFFER_HEIGHT, dispLayer.psm, m_fbScale, m_multisampleEnabled));
++			m_textureParams.erase(static_cast<GLuint>(framebuffer->m_texture));
+ 			m_framebuffers.push_back(framebuffer);
+ 			PopulateFramebuffer(framebuffer);
+ 		}
+@@ -268,6 +271,8 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
++		//(The draw pass sets them again when a game samples this buffer)
++		m_textureParams.erase(static_cast<GLuint>(framebuffer->m_texture));
+ 
+ 		glUseProgram(*m_presentProgram);
+ 
+@@ -1088,6 +1093,7 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+ 	if(!framebuffer)
+ 	{
+ 		framebuffer = FramebufferPtr(new CFramebuffer(frame.GetBasePtr(), frame.GetWidth(), FRAMEBUFFER_HEIGHT, frame.nPsm, m_fbScale, m_multisampleEnabled));
++		m_textureParams.erase(static_cast<GLuint>(framebuffer->m_texture));
+ 		m_framebuffers.push_back(framebuffer);
+ 		PopulateFramebuffer(framebuffer);
+ 	}
+@@ -1576,119 +1582,63 @@ void CGSH_OpenGL::Prim_Line()
+ 	m_vertexBuffer.insert(m_vertexBuffer.end(), std::begin(vertices), std::end(vertices));
+ }
+ 
+-void CGSH_OpenGL::Prim_Triangle()
++void CGSH_OpenGL::ConvertTriangleVertex(unsigned int slot)
+ {
+-	float nF1, nF2, nF3;
+-
+-	XYZ vertex[3];
+-	vertex[0] <<= m_VtxBuffer[2].position;
+-	vertex[1] <<= m_VtxBuffer[1].position;
+-	vertex[2] <<= m_VtxBuffer[0].position;
+-
+-	float nX1 = vertex[0].GetX(), nX2 = vertex[1].GetX(), nX3 = vertex[2].GetX();
+-	float nY1 = vertex[0].GetY(), nY2 = vertex[1].GetY(), nY3 = vertex[2].GetY();
+-	uint32 nZ1 = vertex[0].nZ, nZ2 = vertex[1].nZ, nZ3 = vertex[2].nZ;
+-
+-	RGBAQ rgbaq[3];
+-	rgbaq[0] <<= m_VtxBuffer[2].rgbaq;
+-	rgbaq[1] <<= m_VtxBuffer[1].rgbaq;
+-	rgbaq[2] <<= m_VtxBuffer[0].rgbaq;
++	const auto& source = m_VtxBuffer[slot];
++	auto& vertex = m_vtxPrim[slot];
+ 
+-	nX1 -= m_nPrimOfsX;
+-	nX2 -= m_nPrimOfsX;
+-	nX3 -= m_nPrimOfsX;
++	auto position = make_convertible<XYZ>(source.position);
++	auto rgbaq = make_convertible<RGBAQ>(source.rgbaq);
+ 
+-	nY1 -= m_nPrimOfsY;
+-	nY2 -= m_nPrimOfsY;
+-	nY3 -= m_nPrimOfsY;
+-
+-	if(m_PrimitiveMode.nFog)
+-	{
+-		nF1 = (float)(0xFF - m_VtxBuffer[2].fog) / 255.0f;
+-		nF2 = (float)(0xFF - m_VtxBuffer[1].fog) / 255.0f;
+-		nF3 = (float)(0xFF - m_VtxBuffer[0].fog) / 255.0f;
+-	}
+-	else
+-	{
+-		nF1 = nF2 = nF3 = 0.0;
+-	}
+-
+-	float nS[3] = {0, 0, 0};
+-	float nT[3] = {0, 0, 0};
+-	float nQ[3] = {1, 1, 1};
++	vertex.x = position.GetX() - m_nPrimOfsX;
++	vertex.y = position.GetY() - m_nPrimOfsY;
++	vertex.z = position.nZ;
++	vertex.color = MakeColor(rgbaq.nR, rgbaq.nG, rgbaq.nB, rgbaq.nA);
++	vertex.f = m_PrimitiveMode.nFog ? ((float)(0xFF - source.fog) / 255.0f) : 0.0f;
+ 
++	vertex.s = 0;
++	vertex.t = 0;
++	vertex.q = 1;
+ 	if(m_PrimitiveMode.nTexture)
+ 	{
+ 		if(m_PrimitiveMode.nUseUV)
+ 		{
+-			UV uv[3];
+-			uv[0] <<= m_VtxBuffer[2].uv;
+-			uv[1] <<= m_VtxBuffer[1].uv;
+-			uv[2] <<= m_VtxBuffer[0].uv;
+-
+-			nS[0] = uv[0].GetU() / static_cast<float>(m_nTexWidth);
+-			nS[1] = uv[1].GetU() / static_cast<float>(m_nTexWidth);
+-			nS[2] = uv[2].GetU() / static_cast<float>(m_nTexWidth);
+-
+-			nT[0] = uv[0].GetV() / static_cast<float>(m_nTexHeight);
+-			nT[1] = uv[1].GetV() / static_cast<float>(m_nTexHeight);
+-			nT[2] = uv[2].GetV() / static_cast<float>(m_nTexHeight);
++			auto uv = make_convertible<UV>(source.uv);
++			vertex.s = uv.GetU() / static_cast<float>(m_nTexWidth);
++			vertex.t = uv.GetV() / static_cast<float>(m_nTexHeight);
+ 		}
+ 		else
+ 		{
+-			ST st[3];
+-			st[0] <<= m_VtxBuffer[2].st;
+-			st[1] <<= m_VtxBuffer[1].st;
+-			st[2] <<= m_VtxBuffer[0].st;
+-
+-			nS[0] = st[0].nS;
+-			nS[1] = st[1].nS;
+-			nS[2] = st[2].nS;
+-			nT[0] = st[0].nT;
+-			nT[1] = st[1].nT;
+-			nT[2] = st[2].nT;
+-
+-			bool isQ0Neg = (rgbaq[0].nQ < 0);
+-			bool isQ1Neg = (rgbaq[1].nQ < 0);
+-			bool isQ2Neg = (rgbaq[2].nQ < 0);
+-
+-			assert(isQ0Neg == isQ1Neg);
+-			assert(isQ1Neg == isQ2Neg);
+-
+-			nQ[0] = rgbaq[0].nQ;
+-			nQ[1] = rgbaq[1].nQ;
+-			nQ[2] = rgbaq[2].nQ;
++			auto st = make_convertible<ST>(source.st);
++			vertex.s = st.nS;
++			vertex.t = st.nT;
++			vertex.q = rgbaq.nQ;
+ 		}
+ 	}
++	m_vtxPrimStamp[slot] = m_primStamp;
++}
+ 
+-	auto color1 = MakeColor(
+-	    rgbaq[0].nR, rgbaq[0].nG,
+-	    rgbaq[0].nB, rgbaq[0].nA);
+-
+-	auto color2 = MakeColor(
+-	    rgbaq[1].nR, rgbaq[1].nG,
+-	    rgbaq[1].nB, rgbaq[1].nA);
++void CGSH_OpenGL::Prim_Triangle()
++{
++	//Oldest vertex first (slot 2), as kicked
++	for(unsigned int slot = 0; slot < 3; slot++)
++	{
++		if(m_vtxPrimStamp[slot] != m_primStamp) ConvertTriangleVertex(slot);
++	}
+ 
+-	auto color3 = MakeColor(
+-	    rgbaq[2].nR, rgbaq[2].nG,
+-	    rgbaq[2].nB, rgbaq[2].nA);
++	size_t index = m_vertexBuffer.size();
++	m_vertexBuffer.resize(index + 3);
++	auto vertices = &m_vertexBuffer[index];
++	vertices[0] = m_vtxPrim[2];
++	vertices[1] = m_vtxPrim[1];
++	vertices[2] = m_vtxPrim[0];
+ 
+ 	if(m_PrimitiveMode.nShading == 0)
+ 	{
+ 		//Flat shaded triangles use the last color set
+-		color1 = color2 = color3;
++		vertices[0].color = vertices[2].color;
++		vertices[1].color = vertices[2].color;
+ 	}
+-
+-	// clang-format off
+-	PRIM_VERTEX vertices[] =
+-	{
+-		{	nX1,	nY1,	nZ1,	color1,	nS[0],	nT[0],	nQ[0],	nF1	},
+-		{	nX2,	nY2,	nZ2,	color2,	nS[1],	nT[1],	nQ[1],	nF2	},
+-		{	nX3,	nY3,	nZ3,	color3,	nS[2],	nT[2],	nQ[2],	nF3	},
+-	};
+-	// clang-format on
+-
+-	m_vertexBuffer.insert(m_vertexBuffer.end(), std::begin(vertices), std::end(vertices));
+ }
+ 
+ void CGSH_OpenGL::Prim_Sprite()
+@@ -1879,18 +1829,28 @@ void CGSH_OpenGL::DoRenderPass()
+ 		g_wsxGsStats.texSetups.fetch_add(1, std::memory_order_relaxed);
+ 		glActiveTexture(GL_TEXTURE0);
+ 		glBindTexture(GL_TEXTURE_2D, m_renderState.texture0Handle);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, m_renderState.texture0MinFilter);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, m_renderState.texture0MagFilter);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, m_renderState.texture0WrapS);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, m_renderState.texture0WrapT);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, m_renderState.texture0AlphaAsIndex ? GL_ALPHA : GL_RED);
++		if(m_renderState.texture0Handle != 0)
++		{
++			uint64 params = (static_cast<uint64>(m_renderState.texture0MinFilter) & 0xFFFF) |
++			                ((static_cast<uint64>(m_renderState.texture0MagFilter) & 0xFFFF) << 16) |
++			                ((static_cast<uint64>(m_renderState.texture0WrapS) & 0xFFFF) << 32) |
++			                ((static_cast<uint64>(m_renderState.texture0WrapT) & 0x7FFF) << 48) |
++			                (m_renderState.texture0AlphaAsIndex ? (1ULL << 63) : 0);
++			auto& currentParams = m_textureParams[m_renderState.texture0Handle];
++			if(currentParams != params)
++			{
++				currentParams = params;
++				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, m_renderState.texture0MinFilter);
++				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, m_renderState.texture0MagFilter);
++				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, m_renderState.texture0WrapS);
++				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, m_renderState.texture0WrapT);
++				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, m_renderState.texture0AlphaAsIndex ? GL_ALPHA : GL_RED);
++			}
++		}
+ 
++		//(Palette textures get their parameters when they are created)
+ 		glActiveTexture(GL_TEXTURE1);
+ 		glBindTexture(GL_TEXTURE_2D, m_renderState.texture1Handle);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+ 
+ 		m_validGlState |= GLSTATE_TEXTURE;
+ 	}
+@@ -1902,14 +1862,16 @@ void CGSH_OpenGL::DoRenderPass()
+ 		m_validGlState |= GLSTATE_FRAMEBUFFER;
+ 	}
+ 
+-	glBindBufferBase(GL_UNIFORM_BUFFER, 0, m_vertexParamsBuffer);
+-	glBindBufferBase(GL_UNIFORM_BUFFER, 1, m_fragmentParamsBuffer);
+-
+-	glBindBuffer(GL_ARRAY_BUFFER, m_primBuffer);
++	if((m_validGlState & GLSTATE_PRIM_BINDINGS) == 0)
++	{
++		glBindBufferBase(GL_UNIFORM_BUFFER, 0, m_vertexParamsBuffer);
++		glBindBufferBase(GL_UNIFORM_BUFFER, 1, m_fragmentParamsBuffer);
++		glBindBuffer(GL_ARRAY_BUFFER, m_primBuffer);
++		glBindVertexArray(m_primVertexArray);
++		m_validGlState |= GLSTATE_PRIM_BINDINGS;
++	}
+ 	glBufferData(GL_ARRAY_BUFFER, sizeof(PRIM_VERTEX) * m_vertexBuffer.size(), m_vertexBuffer.data(), GL_STREAM_DRAW);
+ 
+-	glBindVertexArray(m_primVertexArray);
+-
+ 	GLenum primitiveMode = GL_NONE;
+ 	switch(m_primitiveType)
+ 	{
+@@ -1980,7 +1942,7 @@ void CGSH_OpenGL::CopyToFb(
+     int32 dstX0, int32 dstY0, int32 dstX1, int32 dstY1)
+ {
+ 	m_validGlState &= ~(GLSTATE_BLEND | GLSTATE_COLORMASK | GLSTATE_SCISSOR | GLSTATE_PROGRAM);
+-	m_validGlState &= ~(GLSTATE_VIEWPORT | GLSTATE_DEPTHTEST | GLSTATE_DEPTHMASK);
++	m_validGlState &= ~(GLSTATE_VIEWPORT | GLSTATE_DEPTHTEST | GLSTATE_DEPTHMASK | GLSTATE_PRIM_BINDINGS);
+ 
+ 	assert(srcX1 >= srcX0);
+ 	assert(srcY1 >= srcY0);
+@@ -2023,6 +1985,7 @@ void CGSH_OpenGL::CopyToFb(
+ void CGSH_OpenGL::WriteRegisterImpl(uint8 nRegister, uint64 nData)
+ {
+ 	CGSHandler::WriteRegisterImpl(nRegister, nData);
++	m_ctxDirty = true;
+ 
+ 	switch(nRegister)
+ 	{
+@@ -2068,6 +2031,37 @@ void CGSH_OpenGL::ProcessPrim(uint64 value)
+ 	}
+ }
+ 
++void CGSH_OpenGL::WriteRegistersImpl(const RegisterWrite* write, const RegisterWrite* writeEnd)
++{
++	//Most writes are vertex data: a color, texture coordinates, then the position that kicks the vertex
++	for(; write != writeEnd; write++)
++	{
++		uint8 reg = write->first;
++		switch(reg)
++		{
++		case GS_REG_RGBAQ:
++		case GS_REG_ST:
++		case GS_REG_UV:
++		case GS_REG_FOG:
++			m_nReg[reg] = write->second;
++			break;
++		case GS_REG_XYZ2:
++		case GS_REG_XYZ3:
++		case GS_REG_XYZF2:
++		case GS_REG_XYZF3:
++			m_nReg[reg] = write->second;
++			VertexKick(reg, write->second);
++			break;
++		default:
++			//Anything else may change what the next primitive is drawn with
++			m_ctxDirty = true;
++			WriteRegisterImpl(reg, write->second);
++			break;
++		}
++	}
++	m_regsDirty = true;
++}
++
+ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
+ {
+ 	if(m_pendingPrim)
+@@ -2083,83 +2077,75 @@ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
+ 
+ 	if(!m_drawEnabled) nDrawingKick = false;
+ 
+-	if(nFog)
+ 	{
+-		m_VtxBuffer[m_nVtxCount - 1].position = nValue & 0x00FFFFFFFFFFFFFFULL;
+-		m_VtxBuffer[m_nVtxCount - 1].rgbaq = m_nReg[GS_REG_RGBAQ];
+-		m_VtxBuffer[m_nVtxCount - 1].uv = m_nReg[GS_REG_UV];
+-		m_VtxBuffer[m_nVtxCount - 1].st = m_nReg[GS_REG_ST];
+-		m_VtxBuffer[m_nVtxCount - 1].fog = (uint8)(nValue >> 56);
+-	}
+-	else
+-	{
+-		m_VtxBuffer[m_nVtxCount - 1].position = nValue;
+-		m_VtxBuffer[m_nVtxCount - 1].rgbaq = m_nReg[GS_REG_RGBAQ];
+-		m_VtxBuffer[m_nVtxCount - 1].uv = m_nReg[GS_REG_UV];
+-		m_VtxBuffer[m_nVtxCount - 1].st = m_nReg[GS_REG_ST];
+-		m_VtxBuffer[m_nVtxCount - 1].fog = (uint8)(m_nReg[GS_REG_FOG] >> 56);
++		auto& vertex = m_VtxBuffer[m_nVtxCount - 1];
++		vertex.rgbaq = m_nReg[GS_REG_RGBAQ];
++		vertex.uv = m_nReg[GS_REG_UV];
++		vertex.st = m_nReg[GS_REG_ST];
++		if(nFog)
++		{
++			vertex.position = nValue & 0x00FFFFFFFFFFFFFFULL;
++			vertex.fog = (uint8)(nValue >> 56);
++		}
++		else
++		{
++			vertex.position = nValue;
++			vertex.fog = (uint8)(m_nReg[GS_REG_FOG] >> 56);
++		}
++		m_vtxPrimStamp[m_nVtxCount - 1] = 0;
+ 	}
+ 
+ 	m_nVtxCount--;
+ 
+ 	if(m_nVtxCount == 0)
+ 	{
+-		if((m_nReg[GS_REG_PRMODECONT] & 1) != 0)
+-		{
+-			m_PrimitiveMode <<= m_nReg[GS_REG_PRIM];
+-		}
+-		else
++		if(nDrawingKick)
+ 		{
+-			m_PrimitiveMode <<= m_nReg[GS_REG_PRMODE];
+-		}
++			//The drawing context is looked at again only when a register it reads was written, or something
++			//(a transfer, a flip) dropped the render state
++			if(m_ctxDirty || !m_renderState.isValid || !m_renderState.isTextureStateValid || !m_renderState.isFramebufferStateValid)
++			{
++				if((m_nReg[GS_REG_PRMODECONT] & 1) != 0)
++				{
++					m_PrimitiveMode <<= m_nReg[GS_REG_PRIM];
++				}
++				else
++				{
++					m_PrimitiveMode <<= m_nReg[GS_REG_PRMODE];
++				}
+ 
+-		if(nDrawingKick && !m_swTargets.empty())
+-		{
+-			auto frame = make_convertible<FRAME>(m_nReg[GS_REG_FRAME_1 + m_PrimitiveMode.nContext]);
+-			if(m_swTargets.find(frame.GetBasePtr()) != m_swTargets.end())
++				m_swDrawActive = false;
++				if(!m_swTargets.empty())
++				{
++					auto frame = make_convertible<FRAME>(m_nReg[GS_REG_FRAME_1 + m_PrimitiveMode.nContext]);
++					m_swDrawActive = (m_swTargets.find(frame.GetBasePtr()) != m_swTargets.end());
++				}
++
++				if(!m_swDrawActive)
++				{
++					if(m_swDirtyPending) SwFlushDirty();
++					SetRenderingContext(m_PrimitiveMode);
++					m_ctxDirty = false;
++					m_primStamp++;
++				}
++			}
++
++			if(m_swDrawActive)
+ 			{
+ 				SwDrawPrimitive();
+ 				nDrawingKick = false;
+ 			}
+ 		}
+-
+-		if(nDrawingKick)
++		else if(m_ctxDirty)
+ 		{
+-			if(m_swDirtyPending) SwFlushDirty();
+-
+-			// Fast skip if nothing relevant changed since last draw
+-			bool needCtx = true;
+-			if(m_renderState.isValid && m_renderState.isTextureStateValid && m_renderState.isFramebufferStateValid)
++			if((m_nReg[GS_REG_PRMODECONT] & 1) != 0)
+ 			{
+-				uint64 primReg = m_PrimitiveMode;
+-				auto primLocal = make_convertible<PRMODE>(primReg);
+-				unsigned ctx = primLocal.nContext;
+-				uint64 testReg = m_nReg[GS_REG_TEST_1 + ctx];
+-				uint64 frameReg = m_nReg[GS_REG_FRAME_1 + ctx];
+-				uint64 alphaReg = m_nReg[GS_REG_ALPHA_1 + ctx];
+-				uint64 zbufReg = m_nReg[GS_REG_ZBUF_1 + ctx];
+-				uint64 tex0Reg = m_nReg[GS_REG_TEX0_1 + ctx];
+-				uint64 tex1Reg = m_nReg[GS_REG_TEX1_1 + ctx];
+-				uint64 texAReg = m_nReg[GS_REG_TEXA];
+-				uint64 clampReg = m_nReg[GS_REG_CLAMP_1 + ctx];
+-				uint64 fogColReg = m_nReg[GS_REG_FOGCOL];
+-				uint64 scissorReg = m_nReg[GS_REG_SCISSOR_1 + ctx];
+-				if(m_renderState.primReg == primReg &&
+-				   m_renderState.testReg == testReg &&
+-				   m_renderState.frameReg == frameReg &&
+-				   m_renderState.alphaReg == alphaReg &&
+-				   m_renderState.zbufReg == zbufReg &&
+-				   m_renderState.tex0Reg == tex0Reg &&
+-				   m_renderState.tex1Reg == tex1Reg &&
+-				   m_renderState.texAReg == texAReg &&
+-				   m_renderState.clampReg == clampReg &&
+-				   m_renderState.fogColReg == fogColReg &&
+-				   m_renderState.scissorReg == scissorReg)
+-				{
+-					needCtx = false; // fully same state; skip call
+-				}
++				m_PrimitiveMode <<= m_nReg[GS_REG_PRIM];
++			}
++			else
++			{
++				m_PrimitiveMode <<= m_nReg[GS_REG_PRMODE];
+ 			}
+-			if(needCtx) SetRenderingContext(m_PrimitiveMode);
+ 		}
+ 
+ 		switch(m_primitiveType)
+@@ -2183,13 +2169,19 @@ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
+ 			break;
+ 		case PRIM_TRIANGLESTRIP:
+ 			if(nDrawingKick) Prim_Triangle();
+-			memcpy(&m_VtxBuffer[2], &m_VtxBuffer[1], sizeof(VERTEX));
+-			memcpy(&m_VtxBuffer[1], &m_VtxBuffer[0], sizeof(VERTEX));
++			m_VtxBuffer[2] = m_VtxBuffer[1];
++			m_VtxBuffer[1] = m_VtxBuffer[0];
++			m_vtxPrim[2] = m_vtxPrim[1];
++			m_vtxPrim[1] = m_vtxPrim[0];
++			m_vtxPrimStamp[2] = m_vtxPrimStamp[1];
++			m_vtxPrimStamp[1] = m_vtxPrimStamp[0];
+ 			m_nVtxCount = 1;
+ 			break;
+ 		case PRIM_TRIANGLEFAN:
+ 			if(nDrawingKick) Prim_Triangle();
+-			memcpy(&m_VtxBuffer[1], &m_VtxBuffer[0], sizeof(VERTEX));
++			m_VtxBuffer[1] = m_VtxBuffer[0];
++			m_vtxPrim[1] = m_vtxPrim[0];
++			m_vtxPrimStamp[1] = m_vtxPrimStamp[0];
+ 			m_nVtxCount = 1;
+ 			break;
+ 		case PRIM_SPRITE:
+@@ -2684,8 +2676,10 @@ void CGSH_OpenGL::SwNoteReadback(uint32 srcPtr)
+ 			if(!isFramebuffer) return;
+ 			FlushVertexBuffer();
+ 			m_renderState.isValid = false;
++			printf("WSXSW target %x marked (flip %u, readback of %x)\n", ptr, m_swFlipCount, srcPtr);
+ 		}
+ 		m_swTargets[ptr] = m_swFlipCount;
++		m_ctxDirty = true;
+ 	};
+ 	mark(srcPtr);
+ 	for(const auto& copy : m_swCopies)
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index 8190f8f8..921660b4 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -323,6 +323,8 @@ private:
+ 
+ 	void ProcessPrim(uint64);
+ 	void VertexKick(uint8, uint64);
++	void WriteRegistersImpl(const RegisterWrite*, const RegisterWrite*) override;
++	void ConvertTriangleVertex(unsigned int);
+ 
+ 	Framework::OpenGl::ProgramPtr GetShaderFromCaps(const SHADERCAPS&);
+ 	Framework::OpenGl::ProgramPtr GenerateShader(const SHADERCAPS&);
+@@ -459,6 +461,17 @@ private:
+ 	VERTEX m_VtxBuffer[3];
+ 	int m_nVtxCount;
+ 
++	//Triangle vertices as they are drawn, converted once each (a strip uses every vertex in three triangles):
++	//valid while the stamp is the current one, which changes with the drawing context.
++	PRIM_VERTEX m_vtxPrim[3];
++	uint32 m_vtxPrimStamp[3] = {0, 0, 0};
++	uint32 m_primStamp = 1;
++	//A register that takes part in the drawing context was written since it was last looked at
++	bool m_ctxDirty = true;
++	bool m_swDrawActive = false;
++	//Sampling parameters last set on each texture (they are part of the texture in GL)
++	std::unordered_map<GLuint, uint64> m_textureParams;
++
+ 	bool m_pendingPrim = false;
+ 	uint64 m_pendingPrimValue = 0;
+ 	PRMODE m_PrimitiveMode;
+@@ -512,6 +525,7 @@ private:
+ 		GLSTATE_FRAMEBUFFER = 0x0100,
+ 		GLSTATE_VIEWPORT = 0x0200,
+ 		GLSTATE_DEPTHTEST = 0x0400,
++		GLSTATE_PRIM_BINDINGS = 0x0800, //Vertex array, vertex buffer and uniform block bindings of the draw pass
+ 	};
+ 
+ 	ShaderMap m_shaders;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+index f0df20b5..685c9b93 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+@@ -207,6 +207,7 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
+ 		{
+ 			g_wsxGsStats.texMisses.fetch_add(1, std::memory_order_relaxed);
+ 			auto textureHandle = Framework::OpenGl::CTexture::Create();
++			m_textureParams.erase(static_cast<GLuint>(textureHandle));
+ 			glBindTexture(GL_TEXTURE_2D, textureHandle);
+ 			glTexStorage2D(GL_TEXTURE_2D, 1, texFormat.internalFormat, texWidth, texHeight);
+ 			CHECKGLERROR();
+@@ -278,6 +279,10 @@ GLuint CGSH_OpenGL::PreparePalette(const TEX0& tex0)
+ 	glGenTextures(1, &textureHandle);
+ 	glBindTexture(GL_TEXTURE_2D, textureHandle);
+ 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, entryCount, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, convertedClut.data());
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+ 
+ 	PalCache_Insert(tex0, convertedClut.data(), textureHandle);
+ 
+diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
+index f190a53d..f72021d7 100644
+--- a/Source/gs/GSHandler.cpp
++++ b/Source/gs/GSHandler.cpp
+@@ -811,9 +811,16 @@ void CGSHandler::FlushWriteBuffer()
+ 	//Nothing should be written to the buffer after that
+ }
+ 
++void CGSHandler::WriteRegistersImpl(const RegisterWrite* writeStart, const RegisterWrite* writeEnd)
++{
++	for(auto write = writeStart; write != writeEnd; write++)
++	{
++		WriteRegisterImpl(write->first, write->second);
++	}
++}
++
+ void CGSHandler::WriteRegisterImpl(uint8 nRegister, uint64 nData)
+ {
+-	g_wsxGsStats.regWrites.fetch_add(1, std::memory_order_relaxed);
+ 	nRegister &= REGISTER_MAX - 1;
+ 	m_nReg[nRegister] = nData;
+ 	m_regsDirty = true;
+@@ -935,10 +942,8 @@ void CGSHandler::ReadImageDataImpl(void* ptr, uint32 size)
+ 
+ void CGSHandler::SubmitWriteBufferImpl(const RegisterWrite* writeStart, const RegisterWrite* writeEnd)
+ {
+-	for(auto write = writeStart; write != writeEnd; write++)
+-	{
+-		WriteRegisterImpl(write->first, write->second);
+-	}
++	g_wsxGsStats.regWrites.fetch_add(writeEnd - writeStart, std::memory_order_relaxed);
++	WriteRegistersImpl(writeStart, writeEnd);
+ 
+ #ifdef _DEBUG
+ 	assert(m_transferCount != 0);
+diff --git a/Source/gs/GSHandler.h b/Source/gs/GSHandler.h
+index 0e7bd98d..046146ea 100644
+--- a/Source/gs/GSHandler.h
++++ b/Source/gs/GSHandler.h
+@@ -1049,6 +1049,9 @@ protected:
+ 	virtual void FlipImpl(const DISPLAY_INFO&);
+ 	virtual void MarkNewFrame();
+ 	virtual void WriteRegisterImpl(uint8, uint64);
++	//A run of register writes (what the write buffer holds): handlers override it to keep the common
++	//writes (vertex data) out of the per register virtual call
++	virtual void WriteRegistersImpl(const RegisterWrite*, const RegisterWrite*);
+ 	void FeedImageDataImpl(const uint8*, uint32);
+ 	void ReadImageDataImpl(void*, uint32);
+ 	void SubmitWriteBufferImpl(const RegisterWrite*, const RegisterWrite*);
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 1b647437..427d0c5c 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -245,6 +245,11 @@ void debugLoseGsContext()
+ extern std::atomic<int> g_wsxGsTrace;
+ 
+ // Debug: print GS draws and transfers (GST lines) for the next `frames` frames.
++void vifTrace(int lines)
++{
++	g_wsxVifTrace.store(lines);
++}
++
+ void gsTrace(int frames)
+ {
+ 	g_wsxGsTrace.store(frames);
+@@ -674,6 +679,7 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("takeDiscWaitMs", &takeDiscWaitMs);
+ 	function("getVblankCount", &getVblankCount);
+ 	function("gsTrace", &gsTrace);
++	function("vifTrace", &vifTrace);
+ 	function("getFrameStatsAddress", &getFrameStatsAddress);
+ 	function("getAudioRingAddress", &getAudioRingAddress);
+ 	function("getVmZoneAddress", &getVmZoneAddress);
+-- 
+2.51.0.windows.1
+

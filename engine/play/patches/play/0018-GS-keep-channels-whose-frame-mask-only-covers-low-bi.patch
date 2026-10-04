@@ -1,0 +1,36 @@
+From 9a21e3f7215008d0681d2a2de617f7dbee453e60 Mon Sep 17 00:00:00 2001
+From: wsx <wsx@localhost>
+Date: Tue, 29 Sep 2026 20:16:20 -0400
+Subject: [PATCH 18/43] GS: keep channels whose frame mask only covers low bits
+
+Resident Evil Outbreak draws its movies and scenes with FBMSK = 1 (red bit 0).
+GL masks whole channels, so red was never written and everything came out teal.
+---
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 7eb9460f..9c2001df 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -976,10 +976,13 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+ 	auto scissor = make_convertible<SCISSOR>(scissorReg);
+ 	auto test = make_convertible<TEST>(testReg);
+ 
+-	bool r = (frame.nMask & 0x000000FF) == 0;
+-	bool g = (frame.nMask & 0x0000FF00) == 0;
+-	bool b = (frame.nMask & 0x00FF0000) == 0;
+-	bool a = (frame.nMask & 0xFF000000) == 0;
++	//GL can only mask whole channels. A mask on a channel's low bits only (Resident Evil Outbreak
++	//draws with FBMSK = 1) is ignored: dropping the channel would lose it entirely, while writing it
++	//is off by at most 15 levels.
++	bool r = (frame.nMask & 0x000000F0) == 0;
++	bool g = (frame.nMask & 0x0000F000) == 0;
++	bool b = (frame.nMask & 0x00F00000) == 0;
++	bool a = (frame.nMask & 0xF0000000) == 0;
+ 
+ 	//Don't write to alpha in PSMCT24
+ 	if(frame.nPsm == PSMCT24)
+-- 
+2.51.0.windows.1
+

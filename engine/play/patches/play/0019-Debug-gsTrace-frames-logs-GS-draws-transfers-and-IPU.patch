@@ -1,0 +1,154 @@
+From 2d3437273c1cc93def6523ab111aa8ebea37bd6d Mon Sep 17 00:00:00 2001
+From: wsx <wsx@localhost>
+Date: Tue, 29 Sep 2026 20:16:22 -0400
+Subject: [PATCH 19/43] Debug: gsTrace(frames) logs GS draws, transfers and IPU
+ commands
+
+Prints GST lines (raw register values, draw bounding boxes, flips) from the GS
+and VM threads while the counter is positive; decode with engine/play/bench/gst.py.
+---
+ Source/ee/IPU.cpp                   |  5 ++++
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp | 41 +++++++++++++++++++++++++++++
+ Source/ui_js/Main.cpp               |  9 +++++++
+ 3 files changed, 55 insertions(+)
+
+diff --git a/Source/ee/IPU.cpp b/Source/ee/IPU.cpp
+index b8efa0af..02aedbe2 100644
+--- a/Source/ee/IPU.cpp
++++ b/Source/ee/IPU.cpp
+@@ -1,4 +1,5 @@
+ #include "IPU.h"
++#include <atomic>
+ #include <cassert>
+ #include <cstring>
+ #include <stdio.h>
+@@ -417,8 +418,12 @@ void CIPU::FlushOUTFIFOData()
+ 	m_OUT_FIFO.Flush();
+ }
+ 
++//Debug trace switch (GSH_OpenGL.cpp): IPU commands are logged with the GS draws.
++extern std::atomic<int> g_wsxGsTrace;
++
+ void CIPU::InitializeCommand(uint32 value)
+ {
++	if(g_wsxGsTrace.load(std::memory_order_relaxed) > 0) printf("GST ipu cmd=%08x th0=%x th1=%x\n", value, m_nTH0, m_nTH1);
+ 	unsigned int cmd = (value >> 28);
+ 	switch(cmd)
+ 	{
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 9c2001df..5f05a2f7 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -7,6 +7,10 @@
+ #include "../GsPixelFormats.h"
+ #include "../GsTransferRange.h"
+ #include "GSH_OpenGL.h"
++#include <atomic>
++
++// Debug: frames left to trace GS draws/transfers for (set from the page with gsTrace()).
++std::atomic<int> g_wsxGsTrace{0};
+ 
+ #ifdef USE_DUALSOURCE_BLENDING
+ //Dual source blending constants
+@@ -136,6 +140,12 @@ void CGSH_OpenGL::MarkNewFrame()
+ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ {
+ 	FlushVertexBuffer();
++	if(g_wsxGsTrace.load(std::memory_order_relaxed) > 0)
++	{
++		const auto& l = dispInfo.layers[0];
++		printf("GST flip en=%d bp=%x bw=%u psm=%u w=%u h=%u\n", (int)l.enabled, l.bufPtr, l.bufWidth, l.psm, l.width, l.height);
++		g_wsxGsTrace.fetch_sub(1);
++	}
+ 	m_renderState.isValid = false;
+ 	m_validGlState = 0;
+ 
+@@ -624,6 +634,14 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	{
+ 		FlushVertexBuffer();
+ 	}
++	if(g_wsxGsTrace.load(std::memory_order_relaxed) > 0)
++	{
++		printf("GST ctx prim=%llx frame=%llx zbuf=%llx test=%llx alpha=%llx tex0=%llx tex1=%llx texa=%llx clamp=%llx scis=%llx fba=%llx pabe=%llx colclamp=%llx dthe=%llx caps=%x\n",
++		       (unsigned long long)primReg, (unsigned long long)frameReg, (unsigned long long)zbufReg, (unsigned long long)testReg, (unsigned long long)alphaReg,
++		       (unsigned long long)tex0Reg, (unsigned long long)tex1Reg, (unsigned long long)texAReg, (unsigned long long)clampReg, (unsigned long long)scissorReg,
++		       (unsigned long long)m_nReg[GS_REG_FBA_1 + context], (unsigned long long)m_nReg[GS_REG_PABE], (unsigned long long)m_nReg[GS_REG_COLCLAMP],
++		       (unsigned long long)m_nReg[0x45], static_cast<uint32>(shaderCaps));
++	}
+ 
+ 	//--------------------------------------------------------
+ 	// Apply state changes (order kept similar to original when relevant)
+@@ -1713,6 +1731,19 @@ void CGSH_OpenGL::FlushVertexBuffer()
+ {
+ 	if(m_vertexBuffer.empty()) return;
+ 
++	if(g_wsxGsTrace.load(std::memory_order_relaxed) > 0)
++	{
++		float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
++		for(const auto& v : m_vertexBuffer)
++		{
++			x0 = std::min(x0, v.x); y0 = std::min(y0, v.y);
++			x1 = std::max(x1, v.x); y1 = std::max(y1, v.y);
++		}
++		const auto& v0 = m_vertexBuffer[0];
++		printf("GST draw n=%d bbox=%.0f,%.0f-%.0f,%.0f col0=%08x st0=%.3f,%.3f q0=%.3f tex=%u\n", (int)m_vertexBuffer.size(), x0, y0, x1, y1, v0.color, v0.s, v0.t, v0.q,
++		       (unsigned)m_renderState.texture0Handle);
++	}
++
+ 	assert(m_renderState.isValid == true);
+ 
+ 	auto shader = GetShaderFromCaps(m_renderState.shaderCaps);
+@@ -2108,6 +2139,11 @@ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
+ 
+ void CGSH_OpenGL::ProcessHostToLocalTransfer()
+ {
++	if(g_wsxGsTrace.load(std::memory_order_relaxed) > 0)
++	{
++		printf("GST h2l bitblt=%llx trxpos=%llx trxreg=%llx dirty=%d\n", (unsigned long long)m_nReg[GS_REG_BITBLTBUF], (unsigned long long)m_nReg[GS_REG_TRXPOS],
++		       (unsigned long long)m_nReg[GS_REG_TRXREG], (int)m_trxCtx.nDirty);
++	}
+ 	if(m_trxCtx.nDirty)
+ 	{
+ 		FlushVertexBuffer();
+@@ -2182,6 +2218,11 @@ void CGSH_OpenGL::ProcessLocalToHostTransfer()
+ void CGSH_OpenGL::ProcessLocalToLocalTransfer()
+ {
+ 	auto bltBuf = make_convertible<BITBLTBUF>(m_nReg[GS_REG_BITBLTBUF]);
++	if(g_wsxGsTrace.load(std::memory_order_relaxed) > 0)
++	{
++		printf("GST l2l bitblt=%llx trxpos=%llx trxreg=%llx\n", (unsigned long long)m_nReg[GS_REG_BITBLTBUF], (unsigned long long)m_nReg[GS_REG_TRXPOS],
++		       (unsigned long long)m_nReg[GS_REG_TRXREG]);
++	}
+ 	auto srcFramebufferIterator = std::find_if(m_framebuffers.begin(), m_framebuffers.end(),
+ 	                                           [&](const FramebufferPtr& framebuffer) {
+ 		                                           return (framebuffer->m_basePtr == bltBuf.GetSrcPtr()) &&
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 75956f1d..75574067 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -188,6 +188,14 @@ void debugLoseGsContext()
+ 	});
+ }
+ 
++extern std::atomic<int> g_wsxGsTrace;
++
++// Debug: print GS draws and transfers (GST lines) for the next `frames` frames.
++void gsTrace(int frames)
++{
++	g_wsxGsTrace.store(frames);
++}
++
+ uint32 getVblankCount()
+ {
+ 	return g_vblankCount.load();
+@@ -361,6 +369,7 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("clearStats", &clearStats);
+ 	function("takeDiscWaitMs", &takeDiscWaitMs);
+ 	function("getVblankCount", &getVblankCount);
++	function("gsTrace", &gsTrace);
+ 	function("getFrameStatsAddress", &getFrameStatsAddress);
+ 	function("getAudioRingAddress", &getAudioRingAddress);
+ 	function("jitCacheAlloc", &jitCacheAlloc);
+-- 
+2.51.0.windows.1
+

@@ -1,0 +1,44 @@
+From d1bfafa31b5a9f659f1919a16ecedfe8032ac24e Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 14:52:25 -0400
+Subject: [PATCH 37/43] GS: reset the draw context caches with the GL context
+
+---
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 59f4c647..a696213a 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -92,6 +92,9 @@ void CGSH_OpenGL::InitializeImpl()
+ 
+ 	m_renderState.isValid = false;
+ 	m_validGlState = 0;
++	//(A rebuilt context starts its texture names over)
++	m_textureParams.clear();
++	m_ctxDirty = true;
+ }
+ 
+ void CGSH_OpenGL::ReleaseImpl()
+@@ -99,6 +102,7 @@ void CGSH_OpenGL::ReleaseImpl()
+ 	ResetImpl();
+ 
+ 	m_paletteCache.clear();
++	m_textureParams.clear();
+ 	m_shaders.clear();
+ 	m_presentProgram.reset();
+ 	m_presentVertexBuffer.Reset();
+@@ -138,6 +142,9 @@ void CGSH_OpenGL::ResetImpl()
+ 	m_swCopies.clear();
+ 	m_swLastFbPtr = ~0U;
+ 	m_swDirtyPending = false;
++	m_swDrawActive = false;
++	m_ctxDirty = true;
++	m_vtxPrimStamp[0] = m_vtxPrimStamp[1] = m_vtxPrimStamp[2] = 0;
+ 	m_primitiveType = PRIM_INVALID;
+ 	m_pendingPrim = false;
+ 	m_pendingPrimValue = 0;
+-- 
+2.51.0.windows.1
+

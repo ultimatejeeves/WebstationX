@@ -1,0 +1,241 @@
+From 193277cf292eea0c46792def60d4e7f1c1782885 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 02:25:10 -0400
+Subject: [PATCH 04/43] EE: detect idle loops that poll through a call to a
+ leaf function
+
+---
+ Source/ee/EeBasicBlock.cpp | 195 ++++++++++++++++++++++++++++++++++++-
+ Source/ee/EeBasicBlock.h   |   1 +
+ 2 files changed, 195 insertions(+), 1 deletion(-)
+
+diff --git a/Source/ee/EeBasicBlock.cpp b/Source/ee/EeBasicBlock.cpp
+index cb057bc3..159699c5 100644
+--- a/Source/ee/EeBasicBlock.cpp
++++ b/Source/ee/EeBasicBlock.cpp
+@@ -1,4 +1,5 @@
+ #include "EeBasicBlock.h"
++#include <vector>
+ #include "offsetof_def.h"
+ 
+ void CEeBasicBlock::SetFpRoundingMode(Jitter::CJitter::ROUNDINGMODE fpRoundingMode)
+@@ -27,7 +28,7 @@ void CEeBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
+ 		jitter->FP_SetRoundingMode(DEFAULT_FP_ROUNDING_MODE);
+ 	}
+ 
+-	if(m_isIdleLoopBlock || IsCodeIdleLoopBlock())
++	if(m_isIdleLoopBlock || IsCodeIdleLoopBlock() || IsCallSpinLoopBlock())
+ 	{
+ 		jitter->PushCst(MIPS_EXCEPTION_IDLE);
+ 		jitter->PullRel(offsetof(CMIPS, m_State.nHasException));
+@@ -170,3 +171,195 @@ bool CEeBasicBlock::IsCodeIdleLoopBlock() const
+ 
+ 	return true;
+ }
++
++//Detects polling loops that read their condition through a call to a tiny leaf function, a pattern
++//IsCodeIdleLoopBlock can't see because the loop spans three blocks. Tony Hawk's Pro Skater 4 waits
++//for vblank like this (about half of its EE time):
++//
++//  T:  JAL  f               f:  LUI  V1, $002D
++//      NOP                      LD   V0, $FE98(V1)
++//  B:  LD   V1, $FEC0(S0)       JR   RA
++//      BEQ  V1, V0, T           NOP
++//      NOP
++//
++//B (this block) is flagged idle when one trip around T -> f -> B only loads memory and computes
++//registers that don't carry over from the previous trip (so counting/delay loops are rejected).
++//Skipping the rest of the time slice is then invisible to the game: nothing but an interrupt or
++//DMA can change what the loop is waiting for.
++bool CEeBasicBlock::IsCallSpinLoopBlock() const
++{
++	enum
++	{
++		OP_SPECIAL = 0x00,
++		OP_JAL = 0x03,
++		OP_BEQ = 0x04,
++		OP_BNE = 0x05,
++		OP_ADDIU = 0x09,
++		OP_SLTI = 0x0A,
++		OP_SLTIU = 0x0B,
++		OP_ANDI = 0x0C,
++		OP_ORI = 0x0D,
++		OP_XORI = 0x0E,
++		OP_LUI = 0x0F,
++		OP_DADDIU = 0x19,
++		OP_LQ = 0x1E,
++		OP_LB = 0x20,
++		OP_LH = 0x21,
++		OP_LW = 0x23,
++		OP_LBU = 0x24,
++		OP_LHU = 0x25,
++		OP_LWU = 0x27,
++		OP_LD = 0x37,
++	};
++
++	enum
++	{
++		SPECIAL_SLL = 0x00,
++		SPECIAL_SRL = 0x02,
++		SPECIAL_SRA = 0x03,
++		SPECIAL_JR = 0x08,
++		SPECIAL_ADDU = 0x21,
++		SPECIAL_SUBU = 0x23,
++		SPECIAL_AND = 0x24,
++		SPECIAL_OR = 0x25,
++		SPECIAL_XOR = 0x26,
++		SPECIAL_NOR = 0x27,
++		SPECIAL_SLT = 0x2A,
++		SPECIAL_SLTU = 0x2B,
++		SPECIAL_DADDU = 0x2D,
++		SPECIAL_DSLL = 0x38,
++		SPECIAL_DSRL = 0x3A,
++		SPECIAL_DSLL32 = 0x3C,
++		SPECIAL_DSRL32 = 0x3E,
++	};
++
++	static const uint32 RA = 31;
++	static const uint32 MAX_LEAF_SIZE = 8;
++
++	auto readWord = [&](uint32 address) { return m_context.m_pMemoryMap->GetWord(address); };
++
++	//B must end with BEQ/BNE (+ delay slot) back to a two instruction call block right before it
++	if(m_end < m_begin + 8) return false;
++	uint32 branchAddress = m_end - 4;
++	uint32 branch = readWord(branchAddress);
++	uint32 branchOp = (branch >> 26) & 0x3F;
++	if((branchOp != OP_BEQ) && (branchOp != OP_BNE)) return false;
++	uint32 branchTarget = branchAddress + 4 + (static_cast<int16>(branch & 0xFFFF) * 4);
++	if(branchTarget + 8 != m_begin) return false;
++
++	uint32 call = readWord(branchTarget);
++	if(((call >> 26) & 0x3F) != OP_JAL) return false;
++	uint32 function = ((call & 0x03FFFFFF) << 2) | ((branchTarget + 4) & 0xF0000000);
++
++	//Instructions of one trip around the loop, in execution order
++	std::vector<uint32> trip;
++	trip.push_back(call);
++	trip.push_back(readWord(branchTarget + 4));
++	{
++		bool returned = false;
++		for(uint32 i = 0; i < MAX_LEAF_SIZE; i++)
++		{
++			uint32 inst = readWord(function + i * 4);
++			trip.push_back(inst);
++			if(inst == 0x03E00008) //JR RA
++			{
++				trip.push_back(readWord(function + i * 4 + 4));
++				returned = true;
++				break;
++			}
++		}
++		if(!returned) return false;
++	}
++	for(uint32 address = m_begin; address <= m_end; address += 4)
++	{
++		trip.push_back(readWord(address));
++	}
++
++	uint32 defState = 0;
++	uint32 useState = 0;
++	for(uint32 inst : trip)
++	{
++		uint32 op = (inst >> 26) & 0x3F;
++		uint32 rs = (inst >> 21) & 0x1F;
++		uint32 rt = (inst >> 16) & 0x1F;
++		uint32 rd = (inst >> 11) & 0x1F;
++		uint32 funct = inst & 0x3F;
++		uint32 newUse = 0;
++		uint32 newDef = 0;
++		switch(op)
++		{
++		case OP_SPECIAL:
++			if(inst == 0) continue; //NOP
++			switch(funct)
++			{
++			case SPECIAL_SLL:
++			case SPECIAL_SRL:
++			case SPECIAL_SRA:
++			case SPECIAL_DSLL:
++			case SPECIAL_DSRL:
++			case SPECIAL_DSLL32:
++			case SPECIAL_DSRL32:
++				newUse = (1 << rt);
++				newDef = (1 << rd);
++				break;
++			case SPECIAL_ADDU:
++			case SPECIAL_SUBU:
++			case SPECIAL_AND:
++			case SPECIAL_OR:
++			case SPECIAL_XOR:
++			case SPECIAL_NOR:
++			case SPECIAL_SLT:
++			case SPECIAL_SLTU:
++			case SPECIAL_DADDU:
++				newUse = (1 << rs) | (1 << rt);
++				newDef = (1 << rd);
++				break;
++			case SPECIAL_JR:
++				if(rs != RA) return false;
++				newUse = (1 << RA);
++				break;
++			default:
++				return false;
++			}
++			break;
++		case OP_JAL:
++			newDef = (1 << RA);
++			break;
++		case OP_BEQ:
++		case OP_BNE:
++			newUse = (1 << rs) | (1 << rt);
++			break;
++		case OP_LUI:
++			newDef = (1 << rt);
++			break;
++		case OP_ADDIU:
++		case OP_SLTI:
++		case OP_SLTIU:
++		case OP_ANDI:
++		case OP_ORI:
++		case OP_XORI:
++		case OP_DADDIU:
++		case OP_LQ:
++		case OP_LB:
++		case OP_LH:
++		case OP_LW:
++		case OP_LBU:
++		case OP_LHU:
++		case OP_LWU:
++		case OP_LD:
++			newUse = (1 << rs);
++			newDef = (1 << rt);
++			break;
++		default:
++			return false;
++		}
++		newUse &= ~1U; //R0
++		newDef &= ~1U;
++		//Registers read before this trip wrote them come from the previous trip (or from before the loop)
++		useState |= (newUse & ~defState);
++		//...and must not be written by the loop, otherwise state carries over between trips
++		if(useState & newDef) return false;
++		defState |= newDef;
++	}
++	return true;
++}
+diff --git a/Source/ee/EeBasicBlock.h b/Source/ee/EeBasicBlock.h
+index a2900e91..f0ac6b05 100644
+--- a/Source/ee/EeBasicBlock.h
++++ b/Source/ee/EeBasicBlock.h
+@@ -16,6 +16,7 @@ protected:
+ 
+ private:
+ 	bool IsCodeIdleLoopBlock() const;
++	bool IsCallSpinLoopBlock() const;
+ 
+ 	static constexpr auto DEFAULT_FP_ROUNDING_MODE = Jitter::CJitter::ROUND_TRUNCATE;
+ 	Jitter::CJitter::ROUNDINGMODE m_fpRoundingMode = DEFAULT_FP_ROUNDING_MODE;
+-- 
+2.51.0.windows.1
+

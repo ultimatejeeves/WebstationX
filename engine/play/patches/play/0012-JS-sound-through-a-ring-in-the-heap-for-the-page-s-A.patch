@@ -1,0 +1,268 @@
+From 0d69940b35054c201f391efd4250934db3c1ec50 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 12:47:04 -0400
+Subject: [PATCH 12/43] JS: sound through a ring in the heap for the page's
+ AudioWorklet
+
+The OpenAL path queued ~100 ms buffers through the page's main thread and started playing with one
+buffer queued, so each next buffer arrived just as the last ran out: any main-thread or emulation
+jitter was an audible gap. CSH_WsxRing writes ~11 ms pieces (11 SPU blocks) into a ring the page's
+AudioWorklet reads from the audio thread (getAudioRingAddress). Volume moved to the page.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ Source/ui_js/CMakeLists.txt |  2 ++
+ Source/ui_js/Main.cpp       | 63 ++++++++++++++++++++++++++++----
+ Source/ui_js/SH_WsxRing.cpp | 71 +++++++++++++++++++++++++++++++++++++
+ Source/ui_js/SH_WsxRing.h   | 40 +++++++++++++++++++++
+ 4 files changed, 169 insertions(+), 7 deletions(-)
+ create mode 100644 Source/ui_js/SH_WsxRing.cpp
+ create mode 100644 Source/ui_js/SH_WsxRing.h
+
+diff --git a/Source/ui_js/CMakeLists.txt b/Source/ui_js/CMakeLists.txt
+index 3595d33f..3d2f8db2 100644
+--- a/Source/ui_js/CMakeLists.txt
++++ b/Source/ui_js/CMakeLists.txt
+@@ -48,6 +48,8 @@ add_executable(Play
+ 	Main.cpp
+ 	PH_Js.cpp
+ 	PH_Js.h
++	SH_WsxRing.cpp
++	SH_WsxRing.h
+ 	Ps2VmJs.cpp
+ 	Ps2VmJs.h
+ )
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index f7d0d9f5..9ebf115e 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -5,12 +5,13 @@
+ #include <AL/al.h>
+ #include "Ps2VmJs.h"
+ #include "GSH_OpenGLJs.h"
+-#include "sound/SH_OpenAL/SH_OpenALProxy.h"
++#include "SH_WsxRing.h"
+ #include "input/PH_GenericInput.h"
+ #include "InputProviderEmscripten.h"
+ #include "PH_Js.h"
+ #include "ui_shared/StatsManager.h"
+ #include "WsxFrameStats.h"
++#include "WsxJitCache.h"
+ #include "DefaultAppConfig.h"
+ #include "AppConfig.h"
+ #include "PS2VM_Preferences.h"
+@@ -21,7 +22,7 @@ CGSHandler::NewFrameEvent::Connection g_gsNewFrameConnection;
+ CPS2VM::NewFrameEvent::Connection g_vmNewFrameConnection;
+ std::atomic<uint32> g_vblankCount = 0;
+ std::shared_ptr<CInputProviderEmscripten> g_inputProvider;
+-CSH_OpenAL* g_soundHandler = nullptr;
++CSH_WsxRing* g_soundHandler = nullptr;
+ std::future<bool> g_stateOp;
+ 
+ int main(int argc, const char** argv)
+@@ -75,8 +76,12 @@ static void CreateVm(int width, int height, const CPadHandler::FactoryFunction&
+ 	//Heartbeat for the page's stall watchdog: counts emulated frames even when the GS draws nothing.
+ 	g_vmNewFrameConnection = g_virtualMachine->OnNewFrame.Connect([]() { g_vblankCount++; });
+ 
+-	g_soundHandler = new CSH_OpenAL();
+-	g_virtualMachine->CreateSoundHandler(CSH_OpenALProxy::GetFactoryFunction(g_soundHandler));
++	//Sound goes to the page's AudioWorklet through a ring in the heap, in ~11 ms pieces (the default
++	//100 SPU blocks per write is ~100 ms of sound at a time).
++	g_soundHandler = new CSH_WsxRing();
++	g_virtualMachine->CreateSoundHandler(CSH_WsxRing::GetFactoryFunction(g_soundHandler));
++	CAppConfig::GetInstance().SetPreferenceInteger(PREF_AUDIO_SPUBLOCKCOUNT, 11);
++	g_virtualMachine->ReloadSpuBlockCount();
+ 	g_virtualMachine->CreatePadHandler(padHandlerFactory);
+ 
+ 	auto presentationParams = MakePresentationParams(width, height, CGSHandler::PRESENTATION_MODE_FIT);
+@@ -294,10 +299,48 @@ std::string disassembleEe(uint32 address, int count)
+ 	return result;
+ }
+ 
+-// Master volume, 0..1 (OpenAL listener gain; runs on the main thread that owns the AL context).
+-void setVolume(float gain)
++// Master volume: applied by the page's audio graph now (sound leaves the core through the ring).
++void setVolume(float)
+ {
+-	alListenerf(AL_GAIN, gain);
++}
++
++// Compiled code cache (WsxJitCache.h). The page allocates room, copies a stored blob in, and loads it
++// (parsed on the VM thread; the blob stays allocated for good).
++uintptr_t jitCacheAlloc(uint32 size)
++{
++	return reinterpret_cast<uintptr_t>(malloc(std::max<uint32>(size, 1)));
++}
++
++void jitCacheLoad(uintptr_t blob, uint32 size)
++{
++	g_virtualMachine->SendVmCall([blob, size]() { WsxJitCache::Load(reinterpret_cast<const uint8*>(blob), size); });
++}
++
++// Entries compiled since the last call, as a Uint8Array (empty when there are none).
++emscripten::val jitCacheTakeNew()
++{
++	auto pending = WsxJitCache::TakePending();
++	return emscripten::val::global("Uint8Array").new_(emscripten::typed_memory_view(pending.size(), pending.data()));
++}
++
++std::string jitCacheStats()
++{
++	auto& stats = WsxJitCache::g_stats;
++	char text[160];
++	snprintf(text, sizeof(text), "{\"loaded\":%u,\"hits\":%u,\"misses\":%u,\"mismatches\":%u}", stats.loaded, stats.hits, stats.misses, stats.mismatches);
++	return text;
++}
++
++// Verify mode: compile anyway and compare with the cached code (counts mismatches).
++void jitCacheSetVerify(bool verify)
++{
++	g_virtualMachine->SendVmCall([verify]() { WsxJitCache::g_verify = verify; });
++}
++
++// Sound ring (CSH_WsxRing::RING) the page's AudioWorklet plays from.
++uintptr_t getAudioRingAddress()
++{
++	return reinterpret_cast<uintptr_t>(CSH_WsxRing::GetRing());
+ }
+ 
+ EMSCRIPTEN_BINDINGS(Play)
+@@ -312,6 +355,12 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("takeDiscWaitMs", &takeDiscWaitMs);
+ 	function("getVblankCount", &getVblankCount);
+ 	function("getFrameStatsAddress", &getFrameStatsAddress);
++	function("getAudioRingAddress", &getAudioRingAddress);
++	function("jitCacheAlloc", &jitCacheAlloc);
++	function("jitCacheLoad", &jitCacheLoad);
++	function("jitCacheTakeNew", &jitCacheTakeNew);
++	function("jitCacheStats", &jitCacheStats);
++	function("jitCacheSetVerify", &jitCacheSetVerify);
+ 	function("debugLoseGsContext", &debugLoseGsContext);
+ 	function("pauseVm", &pauseVm);
+ 	function("resumeVm", &resumeVm);
+diff --git a/Source/ui_js/SH_WsxRing.cpp b/Source/ui_js/SH_WsxRing.cpp
+new file mode 100644
+index 00000000..5817f11b
+--- /dev/null
++++ b/Source/ui_js/SH_WsxRing.cpp
+@@ -0,0 +1,71 @@
++#include "SH_WsxRing.h"
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <new>
++
++CSH_WsxRing::RING* CSH_WsxRing::GetRing()
++{
++	//Allocated once, early (the page's views of the heap were made before any growth), never freed.
++	static RING* ring = []() {
++		size_t size = sizeof(RING) + (CAPACITY_FRAMES * 2 * sizeof(int16));
++		auto memory = static_cast<uint8*>(aligned_alloc(16, size));
++		memset(memory, 0, size);
++		auto result = new(memory) RING();
++		result->capacity = CAPACITY_FRAMES;
++		result->sampleRate = 44100;
++		return result;
++	}();
++	return ring;
++}
++
++CSH_WsxRing::CSH_WsxRing()
++{
++	GetRing();
++}
++
++CSoundHandler::FactoryFunction CSH_WsxRing::GetFactoryFunction(CSH_WsxRing* handler)
++{
++	return [handler]() { return handler; };
++}
++
++void CSH_WsxRing::Reset()
++{
++	//The worklet notices the jump and buffers up again.
++	auto ring = GetRing();
++	ring->writePos.store(ring->readPos.load());
++}
++
++void CSH_WsxRing::Write(int16* samples, unsigned int sampleCount, unsigned int sampleRate)
++{
++	auto ring = GetRing();
++	ring->sampleRate = sampleRate;
++	uint32 frames = sampleCount / 2;
++	uint32 writePos = ring->writePos.load(std::memory_order_relaxed);
++	uint32 readPos = ring->readPos.load(std::memory_order_acquire);
++	uint32 free = ring->capacity - (writePos - readPos);
++	if(frames > free)
++	{
++		//Nobody is listening (audio suspended): drop rather than overwrite what's being played.
++		ring->overflows.fetch_add(1, std::memory_order_relaxed);
++		frames = free;
++	}
++	auto data = reinterpret_cast<int16*>(ring + 1);
++	for(uint32 i = 0; i < frames;)
++	{
++		uint32 index = (writePos + i) % ring->capacity;
++		uint32 run = std::min<uint32>(frames - i, ring->capacity - index);
++		memcpy(data + (index * 2), samples + (i * 2), run * 2 * sizeof(int16));
++		i += run;
++	}
++	ring->writePos.store(writePos + frames, std::memory_order_release);
++}
++
++bool CSH_WsxRing::HasFreeBuffers()
++{
++	return true;
++}
++
++void CSH_WsxRing::RecycleBuffers()
++{
++}
+diff --git a/Source/ui_js/SH_WsxRing.h b/Source/ui_js/SH_WsxRing.h
+new file mode 100644
+index 00000000..3997275e
+--- /dev/null
++++ b/Source/ui_js/SH_WsxRing.h
+@@ -0,0 +1,40 @@
++#pragma once
++
++#include <atomic>
++#include "sound/SoundHandler.h"
++
++// Sound output for the browser: the VM thread writes samples into a ring in the wasm heap and an
++// AudioWorklet on the page (src/emu/ps2/audio.ts in WebStationX) plays them from the audio thread.
++// No main thread hops (the OpenAL path queued ~100 ms buffers through the page's main thread and
++// started playing with a single buffer queued, so any jitter left a gap).
++class CSH_WsxRing : public CSoundHandler
++{
++public:
++	//Layout read by the worklet: keep in sync with src/emu/ps2/audio.ts.
++	struct RING
++	{
++		std::atomic<uint32> writePos; //frames written (wraps at 2^32)
++		std::atomic<uint32> readPos;  //frames consumed, advanced by the worklet
++		uint32 capacity;              //frames
++		uint32 sampleRate;
++		std::atomic<uint32> overflows; //writes dropped because the ring was full (audio suspended)
++		uint32 reserved[3];
++		//int16 samples[capacity * 2] follow (interleaved stereo)
++	};
++
++	CSH_WsxRing();
++	virtual ~CSH_WsxRing() = default;
++
++	void Reset() override;
++	void Write(int16*, unsigned int, unsigned int) override;
++	bool HasFreeBuffers() override;
++	void RecycleBuffers() override;
++
++	static FactoryFunction GetFactoryFunction(CSH_WsxRing*);
++	static RING* GetRing();
++
++	enum
++	{
++		CAPACITY_FRAMES = 32768, //~0.75 s at 44.1 kHz
++	};
++};
+-- 
+2.51.0.windows.1
+

@@ -1,0 +1,76 @@
+From 7c816026a76a43f19244f061e74200ef7a187cc2 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 23:00:55 -0400
+Subject: [PATCH 39/43] GS: software rasterizer for downloaded targets off by
+ default (setSwRaster)
+
+It computed some of ATV Offroad Fury 2's terrain batches wrong (translucent sheets over the track
+after loading a race from the menus); the GL path gets the same downloads right since the DMA
+channel 1 fix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp | 3 +++
+ Source/gs/GSH_OpenGL/GSH_OpenGL.h   | 4 ++++
+ Source/ui_js/Main.cpp               | 7 +++++++
+ 3 files changed, 14 insertions(+)
+
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index abfe8945..ed1cf316 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -2672,8 +2672,11 @@ void CGSH_OpenGL::SwNoteCopy(uint32 dstPtr, uint32 srcPtr)
+ 
+ //The game downloads pixels from srcPtr: what was drawn there (or copied there from a buffer we draw) is data
+ //to it. Those targets are drawn in software from now on, where every bit is what the GS would have produced.
++bool CGSH_OpenGL::g_swRasterEnabled = false;
++
+ void CGSH_OpenGL::SwNoteReadback(uint32 srcPtr)
+ {
++	if(!g_swRasterEnabled) return;
+ 	auto mark = [&](uint32 ptr) {
+ 		if(m_swDisplayedPtrs.find(ptr) != m_swDisplayedPtrs.end()) return;
+ 		bool isTarget = (m_swTargets.find(ptr) != m_swTargets.end());
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index 921660b4..7a305c10 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -57,6 +57,10 @@ public:
+ 
+ 	const VERTEX* GetInputVertices() const override;
+ 
++	//Draw render targets the game downloads in software (GsSwRaster.h). Off: in ATV Offroad Fury 2 it computed some
++	//terrain batches wrong (translucent sheets over the track), and the GL path gets the same downloads right.
++	static bool g_swRasterEnabled;
++
+ protected:
+ 	void PalCache_Flush();
+ 	void LoadPreferences();
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index ce6a146f..be4bf397 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -358,6 +358,12 @@ void setPresentation(int width, int height, int mode)
+ 	WithGs([presentationParams](CGSHandler* gs) { gs->SetPresentationParams(presentationParams); });
+ }
+ 
++// Before boot: draw render targets the game downloads in software (off by default, see CGSH_OpenGL::g_swRasterEnabled).
++void setSwRaster(bool enabled)
++{
++	CGSH_OpenGL::g_swRasterEnabled = enabled;
++}
++
+ void setResolutionFactor(int factor)
+ {
+ 	CAppConfig::GetInstance().SetPreferenceInteger(PREF_CGSH_OPENGL_RESOLUTION_FACTOR, std::max(1, factor));
+@@ -736,6 +742,7 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("getMemoryCardPath", &getMemoryCardPath);
+ 	function("setPresentation", &setPresentation);
+ 	function("setResolutionFactor", &setResolutionFactor);
++	function("setSwRaster", &setSwRaster);
+ 	function("setFrameLimit", &setFrameLimit);
+ 	function("setVolume", &setVolume);
+ 	function("setEeFrequencyScale", &setEeFrequencyScale);
+-- 
+2.51.0.windows.1
+

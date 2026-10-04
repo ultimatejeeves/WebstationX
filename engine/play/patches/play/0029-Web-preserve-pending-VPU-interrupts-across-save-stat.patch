@@ -1,0 +1,40 @@
+From d11a4d52c06bca471e8c023152e7806647923dd5 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 23:24:23 -0400
+Subject: [PATCH 29/43] Web: preserve pending VPU interrupts across save states
+
+---
+ Source/ee/Ee_SubSystem.cpp | 4 ++++
+ Source/ee/Vpu1Thread.cpp   | 1 +
+ 2 files changed, 5 insertions(+)
+
+diff --git a/Source/ee/Ee_SubSystem.cpp b/Source/ee/Ee_SubSystem.cpp
+index 0bbb4393..d1b883a7 100644
+--- a/Source/ee/Ee_SubSystem.cpp
++++ b/Source/ee/Ee_SubSystem.cpp
+@@ -524,6 +524,10 @@ void CSubSystem::NotifyVBlankEnd()
+ void CSubSystem::SaveState(Framework::CZipArchiveWriter& archive)
+ {
+ 	SyncVpu1(CVpu1Thread::DRAIN_STATE);
++	//Drain can finish at an interrupt stall. Move the worker's pending IRQs
++	//into the device state before serializing it, or the restored VIF can
++	//remain stalled forever with no interrupt for the EE to acknowledge.
++	if(m_vpu1Thread) DeliverVpu1Interrupts(m_vpu1Thread->TakeInterrupts());
+ 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_EE, &m_EE.m_State, sizeof(MIPSSTATE)));
+ 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_VU0, &m_VU0.m_State, sizeof(MIPSSTATE)));
+ 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_VU1, &m_VU1.m_State, sizeof(MIPSSTATE)));
+diff --git a/Source/ee/Vpu1Thread.cpp b/Source/ee/Vpu1Thread.cpp
+index 5891886a..b1540598 100644
+--- a/Source/ee/Vpu1Thread.cpp
++++ b/Source/ee/Vpu1Thread.cpp
+@@ -457,6 +457,7 @@ void CVpu1Thread::ThreadProc()
+ 			discardRing(*m_path3Ring);
+ 			m_vif1StreamSet = false;
+ 			m_path3Offset = 0;
++			m_pendingInterrupts.store(0);
+ 			m_discard = false;
+ 			m_idleCondition.notify_all();
+ 			continue;
+-- 
+2.51.0.windows.1
+

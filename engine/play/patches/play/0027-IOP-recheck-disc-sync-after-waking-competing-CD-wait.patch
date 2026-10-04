@@ -1,0 +1,56 @@
+From 438e3d1951bca375486cff4b4db720a3f6135619 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 23:07:10 -0400
+Subject: [PATCH 27/43] IOP: recheck disc sync after waking competing CD
+ waiters
+
+---
+ Source/iop/IopBios.cpp     | 7 +++++++
+ Source/iop/Iop_Cdvdman.cpp | 4 ++--
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/Source/iop/IopBios.cpp b/Source/iop/IopBios.cpp
+index e6b722ae..9118fdae 100644
+--- a/Source/iop/IopBios.cpp
++++ b/Source/iop/IopBios.cpp
+@@ -2978,6 +2978,12 @@ uint32 CIopBios::GetVplFreeSize(uint32 vplId)
+ 
+ void CIopBios::WaitCdSync()
+ {
++	//CdSync waits in a loop on the real driver. A higher-priority waiter can
++	//start another read before this thread runs again (Dave Mirra BMX 2's
++	//audio and level loaders). Re-enter the import stub after waking so the
++	//command is checked again instead of returning while the drive is busy.
++	//The import trap is in the delay slot of JR RA; retry both instructions.
++	m_cpu.m_State.nPC = m_cpu.m_State.nCOP0[CCOP_SCU::EPC] - 4;
+ 	uint32 threadId = m_currentThreadId;
+ 	auto thread = GetThread(threadId);
+ 	thread->status = THREAD_STATUS_WAIT_CDSYNC;
+@@ -2994,6 +3000,7 @@ void CIopBios::ReleaseWaitCdSync()
+ 
+ 		thread->status = THREAD_STATUS_RUNNING;
+ 		LinkThread(thread->id);
++		m_rescheduleNeeded = true;
+ 	}
+ }
+ 
+diff --git a/Source/iop/Iop_Cdvdman.cpp b/Source/iop/Iop_Cdvdman.cpp
+index 71aed539..767cdfd0 100644
+--- a/Source/iop/Iop_Cdvdman.cpp
++++ b/Source/iop/Iop_Cdvdman.cpp
+@@ -426,10 +426,10 @@ void CCdvdman::CountTicks(uint32 ticks)
+ 				assert(false);
+ 				break;
+ 			}
+-			m_bios.ReleaseWaitCdSync();
+-			m_bios.CheckReschedule();
+ 			m_status = CDVD_STATUS_PAUSED;
+ 			m_pendingCommand = COMMAND_NONE;
++			m_bios.ReleaseWaitCdSync();
++			m_bios.CheckReschedule();
+ 		}
+ 	}
+ }
+-- 
+2.51.0.windows.1
+

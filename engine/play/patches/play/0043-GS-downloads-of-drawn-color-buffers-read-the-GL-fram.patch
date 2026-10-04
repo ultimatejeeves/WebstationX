@@ -1,0 +1,225 @@
+From 9a46242c0be00ed34abf94ce9a8be1a18ff9f3d1 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 23:17:35 -0400
+Subject: [PATCH 43/43] GS: downloads of drawn color buffers read the GL
+ framebuffer (ATV Offroad Fury 3 composes rider/ATV skins on the GS and reads
+ them back); debug: GS block watch, download log, texture reader
+
+---
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp | 56 ++++++++++++++---------------
+ Source/gs/GSHandler.cpp             | 43 ++++++++++++++++++++++
+ Source/ui_js/Main.cpp               | 48 +++++++++++++++++++++++++
+ 3 files changed, 117 insertions(+), 30 deletions(-)
+
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index ed1cf316..4e06d21b 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -2238,10 +2238,11 @@ void CGSH_OpenGL::ProcessHostToLocalTransfer()
+ 	}
+ }
+ 
++template <typename Function>
++static bool WithPixelIndexor(uint32 psm, uint8* ram, uint32 bufPtr, uint32 bufWidth, Function&& fn);
++
+ void CGSH_OpenGL::ProcessLocalToHostTransfer()
+ {
+-	//This is constrained to work only with ps2autotest, will be unconstrained later
+-
+ 	auto bltBuf = make_convertible<BITBLTBUF>(m_nReg[GS_REG_BITBLTBUF]);
+ 	auto trxPos = make_convertible<TRXPOS>(m_nReg[GS_REG_TRXPOS]);
+ 	auto trxReg = make_convertible<TRXREG>(m_nReg[GS_REG_TRXREG]);
+@@ -2254,44 +2255,39 @@ void CGSH_OpenGL::ProcessLocalToHostTransfer()
+ 	SwFlushDirty();
+ 	SwNoteReadback(bltBuf.GetSrcPtr());
+ 
+-	if(bltBuf.nSrcPsm != PSMCT32) return;
+-
+-	uint32 transferAddress = bltBuf.GetSrcPtr();
+-	if(transferAddress != 0) return;
++	uint32 width = trxReg.nRRW;
++	uint32 height = trxReg.nRRH;
++	if((width == 0) || (height == 0)) return;
+ 
+-	if((trxReg.nRRW != 32) || (trxReg.nRRH != 32)) return;
+-	if((trxPos.nSSAX != 0) || (trxPos.nSSAY != 0)) return;
+-
+-	auto framebufferIterator = std::find_if(m_framebuffers.begin(), m_framebuffers.end(),
+-	                                        [](const FramebufferPtr& framebuffer) {
+-		                                        return (framebuffer->m_psm == PSMCT32) && (framebuffer->m_basePtr == 0);
+-	                                        });
+-	if(framebufferIterator == std::end(m_framebuffers)) return;
+-	const auto& framebuffer = (*framebufferIterator);
++	//Color only: depth-format downloads keep reading GS memory (ATV Offroad Fury 2 parks color data in Z buffer
++	//memory with a local to local copy and downloads it from there).
++	if((bltBuf.nSrcPsm != PSMCT32) && (bltBuf.nSrcPsm != PSMCT24)) return;
+ 
++	//When the source is one of our buffers, what was drawn there only exists in GL: bring it into GS memory,
++	//where the transfer reads from. Anything else is in GS memory already.
+ 	FlushVertexBuffer();
+ 	m_renderState.isValid = false;
+ 
+-	auto pixels = new uint32[trxReg.nRRW * trxReg.nRRH];
+-
+-	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer->m_framebuffer);
+-	glReadPixels(trxPos.nSSAX, trxPos.nSSAY, trxReg.nRRW, trxReg.nRRH, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+-	CHECKGLERROR();
++	std::vector<uint32> pixels(width * height);
++	if(!ReadGlPixels(bltBuf.GetSrcPtr(), bltBuf.GetSrcWidth(), bltBuf.nSrcPsm, trxPos.nSSAX, trxPos.nSSAY, width, height, pixels)) return;
+ 
+-	//Write back to RAM
+-	{
+-		CGsPixelFormats::CPixelIndexorPSMCT32 indexor(m_pRAM, bltBuf.GetSrcPtr(), bltBuf.nSrcWidth);
+-		for(uint32 y = trxPos.nSSAY; y < (trxPos.nSSAY + trxReg.nRRH); y++)
++	bool keepUpperByte = (bltBuf.nSrcPsm == PSMCT24) || (bltBuf.nSrcPsm == PSMZ24);
++	WithPixelIndexor(bltBuf.nSrcPsm, m_pRAM, bltBuf.GetSrcPtr(), bltBuf.nSrcWidth, [&](auto& indexor) {
++		for(uint32 y = 0; y < height; y++)
+ 		{
+-			for(uint32 x = trxPos.nSSAX; x < (trxPos.nSSAX + trxReg.nRRH); x++)
++			for(uint32 x = 0; x < width; x++)
+ 			{
+-				uint32 pixel = pixels[x + (y * trxReg.nRRW)];
+-				indexor.SetPixel(x, y, pixel);
++				uint32 srcX = (trxPos.nSSAX + x) % 2048;
++				uint32 srcY = (trxPos.nSSAY + y) % 2048;
++				uint32 pixel = pixels[x + (y * width)];
++				if(keepUpperByte)
++				{
++					pixel = (pixel & 0x00FFFFFF) | (static_cast<uint32>(indexor.GetPixel(srcX, srcY)) & 0xFF000000);
++				}
++				indexor.SetPixel(srcX, srcY, static_cast<decltype(indexor.GetPixel(0, 0))>(pixel));
+ 			}
+ 		}
+-	}
+-
+-	delete[] pixels;
++	});
+ }
+ 
+ //Runs fn with the pixel indexor of a pixel storage format (false for formats without one).
+diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
+index 6cf5e25e..4fdd2a89 100644
+--- a/Source/gs/GSHandler.cpp
++++ b/Source/gs/GSHandler.cpp
+@@ -960,9 +960,52 @@ void CGSHandler::SubmitWriteBufferImpl(const RegisterWrite* writeStart, const Re
+ #endif
+ }
+ 
++//Debug: a watched block of GS memory (debugWatchGsBlock). Checked whenever a transfer starts; a change is
++//attributed to the transfer that started before (anything else that writes GS memory shows up as that too).
++uint32 g_wsxGsWatchBlock = ~0U;
++
++static void WsxGsWatchCheck(const uint8* ram, const char* next)
++{
++	static uint32 lastSum = 0;
++	static char lastDesc[200] = "(nothing yet)";
++	static uint32 count = 0;
++	uint32 sum = 0;
++	auto words = reinterpret_cast<const uint32*>(ram + (g_wsxGsWatchBlock * 256));
++	for(unsigned int i = 0; i < 64; i++)
++	{
++		sum = (sum * 31) + words[i];
++	}
++	if(sum != lastSum)
++	{
++		printf("GSWATCH block %X changed (#%u) after: %s | now %08X %08X %08X %08X\n", g_wsxGsWatchBlock, count, lastDesc, words[0], words[1], words[2], words[3]);
++		lastSum = sum;
++	}
++	count++;
++	if(next)
++	{
++		snprintf(lastDesc, sizeof(lastDesc), "#%u %s", count, next);
++	}
++}
++
+ void CGSHandler::BeginTransfer()
+ {
+ 	uint32 trxDir = m_nReg[GS_REG_TRXDIR] & 0x03;
++	if(g_wsxGsWatchBlock != ~0U)
++	{
++		auto bltBuf = make_convertible<BITBLTBUF>(m_nReg[GS_REG_BITBLTBUF]);
++		auto trxReg = make_convertible<TRXREG>(m_nReg[GS_REG_TRXREG]);
++		auto trxPos = make_convertible<TRXPOS>(m_nReg[GS_REG_TRXPOS]);
++		char desc[160];
++		snprintf(desc, sizeof(desc), "dir %u src bp=%X bw=%u psm=%X -> dst bp=%X bw=%u psm=%X pos s=%u,%u d=%u,%u size=%ux%u",
++		         trxDir, bltBuf.nSrcPtr, bltBuf.nSrcWidth, bltBuf.nSrcPsm, bltBuf.nDstPtr, bltBuf.nDstWidth, bltBuf.nDstPsm,
++		         trxPos.nSSAX, trxPos.nSSAY, trxPos.nDSAX, trxPos.nDSAY, trxReg.nRRW, trxReg.nRRH);
++		WsxGsWatchCheck(m_pRAM, desc);
++		if(trxDir == 1)
++		{
++			//Downloads are rare and usually the interesting part (the GS used as a calculator).
++			printf("GSWATCH download %s | frame fbp=%X\n", desc, static_cast<uint32>(m_nReg[GS_REG_FRAME_1] & 0x1FF) * 32);
++		}
++	}
+ 	if(trxDir == 0 || trxDir == 1)
+ 	{
+ 		//"Host to Local" or "Local to Host"
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 4296ae38..05696562 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -543,6 +543,52 @@ std::string debugDumpEeKernel()
+ 	return g_virtualMachine->m_ee->m_os->DumpKernelState();
+ }
+ 
++// Debug: a texture as it sits in GS memory right now (read from the page thread while the GS runs: a snapshot).
++// psm: 0 CT32, 2 CT16, 0x13 T8, 0x14 T4. Returns the address of width*height uint32 (raw indices or colours).
++#include "../gs/GsPixelFormats.h"
++uintptr_t debugReadGsTexture(uint32 tbp, uint32 tbw, uint32 psm, uint32 width, uint32 height)
++{
++	static std::vector<uint32> pixels;
++	pixels.assign(width * height, 0);
++	auto gs = g_virtualMachine->GetGSHandler();
++	if(!gs) return 0;
++	auto ram = gs->GetRam();
++	uint32 pointer = tbp * 256;
++	uint32 bufWidth = tbw / 64;
++	auto read = [&](auto indexor) {
++		for(uint32 y = 0; y < height; y++)
++		{
++			for(uint32 x = 0; x < width; x++)
++			{
++				pixels[(y * width) + x] = indexor.GetPixel(x, y);
++			}
++		}
++	};
++	switch(psm)
++	{
++	case 0x13:
++		read(CGsPixelFormats::CPixelIndexorPSMT8(ram, pointer, bufWidth));
++		break;
++	case 0x14:
++		read(CGsPixelFormats::CPixelIndexorPSMT4(ram, pointer, bufWidth));
++		break;
++	case 0x02:
++		read(CGsPixelFormats::CPixelIndexorPSMCT16(ram, pointer, bufWidth));
++		break;
++	default:
++		read(CGsPixelFormats::CPixelIndexorPSMCT32(ram, pointer, bufWidth));
++		break;
++	}
++	return reinterpret_cast<uintptr_t>(pixels.data());
++}
++
++// Debug: report the GS transfers after which one block of GS memory changed (GSWATCH lines on the console).
++extern uint32 g_wsxGsWatchBlock;
++void debugWatchGsBlock(uint32 block)
++{
++	g_wsxGsWatchBlock = block;
++}
++
+ // Debug: core logging to the console. 0 off, 1 warnings (unimplemented syscalls and module functions), 2 everything.
+ void debugSetLogLevel(int level)
+ {
+@@ -742,6 +788,8 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("debugSetLocalsAsRegisters", &debugSetLocalsAsRegisters);
+ 	function("debugSetJitTrace", &debugSetJitTrace);
+ 	function("debugSetLogLevel", &debugSetLogLevel);
++	function("debugWatchGsBlock", &debugWatchGsBlock);
++	function("debugReadGsTexture", &debugReadGsTexture);
+ 	function("debugDumpEeKernel", &debugDumpEeKernel);
+ 	function("setStateHashFrames", &setStateHashFrames);
+ 	function("getStateHash", &getStateHash);
+-- 
+2.51.0.windows.1
+

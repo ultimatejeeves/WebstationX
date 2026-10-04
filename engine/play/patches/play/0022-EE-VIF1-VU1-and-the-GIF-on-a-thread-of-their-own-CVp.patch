@@ -1,0 +1,2128 @@
+From ab8cfe3b9a89584d315ae1fc6a43412fb67030ed Mon Sep 17 00:00:00 2001
+From: wsx <wsx@localhost>
+Date: Tue, 29 Sep 2026 22:34:37 -0400
+Subject: [PATCH 22/43] EE: VIF1, VU1 and the GIF on a thread of their own
+ (CVpu1Thread)
+
+The EE hands DMA channel 1/2 transfers and FIFO writes over through queues and waits (Drain) only
+before looking at VIF1/GIF/VU1 registers and memory. Display register writes and the end of a frame
+go out in order with the GIF data. Synchronous mode drains after every hand-over and emulates exactly
+what one thread did (machine fingerprints match). The Jitter instance is now per thread.
+---
+ Source/BasicBlock.cpp       |   7 +-
+ Source/CMakeLists.txt       |   2 +
+ Source/GameConfig.cpp       |   9 +-
+ Source/MemoryMap.cpp        |  20 ++
+ Source/MemoryMap.h          |   2 +
+ Source/MemoryUtils.cpp      |   4 +
+ Source/PS2VM.cpp            |  12 +-
+ Source/WsxFrameStats.h      |   9 +-
+ Source/WsxJitCache.h        |  16 +-
+ Source/WsxProfile.h         |  14 +-
+ Source/ee/DMAC.cpp          |   1 +
+ Source/ee/DMAC.h            |   7 +
+ Source/ee/Ee_SubSystem.cpp  | 214 ++++++++++++-
+ Source/ee/Ee_SubSystem.h    |  14 +
+ Source/ee/GIF.cpp           |  25 +-
+ Source/ee/GIF.h             |  10 +-
+ Source/ee/Vif.cpp           |  46 ++-
+ Source/ee/Vif.h             |  11 +
+ Source/ee/Vpu.cpp           |   8 +
+ Source/ee/Vpu.h             |   2 +
+ Source/ee/Vpu1Thread.cpp    | 619 ++++++++++++++++++++++++++++++++++++
+ Source/ee/Vpu1Thread.h      | 193 +++++++++++
+ Source/gs/GSHandler.cpp     |  46 ++-
+ Source/gs/GSHandler.h       |   7 +
+ Source/ui_js/CMakeLists.txt |   2 +-
+ Source/ui_js/Main.cpp       |  38 +++
+ 26 files changed, 1300 insertions(+), 38 deletions(-)
+ create mode 100644 Source/ee/Vpu1Thread.cpp
+ create mode 100644 Source/ee/Vpu1Thread.h
+
+diff --git a/Source/BasicBlock.cpp b/Source/BasicBlock.cpp
+index 8a38ede7..0ffbe76b 100644
+--- a/Source/BasicBlock.cpp
++++ b/Source/BasicBlock.cpp
+@@ -152,11 +152,8 @@ void CBasicBlock::Compile()
+ 
+ 	Framework::CMemStream stream;
+ 	{
+-		static
+-#ifdef AOT_BUILD_CACHE
+-		    thread_local
+-#endif
+-		    CMipsJitter* jitter = nullptr;
++		//One per thread: VU1 code compiles on its own thread (CVpu1Thread) while the VM thread compiles
++		static thread_local CMipsJitter* jitter = nullptr;
+ 		if(jitter == nullptr)
+ 		{
+ 			Jitter::CCodeGen* codeGen = Jitter::CreateCodeGen();
+diff --git a/Source/CMakeLists.txt b/Source/CMakeLists.txt
+index 0eb6a2eb..04399b50 100644
+--- a/Source/CMakeLists.txt
++++ b/Source/CMakeLists.txt
+@@ -234,6 +234,8 @@ set(COMMON_SRC_FILES
+ 	ee/Vif1.cpp
+ 	ee/Vif1.h
+ 	ee/Vpu.cpp
++	ee/Vpu1Thread.cpp
++	ee/Vpu1Thread.h
+ 	ee/Vpu.h
+ 	ee/VuAnalysis.cpp
+ 	ee/VuAnalysis.h
+diff --git a/Source/GameConfig.cpp b/Source/GameConfig.cpp
+index 0bf094be..f68a22e0 100644
+--- a/Source/GameConfig.cpp
++++ b/Source/GameConfig.cpp
+@@ -200,7 +200,14 @@ void CGameConfig::ApplyGameConfig(CPS2VM& virtualMachine)
+ 		eeExecutor->SetBlockFpUseAccurateAddSub(std::move(blockFpUseAccurateAddSub));
+ 		eeExecutor->SetIdleLoopBlocks(std::move(idleLoopBlocks));
+ 
+-		vu1Executor->SetBlockNoClamping(std::move(blockNoClamping));
++		if(virtualMachine.m_ee->m_vpu1Thread)
++		{
++			virtualMachine.m_ee->m_vpu1Thread->RunSync([&]() { vu1Executor->SetBlockNoClamping(std::move(blockNoClamping)); });
++		}
++		else
++		{
++			vu1Executor->SetBlockNoClamping(std::move(blockNoClamping));
++		}
+ 
+ 		break;
+ 	}
+diff --git a/Source/MemoryMap.cpp b/Source/MemoryMap.cpp
+index dda7f575..4314cda7 100644
+--- a/Source/MemoryMap.cpp
++++ b/Source/MemoryMap.cpp
+@@ -75,6 +75,20 @@ void CMemoryMap::InsertMap(MemoryMapListType& memoryMap, uint32 start, uint32 en
+ 	memoryMap.push_back(element);
+ }
+ 
++void CMemoryMap::SetPreAccessHandler(uint32 address, const std::function<void()>& handler)
++{
++	for(auto* memoryMap : {&m_readMap, &m_writeMap})
++	{
++		for(auto& element : *memoryMap)
++		{
++			if((address >= element.nStart) && (address <= element.nEnd) && (element.nType == MEMORYMAP_TYPE_MEMORY))
++			{
++				element.preAccess = handler;
++			}
++		}
++	}
++}
++
+ const CMemoryMap::MEMORYMAPELEMENT* CMemoryMap::GetMap(const MemoryMapListType& memoryMap, uint32 nAddress)
+ {
+ 	for(const auto& mapElement : memoryMap)
+@@ -99,6 +113,7 @@ uint8 CMemoryMap::GetByte(uint32 nAddress)
+ 	switch(e->nType)
+ 	{
+ 	case MEMORYMAP_TYPE_MEMORY:
++		if(e->preAccess) e->preAccess();
+ 		return *(uint8*)&((uint8*)e->pPointer)[nAddress - e->nStart];
+ 		break;
+ 	case MEMORYMAP_TYPE_FUNCTION:
+@@ -122,6 +137,7 @@ void CMemoryMap::SetByte(uint32 nAddress, uint8 nValue)
+ 	switch(e->nType)
+ 	{
+ 	case MEMORYMAP_TYPE_MEMORY:
++		if(e->preAccess) e->preAccess();
+ 		*(uint8*)&((uint8*)e->pPointer)[nAddress - e->nStart] = nValue;
+ 		break;
+ 	case MEMORYMAP_TYPE_FUNCTION:
+@@ -149,6 +165,7 @@ uint16 CMemoryMap_LSBF::GetHalf(uint32 nAddress)
+ 	switch(e->nType)
+ 	{
+ 	case MEMORYMAP_TYPE_MEMORY:
++		if(e->preAccess) e->preAccess();
+ 		return *(uint16*)&((uint8*)e->pPointer)[nAddress - e->nStart];
+ 		break;
+ 	default:
+@@ -169,6 +186,7 @@ uint32 CMemoryMap_LSBF::GetWord(uint32 nAddress)
+ 	switch(e->nType)
+ 	{
+ 	case MEMORYMAP_TYPE_MEMORY:
++		if(e->preAccess) e->preAccess();
+ 		return *(uint32*)&((uint8*)e->pPointer)[nAddress - e->nStart];
+ 		break;
+ 	case MEMORYMAP_TYPE_FUNCTION:
+@@ -210,6 +228,7 @@ void CMemoryMap_LSBF::SetHalf(uint32 nAddress, uint16 nValue)
+ 	switch(e->nType)
+ 	{
+ 	case MEMORYMAP_TYPE_MEMORY:
++		if(e->preAccess) e->preAccess();
+ 		*reinterpret_cast<uint16*>(&reinterpret_cast<uint8*>(e->pPointer)[nAddress - e->nStart]) = nValue;
+ 		break;
+ 	case MEMORYMAP_TYPE_FUNCTION:
+@@ -233,6 +252,7 @@ void CMemoryMap_LSBF::SetWord(uint32 nAddress, uint32 nValue)
+ 	switch(e->nType)
+ 	{
+ 	case MEMORYMAP_TYPE_MEMORY:
++		if(e->preAccess) e->preAccess();
+ 		*(uint32*)&((uint8*)e->pPointer)[nAddress - e->nStart] = nValue;
+ 		break;
+ 	case MEMORYMAP_TYPE_FUNCTION:
+diff --git a/Source/MemoryMap.h b/Source/MemoryMap.h
+index fbf94112..c632564e 100644
+--- a/Source/MemoryMap.h
++++ b/Source/MemoryMap.h
+@@ -28,6 +28,7 @@ public:
+ 		void* pPointer;
+ 		MemoryMapHandlerType handler;
+ 		MEMORYMAP_TYPE nType;
++		std::function<void()> preAccess; //memory only: called before an access (another thread owns it)
+ 	};
+ 	typedef std::vector<MEMORYMAPELEMENT> MemoryMapListType;
+ 
+@@ -48,6 +49,7 @@ public:
+ 	const MEMORYMAPELEMENT* GetReadMap(uint32) const;
+ 	const MEMORYMAPELEMENT* GetWriteMap(uint32) const;
+ 	const MEMORYMAPELEMENT* GetInstructionMap(uint32) const;
++	void SetPreAccessHandler(uint32, const std::function<void()>&);
+ 
+ protected:
+ 	static const MEMORYMAPELEMENT* GetMap(const MemoryMapListType&, uint32);
+diff --git a/Source/MemoryUtils.cpp b/Source/MemoryUtils.cpp
+index a152ce21..e44f29c3 100644
+--- a/Source/MemoryUtils.cpp
++++ b/Source/MemoryUtils.cpp
+@@ -37,6 +37,7 @@ uint64 MemoryUtils_GetDoubleProxy(CMIPS* context, uint32 vAddress)
+ 		switch(e->nType)
+ 		{
+ 		case CMemoryMap::MEMORYMAP_TYPE_MEMORY:
++		if(e->preAccess) e->preAccess();
+ 			result.q = *reinterpret_cast<uint64*>(reinterpret_cast<uint8*>(e->pPointer) + (address - e->nStart));
+ 			break;
+ 		case CMemoryMap::MEMORYMAP_TYPE_FUNCTION:
+@@ -67,6 +68,7 @@ uint128 MemoryUtils_GetQuadProxy(CMIPS* context, uint32 vAddress)
+ 		switch(e->nType)
+ 		{
+ 		case CMemoryMap::MEMORYMAP_TYPE_MEMORY:
++		if(e->preAccess) e->preAccess();
+ 			result = *reinterpret_cast<uint128*>(reinterpret_cast<uint8*>(e->pPointer) + (address - e->nStart));
+ 			break;
+ 		case CMemoryMap::MEMORYMAP_TYPE_FUNCTION:
+@@ -117,6 +119,7 @@ void MemoryUtils_SetDoubleProxy(CMIPS* context, uint64 value64, uint32 vAddress)
+ 	switch(e->nType)
+ 	{
+ 	case CMemoryMap::MEMORYMAP_TYPE_MEMORY:
++		if(e->preAccess) e->preAccess();
+ 		*reinterpret_cast<uint64*>(reinterpret_cast<uint8*>(e->pPointer) + (address - e->nStart)) = value.q;
+ 		break;
+ 	case CMemoryMap::MEMORYMAP_TYPE_FUNCTION:
+@@ -145,6 +148,7 @@ void MemoryUtils_SetQuadProxy(CMIPS* context, const uint128& value, uint32 vAddr
+ 	switch(e->nType)
+ 	{
+ 	case CMemoryMap::MEMORYMAP_TYPE_MEMORY:
++		if(e->preAccess) e->preAccess();
+ 		*reinterpret_cast<uint128*>(reinterpret_cast<uint8*>(e->pPointer) + (address - e->nStart)) = value;
+ 		break;
+ 	case CMemoryMap::MEMORYMAP_TYPE_FUNCTION:
+diff --git a/Source/PS2VM.cpp b/Source/PS2VM.cpp
+index 708d8bbd..2486fda1 100644
+--- a/Source/PS2VM.cpp
++++ b/Source/PS2VM.cpp
+@@ -668,9 +668,14 @@ void CPS2VM::DestroyImpl()
+ 
+ void CPS2VM::CreateGsHandlerImpl(const CGSHandler::FactoryFunction& factoryFunction)
+ {
++	m_ee->SyncVpu1(CVpu1Thread::DRAIN_GS_HANDLER);
+ 	auto gs = m_ee->m_gs;
+ 	m_ee->m_gs = factoryFunction();
+ 	m_ee->m_gs->SetIntc(&m_ee->m_intc);
++	if(m_ee->m_vpu1Thread)
++	{
++		m_ee->m_gs->SetGifInterruptPoster([this]() { m_ee->m_vpu1Thread->PostInterrupt(CINTC::INTC_LINE_GS); });
++	}
+ 	m_ee->m_gs->Initialize();
+ 	m_ee->m_gs->SendGSCall([this]() {
+ 		static_cast<CEeExecutor*>(m_ee->m_EE.m_executor.get())->AttachExceptionHandlerToThread();
+@@ -743,7 +748,10 @@ void CPS2VM::UpdateEe()
+ 		m_cpuUtilisation.eeTotalTicks += executed;
+ 
+ 		m_ee->m_vpu0->Execute(m_singleStepVu0 ? 1 : executed);
+-		m_ee->m_vpu1->Execute(m_singleStepVu1 ? 1 : executed);
++		if(!m_ee->m_vpu1Thread)
++		{
++			m_ee->m_vpu1->Execute(m_singleStepVu1 ? 1 : executed);
++		}
+ 
+ 		m_eeExecutionTicks -= executed;
+ 		m_spuUpdateTicks -= (static_cast<int64>(executed) << SPU_UPDATE_TICKS_PRECISION);
+@@ -984,7 +992,7 @@ void CPS2VM::EmuThread()
+ #ifdef PROFILE
+ 							CProfilerZone profilerZone(m_gsSyncProfilerZone);
+ #endif
+-							m_ee->m_gs->SetVBlank();
++							m_ee->NotifyGsVBlank();
+ 						}
+ 
+ 						if(m_pad != NULL)
+diff --git a/Source/WsxFrameStats.h b/Source/WsxFrameStats.h
+index e11feb6d..e68f5013 100644
+--- a/Source/WsxFrameStats.h
++++ b/Source/WsxFrameStats.h
+@@ -24,7 +24,7 @@ namespace WsxFrameStats
+ 		float jitMs;    //compiling guest code
+ 		float discMs;   //blocked on disc data
+ 		float gsWaitMs; //blocked on the GS thread (it may only run 2 frames behind)
+-		float reserved;
++		float vpu1WaitMs; //blocked on the VPU1 thread (CVpu1Thread)
+ 	};
+ 	static_assert(sizeof(VM_FRAME) == 32);
+ 
+@@ -53,6 +53,7 @@ namespace WsxFrameStats
+ 	inline std::atomic<uint64> g_vmGsWaitUs = 0;
+ 	inline std::atomic<uint64> g_vmSleepUs = 0;
+ 	inline std::atomic<uint64> g_gsIdleUs = 0;
++	inline std::atomic<uint64> g_vpu1WaitUs = 0;
+ 
+ 	inline double Now()
+ 	{
+@@ -86,9 +87,9 @@ namespace WsxFrameStats
+ 	inline void MarkVmFrame()
+ 	{
+ 		static double lastAt = 0;
+-		static uint64 lastSleep = 0, lastJit = 0, lastDisc = 0, lastGsWait = 0;
++		static uint64 lastSleep = 0, lastJit = 0, lastDisc = 0, lastGsWait = 0, lastVpu1Wait = 0;
+ 		double now = Now();
+-		uint64 sleep = g_vmSleepUs, jit = g_jitUs, disc = g_discUs, gsWait = g_vmGsWaitUs;
++		uint64 sleep = g_vmSleepUs, jit = g_jitUs, disc = g_discUs, gsWait = g_vmGsWaitUs, vpu1Wait = g_vpu1WaitUs;
+ 		uint32 index = g_state.vmCount.load(std::memory_order_relaxed);
+ 		auto& frame = g_state.vm[index % RING_SIZE];
+ 		frame.at = now;
+@@ -97,12 +98,14 @@ namespace WsxFrameStats
+ 		frame.jitMs = static_cast<float>(jit - lastJit) / 1000.0f;
+ 		frame.discMs = static_cast<float>(disc - lastDisc) / 1000.0f;
+ 		frame.gsWaitMs = static_cast<float>(gsWait - lastGsWait) / 1000.0f;
++		frame.vpu1WaitMs = static_cast<float>(vpu1Wait - lastVpu1Wait) / 1000.0f;
+ 		g_state.vmCount.store(index + 1, std::memory_order_release);
+ 		lastAt = now;
+ 		lastSleep = sleep;
+ 		lastJit = jit;
+ 		lastDisc = disc;
+ 		lastGsWait = gsWait;
++		lastVpu1Wait = vpu1Wait;
+ 	}
+ 
+ 	//GS thread, at every present.
+diff --git a/Source/WsxJitCache.h b/Source/WsxJitCache.h
+index d1488343..088f104f 100644
+--- a/Source/WsxJitCache.h
++++ b/Source/WsxJitCache.h
+@@ -4,6 +4,7 @@
+ #include <deque>
+ #include <memory>
+ #include <mutex>
++#include <thread>
+ #include <unordered_map>
+ #include <vector>
+ #include "Types.h"
+@@ -62,6 +63,8 @@ namespace WsxJitCache
+ 		}
+ 		CMemoryFunction function;
+ 		uint32* linkSlots = nullptr; //what the instance's linkBase points at (in a never freed arena)
++		//Compiled code lives in its thread's function table: only that thread can adopt the instance.
++		std::thread::id owner = std::this_thread::get_id();
+ 	};
+ 
+ 	struct STATS
+@@ -75,7 +78,9 @@ namespace WsxJitCache
+ 		double precompileMs = 0;
+ 	};
+ 
+-	//Loaded entries: filled and read on the VM thread only.
++	//Loaded entries. The VM thread and the VPU1 thread (CVpu1Thread) both compile: g_mutex guards the
++	//cache (entries are never removed, so a found ENTRY stays valid).
++	inline std::recursive_mutex g_mutex;
+ 	inline std::unordered_map<KEY, ENTRY, KEY_HASH> g_entries;
+ 	inline STATS g_stats;
+ 	inline bool g_verify = false;
+@@ -102,6 +107,7 @@ namespace WsxJitCache
+ 	//VM thread. The blob must outlive the cache (it's never freed).
+ 	inline void Load(const uint8* blob, uint32 size)
+ 	{
++		std::lock_guard lock(g_mutex);
+ 		//A new game: drop what was precompiled for the previous one and not used, start on this one's entries.
+ 		for(auto& [key, entry] : g_entries)
+ 		{
+@@ -129,6 +135,7 @@ namespace WsxJitCache
+ 
+ 	inline ENTRY* Find(const KEY& key)
+ 	{
++		std::lock_guard lock(g_mutex);
+ 		auto it = g_entries.find(key);
+ 		return (it == g_entries.end()) ? nullptr : &it->second;
+ 	}
+@@ -136,6 +143,7 @@ namespace WsxJitCache
+ 	//Precompile up to `limit` of the entries loaded last.
+ 	inline void SetPrecompileLimit(uint32 limit)
+ 	{
++		std::lock_guard lock(g_mutex);
+ 		g_precompileEnd = g_stats.precompiled + limit;
+ 	}
+ 
+@@ -143,9 +151,11 @@ namespace WsxJitCache
+ 	//instance reads its links from; the caller must reset them to its trampolines.
+ 	inline bool TakePrecompiled(ENTRY& entry, CMemoryFunction& function, uint32*& linkSlots)
+ 	{
++		std::lock_guard lock(g_mutex);
+ 		entry.used = true;
+ 		if(entry.precompiled < 0) return false;
+ 		auto& precompiled = g_precompiled[entry.precompiled];
++		if(precompiled.owner != std::this_thread::get_id()) return false;
+ 		entry.precompiled = -1;
+ 		function = std::move(precompiled.function);
+ 		linkSlots = precompiled.linkSlots;
+@@ -160,8 +170,10 @@ namespace WsxJitCache
+ 		double start = WsxFrameStats::Now();
+ 		double end = start + (budgetUs / 1000.0);
+ 		bool worked = false;
+-		while((g_orderPos < g_order.size()) && (g_stats.precompiled < g_precompileEnd))
++		while(true)
+ 		{
++			std::lock_guard lock(g_mutex);
++			if((g_orderPos >= g_order.size()) || (g_stats.precompiled >= g_precompileEnd)) break;
+ 			if(worked && (WsxFrameStats::Now() >= end)) break;
+ 			auto& entry = g_entries[g_order[g_orderPos++]];
+ 			if(entry.used || (entry.precompiled >= 0)) continue;
+diff --git a/Source/WsxProfile.h b/Source/WsxProfile.h
+index 95f5556a..ea05e986 100644
+--- a/Source/WsxProfile.h
++++ b/Source/WsxProfile.h
+@@ -21,27 +21,33 @@ namespace WsxProfile
+ 		ZONE_IOP,
+ 		ZONE_SPU,
+ 		ZONE_JIT,
+-		ZONE_WAIT, //blocked on the GS thread or the disc
++		ZONE_WAIT, //blocked on the GS thread, the disc or the VPU1 thread
++		ZONE_IDLE, //a thread with nothing to do
+ 		ZONE_COUNT,
+ 	};
+ 
++	//One word per thread: the VM thread's, and the VPU1 thread's (CVpu1Thread).
+ 	inline std::atomic<uint32> g_current = ZONE_OTHER;
++	inline std::atomic<uint32> g_vpu1Zone = ZONE_IDLE;
++	inline thread_local std::atomic<uint32>* t_zone = &g_current;
+ 
+ 	class CZone
+ 	{
+ 	public:
+ 		explicit CZone(ZONE zone)
+-		    : m_saved(g_current.load(std::memory_order_relaxed))
++		    : m_word(t_zone)
++		    , m_saved(m_word->load(std::memory_order_relaxed))
+ 		{
+-			g_current.store(zone, std::memory_order_relaxed);
++			m_word->store(zone, std::memory_order_relaxed);
+ 		}
+ 
+ 		~CZone()
+ 		{
+-			g_current.store(m_saved, std::memory_order_relaxed);
++			m_word->store(m_saved, std::memory_order_relaxed);
+ 		}
+ 
+ 	private:
++		std::atomic<uint32>* m_word;
+ 		uint32 m_saved;
+ 	};
+ }
+diff --git a/Source/ee/DMAC.cpp b/Source/ee/DMAC.cpp
+index 1ad667fd..9e8cc3a1 100644
+--- a/Source/ee/DMAC.cpp
++++ b/Source/ee/DMAC.cpp
+@@ -324,6 +324,7 @@ uint32 CDMAC::ReceiveDMA9(uint32 nSrcAddress, uint32 nCount, uint32 unused, bool
+ 		nSrcAddress -= PS2::VUMEM1ADDR;
+ 		nSrcAddress &= (PS2::VUMEM1SIZE - 1);
+ 		srcPtr = m_vuMem1;
++		if(m_vuMem1PreAccess) m_vuMem1PreAccess();
+ 	}
+ 	else
+ 	{
+diff --git a/Source/ee/DMAC.h b/Source/ee/DMAC.h
+index 2aff654b..0339e845 100644
+--- a/Source/ee/DMAC.h
++++ b/Source/ee/DMAC.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <functional>
+ #include "Types.h"
+ #include "zip/ZipArchiveWriter.h"
+ #include "zip/ZipArchiveReader.h"
+@@ -190,6 +191,12 @@ private:
+ 	uint8* m_vuMem0 = nullptr;
+ 	uint8* m_vuMem1 = nullptr;
+ 
++public:
++	//Called before reading VU1 memory (it may belong to a VU1 thread)
++	std::function<void()> m_vuMem1PreAccess;
++
++private:
++
+ 	CMIPS& m_ee;
+ 
+ 	D_CTRL_REG m_D_CTRL;
+diff --git a/Source/ee/Ee_SubSystem.cpp b/Source/ee/Ee_SubSystem.cpp
+index 3443e76c..460fab0a 100644
+--- a/Source/ee/Ee_SubSystem.cpp
++++ b/Source/ee/Ee_SubSystem.cpp
+@@ -67,6 +67,11 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
+ 
+ 	m_vu1InterruptTriggeredConnection = m_vpu1->VuInterruptTriggered.Connect(
+ 	    [this]() {
++		    if(m_vpu1Thread && m_vpu1Thread->IsCurrentThread())
++		    {
++			    m_vpu1Thread->PostInterrupt(CINTC::INTC_LINE_VU1);
++			    return;
++		    }
+ 		    uint32 currentState = m_intc.GetRegister(CINTC::INTC_STAT);
+ 		    assert((currentState & (1 << CINTC::INTC_LINE_VU1)) == 0);
+ 		    m_intc.AssertLine(CINTC::INTC_LINE_VU1);
+@@ -165,10 +170,16 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
+ 	m_OnRequestInstructionCacheFlushConnection = m_os->OnRequestInstructionCacheFlush.Connect(std::bind(&CSubSystem::FlushInstructionCache, this));
+ 
+ 	SetupEePageTable();
++
++	if(CVpu1Thread::g_mode.load() != CVpu1Thread::MODE_OFF)
++	{
++		StartVpu1Thread();
++	}
+ }
+ 
+ CSubSystem::~CSubSystem()
+ {
++	StopVpu1Thread();
+ 	m_EE.m_executor->Reset();
+ 	delete m_os;
+ 	framework_aligned_free(m_ram);
+@@ -181,6 +192,126 @@ CSubSystem::~CSubSystem()
+ 	delete[] m_microMem1;
+ }
+ 
++void CSubSystem::StartVpu1Thread()
++{
++	m_vpu1Thread = std::make_unique<CVpu1Thread>(*m_vpu1, m_gif, m_ram, m_spr);
++
++	//VU1 code is compiled and run on the thread, and compiled code lives in a per-thread function table:
++	//the executor (it compiles its empty block when built) is rebuilt there.
++	m_VU1.m_emptyBlockHandler = nullptr;
++	m_VU1.m_executor.reset();
++	m_vpu1Thread->RunSync([this]() { m_VU1.m_executor = std::make_unique<CVuExecutor>(m_VU1, PS2::MICROMEM1SIZE); });
++
++	m_vpu1Thread->SetInterruptHandler([this](uint32 lines) { DeliverVpu1Interrupts(lines); });
++	m_vpu1->GetVif().SetInterruptPoster([this]() { m_vpu1Thread->PostInterrupt(CINTC::INTC_LINE_VIF1); });
++	m_gif.SetPath3ResumeHandler([this]() { m_vpu1Thread->ResumePath3(); });
++	if(m_gs)
++	{
++		m_gs->SetGifInterruptPoster([this]() { m_vpu1Thread->PostInterrupt(CINTC::INTC_LINE_GS); });
++	}
++
++	//The EE looking at VU1 memory waits for the thread first.
++	auto sync = [this]() { m_vpu1Thread->Drain(CVpu1Thread::DRAIN_VU1_MEMORY); };
++	m_EE.m_pMemoryMap->SetPreAccessHandler(PS2::VUMEM1ADDR, sync);
++	m_EE.m_pMemoryMap->SetPreAccessHandler(PS2::MICROMEM1ADDR, sync);
++	m_dmac.m_vuMem1PreAccess = sync;
++
++	m_dmac.SetChannelTransferFunction(CDMAC::CHANNEL_ID_VIF1,
++	                                  [this](uint32 address, uint32 qwc, uint32 direction, bool tagIncluded) {
++		                                  return Vif1ThreadedReceiveDMA(address, qwc, direction, tagIncluded);
++	                                  });
++	m_dmac.SetChannelTransferFunction(CDMAC::CHANNEL_ID_GIF,
++	                                  [this](uint32 address, uint32 qwc, uint32, bool tagIncluded) {
++		                                  return m_vpu1Thread->SendPath3Dma(address, qwc, tagIncluded);
++	                                  });
++}
++
++void CSubSystem::StopVpu1Thread()
++{
++	if(!m_vpu1Thread) return;
++	//The executor's code belongs to the thread's function table.
++	m_vpu1Thread->RunSync([this]() {
++		m_VU1.m_executor.reset();
++		m_VU1.m_emptyBlockHandler = nullptr;
++	});
++	m_vpu1Thread.reset();
++}
++
++void CSubSystem::SyncVpu1(uint32 reason)
++{
++	if(m_vpu1Thread)
++	{
++		m_vpu1Thread->Drain(static_cast<CVpu1Thread::DRAIN_REASON>(reason));
++	}
++}
++
++void CSubSystem::DeliverVpu1Interrupts(uint32 lines)
++{
++	if(lines & (1 << CINTC::INTC_LINE_VIF1))
++	{
++		//Raised after a delay, like the VIF does itself (CVif::CountTicks)
++		m_vpu1->GetVif().ScheduleInterrupt();
++	}
++	if(lines & (1 << CINTC::INTC_LINE_VU1))
++	{
++		m_intc.AssertLine(CINTC::INTC_LINE_VU1);
++	}
++	if(lines & (1 << CINTC::INTC_LINE_GS))
++	{
++		m_intc.AssertLine(CINTC::INTC_LINE_GS);
++	}
++}
++
++uint32 CSubSystem::Vif1ThreadedReceiveDMA(uint32 address, uint32 qwc, uint32 direction, bool tagIncluded)
++{
++	if(direction == Dmac::CChannel::CHCR_DIR_TO)
++	{
++		//GS to memory: done here, once the thread is done with what it was sent
++		m_vpu1Thread->Drain(CVpu1Thread::DRAIN_GS_READBACK);
++		return m_vpu1->GetVif().ReceiveDMA(address, qwc, direction, tagIncluded);
++	}
++	return m_vpu1Thread->SendVif1Dma(address, qwc, tagIncluded);
++}
++
++//Display settings and the bus direction go out in order with the GIF data (the flip at the end of a
++//frame must see what the game set before it). The event and interrupt registers are the EE's: at once.
++void CSubSystem::WriteGsPrivRegister(uint32 address, uint32 value)
++{
++	if(!m_vpu1Thread)
++	{
++		m_gs->WritePrivRegister(address, value);
++		return;
++	}
++	switch(address & ~0x0F)
++	{
++	case CGSHandler::GS_CSR:
++	case CGSHandler::GS_CSR_ALT:
++	case CGSHandler::GS_IMR:
++	case CGSHandler::GS_SIGLBLID:
++		m_gs->WritePrivRegister(address, value);
++		//Clearing SIGNAL lets a stalled GIF go on
++		m_vpu1Thread->Kick();
++		break;
++	default:
++		m_vpu1Thread->SendCall([this, address, value]() { m_gs->WritePrivRegister(address, value); });
++		break;
++	}
++}
++
++void CSubSystem::NotifyGsVBlank()
++{
++	if(!m_gs) return;
++	if(m_vpu1Thread)
++	{
++		m_vpu1Thread->SendVBlank([this]() { m_gs->FinishFrame(); });
++		m_gs->SignalVBlank();
++	}
++	else
++	{
++		m_gs->SetVBlank();
++	}
++}
++
+ void CSubSystem::SetVpu0(std::shared_ptr<CVpu> newVpu0)
+ {
+ 	m_vpu0 = newVpu0;
+@@ -193,6 +324,10 @@ void CSubSystem::SetVpu1(std::shared_ptr<CVpu> newVpu1)
+ 
+ void CSubSystem::Reset(uint32 ramSize)
+ {
++	if(m_vpu1Thread)
++	{
++		m_vpu1Thread->Discard();
++	}
+ 	m_os->Release();
+ 	m_EE.m_executor->Reset();
+ 
+@@ -222,7 +357,14 @@ void CSubSystem::Reset(uint32 ramSize)
+ 	m_ipu.Reset();
+ 	m_gif.Reset();
+ 	m_vpu0->Reset();
+-	m_vpu1->Reset();
++	if(m_vpu1Thread)
++	{
++		m_vpu1Thread->RunSync([this]() { m_vpu1->Reset(); });
++	}
++	else
++	{
++		m_vpu1->Reset();
++	}
+ 	m_dmac.Reset();
+ 	m_intc.Reset();
+ 	m_timer.Reset();
+@@ -309,11 +451,20 @@ bool CSubSystem::IsCpuIdle() const
+ 
+ void CSubSystem::CountTicks(int ticks)
+ {
++	if(m_vpu1Thread && !m_vpu1Thread->IsSynchronous())
++	{
++		DeliverVpu1Interrupts(m_vpu1Thread->TakeInterrupts());
++	}
+ 	if(m_vpu0->IsVuReady() || (m_vpu0->IsVuRunning() && !m_vpu0->GetVif().IsWaitingForProgramEnd()))
+ 	{
+ 		m_dmac.ResumeDMA0();
+ 	}
+-	if(m_vpu1->IsVuReady() || (m_vpu1->IsVuRunning() && !m_vpu1->GetVif().IsWaitingForProgramEnd()))
++	if(m_vpu1Thread)
++	{
++		//The thread takes transfers whenever its queue has room
++		m_dmac.ResumeDMA1();
++	}
++	else if(m_vpu1->IsVuReady() || (m_vpu1->IsVuRunning() && !m_vpu1->GetVif().IsWaitingForProgramEnd()))
+ 	{
+ 		m_dmac.ResumeDMA1();
+ 	}
+@@ -372,6 +523,7 @@ void CSubSystem::NotifyVBlankEnd()
+ 
+ void CSubSystem::SaveState(Framework::CZipArchiveWriter& archive)
+ {
++	SyncVpu1(CVpu1Thread::DRAIN_STATE);
+ 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_EE, &m_EE.m_State, sizeof(MIPSSTATE)));
+ 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_VU0, &m_VU0.m_State, sizeof(MIPSSTATE)));
+ 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_VU1, &m_VU1.m_State, sizeof(MIPSSTATE)));
+@@ -397,7 +549,15 @@ void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
+ {
+ 	m_EE.m_executor->ClearActiveBlocksInRange(0, PS2::EE_RAM_SIZE, false);
+ 	m_vpu0->GetContext().m_executor->ClearActiveBlocksInRange(0, PS2::MICROMEM0SIZE, false);
+-	m_vpu1->GetContext().m_executor->ClearActiveBlocksInRange(0, PS2::MICROMEM1SIZE, false);
++	if(m_vpu1Thread)
++	{
++		m_vpu1Thread->Discard();
++		m_vpu1Thread->RunSync([this]() { m_vpu1->GetContext().m_executor->ClearActiveBlocksInRange(0, PS2::MICROMEM1SIZE, false); });
++	}
++	else
++	{
++		m_vpu1->GetContext().m_executor->ClearActiveBlocksInRange(0, PS2::MICROMEM1SIZE, false);
++	}
+ 
+ 	archive.BeginReadFile(STATE_EE)->Read(&m_EE.m_State, sizeof(MIPSSTATE));
+ 	archive.BeginReadFile(STATE_VU0)->Read(&m_VU0.m_State, sizeof(MIPSSTATE));
+@@ -442,6 +602,7 @@ uint32 CSubSystem::IOPortReadHandler(uint32 nAddress)
+ 	}
+ 	else if(nAddress >= CGIF::REGS_START && nAddress < CGIF::REGS_END)
+ 	{
++		SyncVpu1(CVpu1Thread::DRAIN_GIF_READ);
+ 		nReturn = m_gif.GetRegister(nAddress);
+ 	}
+ 	else if(nAddress >= CVif::REGS0_START && nAddress < CVif::REGS0_END)
+@@ -450,6 +611,7 @@ uint32 CSubSystem::IOPortReadHandler(uint32 nAddress)
+ 	}
+ 	else if(nAddress >= CVif::REGS1_START && nAddress < CVif::REGS1_END)
+ 	{
++		SyncVpu1(CVpu1Thread::DRAIN_VIF1_READ);
+ 		nReturn = m_vpu1->GetVif().GetRegister(nAddress);
+ 	}
+ 	else if(nAddress >= 0x10008000 && nAddress <= 0x1000EFFC)
+@@ -467,6 +629,7 @@ uint32 CSubSystem::IOPortReadHandler(uint32 nAddress)
+ 	else if(nAddress >= CVpu::EE_ADDR_VU1AREA_START && nAddress <= CVpu::EE_ADDR_VU1AREA_END)
+ 	{
+ 		uint32 offset = nAddress - CVpu::EE_ADDR_VU1AREA_START;
++		SyncVpu1(CVpu1Thread::DRAIN_VU1_AREA);
+ 		nReturn = HandleVu1AreaRead(offset);
+ 	}
+ 	else if(nAddress >= 0x12000000 && nAddress <= 0x1200108C)
+@@ -523,7 +686,9 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
+ 	}
+ 	else if(nAddress >= CGIF::REGS_START && nAddress < CGIF::REGS_END)
+ 	{
++		SyncVpu1(CVpu1Thread::DRAIN_GIF_WRITE);
+ 		m_gif.SetRegister(nAddress, nData);
++		if(m_vpu1Thread) m_vpu1Thread->Kick();
+ 	}
+ 	else if(nAddress >= CVif::REGS0_START && nAddress < CVif::REGS0_END)
+ 	{
+@@ -531,7 +696,9 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
+ 	}
+ 	else if(nAddress >= CVif::REGS1_START && nAddress < CVif::REGS1_END)
+ 	{
++		SyncVpu1(CVpu1Thread::DRAIN_VIF1_WRITE);
+ 		m_vpu1->GetVif().SetRegister(nAddress, nData);
++		if(m_vpu1Thread) m_vpu1Thread->Kick();
+ 	}
+ 	else if(nAddress >= CVif::VIF0_FIFO_START && nAddress < CVif::VIF0_FIFO_END)
+ 	{
+@@ -539,11 +706,25 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
+ 	}
+ 	else if(nAddress >= CVif::VIF1_FIFO_START && nAddress < CVif::VIF1_FIFO_END)
+ 	{
+-		m_vpu1->GetVif().SetRegister(nAddress, nData);
++		if(m_vpu1Thread)
++		{
++			m_vpu1Thread->SendVif1FifoWrite(nAddress, nData);
++		}
++		else
++		{
++			m_vpu1->GetVif().SetRegister(nAddress, nData);
++		}
+ 	}
+ 	else if(nAddress >= CGIF::GIF_FIFO_START && nAddress < CGIF::GIF_FIFO_END)
+ 	{
+-		m_gif.SetRegister(nAddress, nData);
++		if(m_vpu1Thread)
++		{
++			m_vpu1Thread->SendGifFifoWrite(nAddress, nData);
++		}
++		else
++		{
++			m_gif.SetRegister(nAddress, nData);
++		}
+ 	}
+ 	else if(nAddress >= 0x10007000 && nAddress <= 0x1000702F)
+ 	{
+@@ -571,25 +752,35 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
+ 	else if(nAddress >= CVpu::EE_ADDR_VU1AREA_START && nAddress <= CVpu::EE_ADDR_VU1AREA_END)
+ 	{
+ 		uint32 offset = nAddress - CVpu::EE_ADDR_VU1AREA_START;
++		SyncVpu1(CVpu1Thread::DRAIN_VU1_AREA);
+ 		HandleVu1AreaWrite(offset, nData);
+ 	}
+ 	else if(nAddress == CVpu::EE_ADDR_VU_FBRST)
+ 	{
++		SyncVpu1(CVpu1Thread::DRAIN_VU1_FBRST);
+ 		m_vpu1->SetFbrst((nData >> 8) & 0xF);
++		if(m_vpu1Thread) m_vpu1Thread->Kick();
+ 	}
+ 	else if(nAddress == CVpu::EE_ADDR_VU_CMSAR1)
+ 	{
+ 		bool validAddress = (nData & 0x7) == 0;
+ 		if(validAddress)
+ 		{
+-			m_vpu1->ExecuteMicroProgram(nData);
++			if(m_vpu1Thread)
++			{
++				m_vpu1Thread->SendCall([this, nData]() { m_vpu1->ExecuteMicroProgram(nData); });
++			}
++			else
++			{
++				m_vpu1->ExecuteMicroProgram(nData);
++			}
+ 		}
+ 	}
+ 	else if(nAddress >= 0x12000000 && nAddress <= 0x1200108C)
+ 	{
+ 		if(m_gs != NULL)
+ 		{
+-			m_gs->WritePrivRegister(nAddress, nData);
++			WriteGsPrivRegister(nAddress, nData);
+ 		}
+ 	}
+ 	else
+@@ -673,6 +864,15 @@ void CSubSystem::Vu0StateChanged(CVpu::VU_STATE newState)
+ uint32 CSubSystem::Vu1MicroMemWriteHandler(uint32 address, uint32 value)
+ {
+ 	uint32 baseAddress = (address - PS2::MICROMEM1ADDR) & ~0x03;
++	if(m_vpu1Thread)
++	{
++		//Invalidating compiled VU1 code must happen on the thread that owns it
++		m_vpu1Thread->SendCall([this, baseAddress, value]() {
++			*reinterpret_cast<uint32*>(m_microMem1 + baseAddress) = value;
++			m_vpu1->InvalidateMicroProgram(baseAddress, baseAddress + 4);
++		});
++		return 0;
++	}
+ 	*reinterpret_cast<uint32*>(m_microMem1 + baseAddress) = value;
+ 	m_vpu1->InvalidateMicroProgram(baseAddress, baseAddress + 4);
+ 	return 0;
+diff --git a/Source/ee/Ee_SubSystem.h b/Source/ee/Ee_SubSystem.h
+index 8628a456..9dd9c444 100644
+--- a/Source/ee/Ee_SubSystem.h
++++ b/Source/ee/Ee_SubSystem.h
+@@ -16,6 +16,7 @@
+ #include "COP_VU.h"
+ #include "PS2OS.h"
+ #include "../gs/GSHandler.h"
++#include "Vpu1Thread.h"
+ 
+ #include "signal/Signal.h"
+ 
+@@ -68,6 +69,13 @@ namespace Ee
+ 		CPS2OS* m_os = nullptr;
+ 		CIopBios& m_iopBios;
+ 
++		//VIF1, VU1 and the GIF on their own thread (CVpu1Thread::g_mode), or null.
++		std::unique_ptr<CVpu1Thread> m_vpu1Thread;
++		//Waits until that thread did what it was sent (anything that looks at its state must).
++		void SyncVpu1(uint32 reason = 0);
++		//End of a frame for the GS (in order with the GIF data when it's threaded).
++		void NotifyGsVBlank();
++
+ 		void* operator new(size_t allocSize)
+ 		{
+ 			return framework_aligned_alloc(allocSize, 0x10);
+@@ -103,6 +111,12 @@ namespace Ee
+ 
+ 		void ExecuteIpu();
+ 
++		void StartVpu1Thread();
++		void StopVpu1Thread();
++		void DeliverVpu1Interrupts(uint32);
++		uint32 Vif1ThreadedReceiveDMA(uint32, uint32, uint32, bool);
++		void WriteGsPrivRegister(uint32, uint32);
++
+ 		void CheckPendingInterrupts();
+ 
+ 		void FlushInstructionCache();
+diff --git a/Source/ee/GIF.cpp b/Source/ee/GIF.cpp
+index 86e929c9..e94d6ebc 100644
+--- a/Source/ee/GIF.cpp
++++ b/Source/ee/GIF.cpp
+@@ -103,6 +103,11 @@ void CGIF::SaveState(Framework::CZipArchiveWriter& archive)
+ 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_FIFO_BUFFER, m_fifoBuffer, FIFO_SIZE));
+ }
+ 
++void CGIF::SetPath3ResumeHandler(std::function<void()> handler)
++{
++	m_path3ResumeHandler = std::move(handler);
++}
++
+ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
+ {
+ 	uint32 start = address;
+@@ -472,8 +477,6 @@ void CGIF::DrainFifo()
+ 
+ uint32 CGIF::ReceiveDMA(uint32 address, uint32 qwc, uint32 unused, bool tagIncluded)
+ {
+-	uint32 size = qwc * 0x10;
+-
+ 	uint8* memory = nullptr;
+ 	uint32 memorySize = 0;
+ 	if(address & 0x80000000)
+@@ -488,6 +491,12 @@ uint32 CGIF::ReceiveDMA(uint32 address, uint32 qwc, uint32 unused, bool tagInclu
+ 	}
+ 
+ 	address &= (memorySize - 1);
++	return ReceiveMemory(memory, memorySize, address, qwc, tagIncluded);
++}
++
++uint32 CGIF::ReceiveMemory(const uint8* memory, uint32 memorySize, uint32 address, uint32 qwc, bool tagIncluded)
++{
++	uint32 size = qwc * 0x10;
+ 	assert((address + size) <= memorySize);
+ 
+ 	uint32 start = address;
+@@ -538,7 +547,8 @@ uint32 CGIF::ReceiveDMA(uint32 address, uint32 qwc, uint32 unused, bool tagInclu
+ 
+ void CGIF::CountTicks(uint32 cycles)
+ {
+-	m_path3XferActiveTicks = std::max<int32>(m_path3XferActiveTicks - cycles, 0);
++	if(m_path3XferActiveTicks.load(std::memory_order_relaxed) == 0) return;
++	m_path3XferActiveTicks = std::max<int32>(m_path3XferActiveTicks.load() - cycles, 0);
+ }
+ 
+ uint32 CGIF::GetRegister(uint32 address)
+@@ -618,7 +628,14 @@ void CGIF::SetPath3Masked(bool masked)
+ 		assert(m_activePath == 0);
+ 		assert(m_maskedPath3XferState == MASKED_PATH3_XFER_NONE);
+ 		m_maskedPath3XferState = MASKED_PATH3_XFER_PROCESSING;
+-		m_dmac.ResumeDMA2();
++		if(m_path3ResumeHandler)
++		{
++			m_path3ResumeHandler();
++		}
++		else
++		{
++			m_dmac.ResumeDMA2();
++		}
+ 		assert(m_activePath == 0);
+ 		m_maskedPath3XferState = MASKED_PATH3_XFER_NONE;
+ 	}
+diff --git a/Source/ee/GIF.h b/Source/ee/GIF.h
+index 27130628..71793f30 100644
+--- a/Source/ee/GIF.h
++++ b/Source/ee/GIF.h
+@@ -1,5 +1,8 @@
+ #pragma once
+ 
++#include <atomic>
++#include <functional>
++
+ #include "Types.h"
+ #include "zip/ZipArchiveWriter.h"
+ #include "zip/ZipArchiveReader.h"
+@@ -52,6 +55,10 @@ public:
+ 
+ 	void Reset();
+ 	uint32 ReceiveDMA(uint32, uint32, uint32, bool);
++	//ReceiveDMA's work on a given buffer (threaded GIF: a record of CVpu1Thread's queue)
++	uint32 ReceiveMemory(const uint8*, uint32, uint32, uint32, bool);
++	//Threaded GIF: unmasking PATH3 resumes the queued PATH3 data instead of DMA channel 2.
++	void SetPath3ResumeHandler(std::function<void()>);
+ 
+ 	uint32 ProcessSinglePacket(const uint8*, uint32, uint32, uint32, const CGsPacketMetadata&);
+ 	uint32 ProcessMultiplePackets(const uint8*, uint32, uint32, uint32, const CGsPacketMetadata&);
+@@ -113,7 +120,8 @@ private:
+ 	uint32 m_qtemp;
+ 	SIGNAL_STATE m_signalState = SIGNAL_STATE_NONE;
+ 	MASKED_PATH3_XFER_STATE m_maskedPath3XferState = MASKED_PATH3_XFER_NONE;
+-	int32 m_path3XferActiveTicks = 0;
++	std::atomic<int32> m_path3XferActiveTicks = 0; //the EE counts it down while a GIF thread may set it
++	std::function<void()> m_path3ResumeHandler;
+ 	uint8 m_fifoBuffer[FIFO_SIZE];
+ 	uint32 m_fifoIndex = 0;
+ 	uint8* m_ram;
+diff --git a/Source/ee/Vif.cpp b/Source/ee/Vif.cpp
+index 7d1789c5..cb502ed6 100644
+--- a/Source/ee/Vif.cpp
++++ b/Source/ee/Vif.cpp
+@@ -380,6 +380,33 @@ uint32 CVif::ReceiveDMA(uint32 address, uint32 qwc, uint32 unused, bool tagInclu
+ 	return qwc - remainingSize;
+ }
+ 
++void CVif::SetThreadedSource(uint8* source, uint32 size, bool tagIncluded)
++{
++	m_stream.SetSourceParams(source, size, tagIncluded);
++}
++
++uint32 CVif::GetThreadedAvailable() const
++{
++	return m_stream.GetAvailableReadBytes();
++}
++
++//Returns what's left of the record (0: it was all taken, as a DMA transfer would have been).
++uint32 CVif::ProcessThreaded()
++{
++	ProcessPacket(m_stream);
++	return m_stream.GetRemainingDmaTransferSize();
++}
++
++void CVif::SetInterruptPoster(std::function<void()> poster)
++{
++	m_interruptPoster = std::move(poster);
++}
++
++void CVif::ScheduleInterrupt()
++{
++	m_interruptDelayTicks = 0x1000;
++}
++
+ bool CVif::IsWaitingForProgramEnd() const
+ {
+ 	return (m_STAT.nVEW != 0);
+@@ -450,7 +477,14 @@ void CVif::ProcessPacket(StreamType& stream)
+ 				m_STAT.nVIS = 1;
+ 			}
+ 			m_STAT.nINT = 1;
+-			m_interruptDelayTicks = 0x1000;
++			if(m_interruptPoster)
++			{
++				m_interruptPoster();
++			}
++			else
++			{
++				m_interruptDelayTicks = 0x1000;
++			}
+ 		}
+ 
+ 		switch(m_CODE.nCMD)
+@@ -1009,6 +1043,16 @@ void CVif::CFifoStream::SetFifoParams(uint8* source, uint32 size)
+ 	SyncBuffer();
+ }
+ 
++void CVif::CFifoStream::SetSourceParams(uint8* source, uint32 size, bool tagIncluded)
++{
++	m_source = source;
++	m_startAddress = 0;
++	m_nextAddress = 0;
++	m_endAddress = size;
++	m_tagIncluded = tagIncluded;
++	SyncBuffer();
++}
++
+ void CVif::CFifoStream::Align32()
+ {
+ 	unsigned int remainBytes = m_bufferPosition & 0x03;
+diff --git a/Source/ee/Vif.h b/Source/ee/Vif.h
+index bc53d800..967c1042 100644
+--- a/Source/ee/Vif.h
++++ b/Source/ee/Vif.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <climits>
++#include <functional>
+ #include <cstring>
+ #include "Types.h"
+ #include "Convertible.h"
+@@ -83,6 +84,14 @@ public:
+ 
+ 	bool IsWaitingForProgramEnd() const;
+ 
++	//Threaded VIF1 (CVpu1Thread): the stream reads records of the thread's queue instead of EE memory,
++	//and interrupts go through the poster (the EE thread schedules them, see ScheduleInterrupt).
++	void SetThreadedSource(uint8*, uint32, bool);
++	uint32 GetThreadedAvailable() const;
++	uint32 ProcessThreaded();
++	void SetInterruptPoster(std::function<void()>);
++	void ScheduleInterrupt();
++
+ protected:
+ 	enum
+ 	{
+@@ -207,6 +216,7 @@ protected:
+ 		inline void Align32();
+ 		void SetDmaParams(uint32, uint32, bool);
+ 		void SetFifoParams(uint8*, uint32);
++		void SetSourceParams(uint8*, uint32, bool);
+ 
+ 		uint8* GetDirectPointer() const;
+ 		void Advance(uint32);
+@@ -727,6 +737,7 @@ protected:
+ 	uint32 m_pendingMicroProgram;
+ 	uint32 m_incomingFifoDelay;
+ 	int32 m_interruptDelayTicks;
++	std::function<void()> m_interruptPoster;
+ 
+ 	CProfiler::ZoneHandle m_vifProfilerZone = 0;
+ };
+diff --git a/Source/ee/Vpu.cpp b/Source/ee/Vpu.cpp
+index baf15faa..60d951e8 100644
+--- a/Source/ee/Vpu.cpp
++++ b/Source/ee/Vpu.cpp
+@@ -217,6 +217,14 @@ void CVpu::ExecuteMicroProgram(uint32 nAddress)
+ 	}
+ }
+ 
++void CVpu::RunToCompletion()
++{
++	while(m_vuState == VU_STATE_RUNNING)
++	{
++		Execute(5000);
++	}
++}
++
+ void CVpu::InvalidateMicroProgram()
+ {
+ 	m_ctx->m_executor->ClearActiveBlocksInRange(0, (m_number == 0) ? PS2::MICROMEM0SIZE : PS2::MICROMEM1SIZE, false);
+diff --git a/Source/ee/Vpu.h b/Source/ee/Vpu.h
+index 8e468062..cdcc069e 100644
+--- a/Source/ee/Vpu.h
++++ b/Source/ee/Vpu.h
+@@ -85,6 +85,8 @@ public:
+ 	void SetFbrst(uint32);
+ 
+ 	void ExecuteMicroProgram(uint32);
++	//Threaded VU1 (CVpu1Thread): nothing runs the VU in slices, so finish a started program.
++	void RunToCompletion();
+ 	void InvalidateMicroProgram();
+ 	void InvalidateMicroProgram(uint32, uint32);
+ 
+diff --git a/Source/ee/Vpu1Thread.cpp b/Source/ee/Vpu1Thread.cpp
+new file mode 100644
+index 00000000..994d9557
+--- /dev/null
++++ b/Source/ee/Vpu1Thread.cpp
+@@ -0,0 +1,619 @@
++#include <cassert>
++#include <cstring>
++#include <cfenv>
++#include "Vpu1Thread.h"
++#include "Vpu.h"
++#include "Vif.h"
++#include "GIF.h"
++#include "../Ps2Const.h"
++#include "../WsxProfile.h"
++#include "../WsxFrameStats.h"
++#include "../WsxJitCache.h"
++#include "Jitter_CodeGen_Wasm.h"
++
++//A record in a ring: header, then the payload (16 byte aligned, never split by the ring's end).
++struct CVpu1Thread::RECORD
++{
++	uint32 kind;
++	uint32 size; //payload bytes
++	uint64 seq;
++	union
++	{
++		struct
++		{
++			uint32 tagIncluded;
++		} dma;
++		struct
++		{
++			uint32 address;
++			uint32 value;
++		} fifo;
++		struct
++		{
++			std::function<void()>* function;
++		} call;
++	};
++	uint32 reserved[2];
++
++	uint8* GetPayload()
++	{
++		return reinterpret_cast<uint8*>(this + 1);
++	}
++};
++
++//Single producer (EE), single consumer (the thread) ring of records.
++class CVpu1Thread::CRing
++{
++public:
++	explicit CRing(uint32 size)
++	    : m_size(size)
++	    , m_buffer(new uint8[size + sizeof(RECORD)])
++	{
++		assert((size & (size - 1)) == 0);
++	}
++
++	//Producer: room for a record with that payload, or nullptr when full. Publish it with Commit.
++	RECORD* Allocate(uint32 payloadSize)
++	{
++		uint32 recordSize = sizeof(RECORD) + ((payloadSize + 0xF) & ~0xF);
++		assert(recordSize <= (m_size / 4));
++		uint32 write = m_write.load(std::memory_order_relaxed);
++		uint32 read = m_read.load(std::memory_order_acquire);
++		uint32 offset = write & (m_size - 1);
++		uint32 contiguous = m_size - offset;
++		uint32 needed = recordSize;
++		if(contiguous < recordSize)
++		{
++			//Pad to the start: a record is never split
++			needed += contiguous;
++		}
++		if((m_size - (write - read)) < needed)
++		{
++			return nullptr;
++		}
++		if(contiguous < recordSize)
++		{
++			auto pad = reinterpret_cast<RECORD*>(m_buffer.get() + offset);
++			pad->kind = KIND_PAD;
++			pad->size = contiguous - sizeof(RECORD);
++			//The pad's header always fits: records are multiples of 16 and the header is 32,
++			//and a remainder under the header size is covered by the spare room past the end.
++			write += contiguous;
++			m_write.store(write, std::memory_order_release);
++			offset = 0;
++		}
++		auto record = reinterpret_cast<RECORD*>(m_buffer.get() + offset);
++		record->size = payloadSize;
++		return record;
++	}
++
++	void Commit(RECORD* record)
++	{
++		uint32 recordSize = sizeof(RECORD) + ((record->size + 0xF) & ~0xF);
++		m_write.store(m_write.load(std::memory_order_relaxed) + recordSize, std::memory_order_release);
++	}
++
++	//Consumer: the oldest record, or nullptr.
++	RECORD* Head()
++	{
++		while(true)
++		{
++			uint32 read = m_read.load(std::memory_order_relaxed);
++			uint32 write = m_write.load(std::memory_order_acquire);
++			if(read == write) return nullptr;
++			auto record = reinterpret_cast<RECORD*>(m_buffer.get() + (read & (m_size - 1)));
++			if(record->kind != KIND_PAD) return record;
++			m_read.store(read + sizeof(RECORD) + record->size, std::memory_order_release);
++		}
++	}
++
++	void Pop()
++	{
++		uint32 read = m_read.load(std::memory_order_relaxed);
++		auto record = reinterpret_cast<RECORD*>(m_buffer.get() + (read & (m_size - 1)));
++		uint32 recordSize = sizeof(RECORD) + ((record->size + 0xF) & ~0xF);
++		m_read.store(read + recordSize, std::memory_order_release);
++	}
++
++	void Clear()
++	{
++		m_read.store(m_write.load(std::memory_order_acquire), std::memory_order_release);
++	}
++
++private:
++	uint32 m_size;
++	std::unique_ptr<uint8[]> m_buffer;
++	std::atomic<uint32> m_write = 0;
++	std::atomic<uint32> m_read = 0;
++};
++
++namespace
++{
++	enum
++	{
++		VIF1_RING_SIZE = 16 * 1024 * 1024,
++		PATH3_RING_SIZE = 8 * 1024 * 1024,
++		//How many frames the thread may still be working on when the EE ends another
++		MAX_VBLANKS_BEHIND = 1,
++	};
++
++	//Copies qwords out of EE memory the way the DMA channels address it (bit 31: scratchpad).
++	void CopyFromEeMemory(uint8* dst, uint8* ram, uint8* spr, uint32 address, uint32 size)
++	{
++		uint8* source = ram;
++		uint32 memorySize = PS2::EE_RAM_SIZE;
++		if(address & 0x80000000)
++		{
++			source = spr;
++			memorySize = PS2::EE_SPR_SIZE;
++		}
++		address &= (memorySize - 1);
++		while(size != 0)
++		{
++			uint32 chunk = std::min<uint32>(size, memorySize - address);
++			memcpy(dst, source + address, chunk);
++			dst += chunk;
++			size -= chunk;
++			address = 0;
++		}
++	}
++}
++
++CVpu1Thread::CVpu1Thread(CVpu& vpu1, CGIF& gif, uint8* ram, uint8* spr)
++    : m_vpu1(vpu1)
++    , m_gif(gif)
++    , m_ram(ram)
++    , m_spr(spr)
++    , m_synchronous(g_mode.load() == MODE_SYNCHRONOUS)
++    , m_vif1Ring(std::make_unique<CRing>(VIF1_RING_SIZE))
++    , m_path3Ring(std::make_unique<CRing>(PATH3_RING_SIZE))
++{
++	static_assert(sizeof(RECORD) == 32);
++	m_thread = std::thread([this]() { ThreadProc(); });
++	m_threadId = m_thread.get_id();
++}
++
++CVpu1Thread::~CVpu1Thread()
++{
++	{
++		std::lock_guard lock(m_mutex);
++		m_quit = true;
++	}
++	m_workCondition.notify_all();
++	m_thread.join();
++}
++
++bool CVpu1Thread::IsCurrentThread() const
++{
++	return std::this_thread::get_id() == m_threadId;
++}
++
++void CVpu1Thread::SetInterruptHandler(InterruptHandler handler)
++{
++	m_interruptHandler = std::move(handler);
++}
++
++void CVpu1Thread::Publish(CRing& ring, RECORD* record)
++{
++	record->seq = m_nextSeq++;
++	ring.Commit(record);
++	m_sent.store(record->seq, std::memory_order_seq_cst);
++	if(m_parked.load(std::memory_order_seq_cst))
++	{
++		std::lock_guard lock(m_mutex);
++		m_workCondition.notify_all();
++	}
++}
++
++void CVpu1Thread::AfterSend()
++{
++	if(!m_synchronous) return;
++	Drain(DRAIN_SYNC_MODE);
++	DeliverInterrupts();
++}
++
++uint32 CVpu1Thread::SendVif1Dma(uint32 address, uint32 qwc, bool tagIncluded)
++{
++	//Large transfers go over in pieces: the queue can hold several frames of them.
++	uint32 sent = 0;
++	while(sent != qwc)
++	{
++		uint32 chunk = std::min<uint32>(qwc - sent, 0x4000);
++		auto record = m_vif1Ring->Allocate(chunk * 0x10);
++		if(!record)
++		{
++			g_stats.ringFull++;
++			break;
++		}
++		record->kind = KIND_VIF1_DMA;
++		record->dma.tagIncluded = (tagIncluded && (sent == 0)) ? 1 : 0;
++		CopyFromEeMemory(record->GetPayload(), m_ram, m_spr, address + (sent * 0x10), chunk * 0x10);
++		Publish(*m_vif1Ring, record);
++		sent += chunk;
++	}
++	AfterSend();
++	return sent;
++}
++
++void CVpu1Thread::SendVif1FifoWrite(uint32 address, uint32 value)
++{
++	RECORD* record = nullptr;
++	while(!(record = m_vif1Ring->Allocate(0)))
++	{
++		Drain(DRAIN_QUEUE_FULL);
++	}
++	record->kind = KIND_VIF1_FIFO;
++	record->fifo.address = address;
++	record->fifo.value = value;
++	Publish(*m_vif1Ring, record);
++	AfterSend();
++}
++
++uint32 CVpu1Thread::SendPath3Dma(uint32 address, uint32 qwc, bool tagIncluded)
++{
++	uint32 sent = 0;
++	while(sent != qwc)
++	{
++		uint32 chunk = std::min<uint32>(qwc - sent, 0x4000);
++		auto record = m_path3Ring->Allocate(chunk * 0x10);
++		if(!record)
++		{
++			g_stats.ringFull++;
++			break;
++		}
++		record->kind = KIND_PATH3_DMA;
++		record->dma.tagIncluded = (tagIncluded && (sent == 0)) ? 1 : 0;
++		CopyFromEeMemory(record->GetPayload(), m_ram, m_spr, address + (sent * 0x10), chunk * 0x10);
++		Publish(*m_path3Ring, record);
++		sent += chunk;
++	}
++	AfterSend();
++	return sent;
++}
++
++void CVpu1Thread::SendGifFifoWrite(uint32 address, uint32 value)
++{
++	RECORD* record = nullptr;
++	while(!(record = m_path3Ring->Allocate(0)))
++	{
++		Drain(DRAIN_QUEUE_FULL);
++	}
++	record->kind = KIND_GIF_FIFO;
++	record->fifo.address = address;
++	record->fifo.value = value;
++	Publish(*m_path3Ring, record);
++	AfterSend();
++}
++
++void CVpu1Thread::SendCall(std::function<void()> function)
++{
++	RECORD* record = nullptr;
++	while(!(record = m_vif1Ring->Allocate(0)))
++	{
++		Drain(DRAIN_QUEUE_FULL);
++	}
++	record->kind = KIND_CALL;
++	record->call.function = new std::function<void()>(std::move(function));
++	Publish(*m_vif1Ring, record);
++	AfterSend();
++}
++
++void CVpu1Thread::SendVBlank(std::function<void()> finish)
++{
++	//Don't get more than a frame ahead of the thread (unless it's stalled on us).
++	if(!m_synchronous && ((m_vblanksSent.load() - m_vblanksDone.load()) >= MAX_VBLANKS_BEHIND))
++	{
++		WsxFrameStats::CScope waitScope(WsxFrameStats::g_vpu1WaitUs);
++		WsxProfile::CZone zone(WsxProfile::ZONE_WAIT);
++		std::unique_lock lock(m_mutex);
++		uint64 target = m_vblanksSent.load() - MAX_VBLANKS_BEHIND + 1;
++		double start = WsxFrameStats::Now();
++		m_idleCondition.wait(lock, [&]() {
++			return (m_vblanksDone.load() >= target) || IsQuiescent();
++		});
++		g_stats.vblankWaitUs += static_cast<uint64>((WsxFrameStats::Now() - start) * 1000.0);
++	}
++	RECORD* record = nullptr;
++	while(!(record = m_vif1Ring->Allocate(0)))
++	{
++		Drain(DRAIN_QUEUE_FULL);
++	}
++	record->kind = KIND_VBLANK;
++	record->call.function = new std::function<void()>(std::move(finish));
++	m_vblanksSent++;
++	Publish(*m_vif1Ring, record);
++	AfterSend();
++}
++
++//Caller holds m_mutex.
++bool CVpu1Thread::IsQuiescent() const
++{
++	uint64 sent = m_sent.load();
++	if(m_completed.load() == sent) return true;
++	return m_parked.load() && (m_parkedSent == sent) && (m_parkedKicks == m_kicks.load());
++}
++
++void CVpu1Thread::Drain(DRAIN_REASON reason)
++{
++	assert(!IsCurrentThread());
++	if(m_completed.load(std::memory_order_acquire) == m_sent.load(std::memory_order_relaxed)) return;
++	WsxFrameStats::CScope waitScope(WsxFrameStats::g_vpu1WaitUs);
++	WsxProfile::CZone zone(WsxProfile::ZONE_WAIT);
++	double start = WsxFrameStats::Now();
++	//Short waits are the common case: spin a little before sleeping.
++	for(unsigned int i = 0; i < 2000; i++)
++	{
++		if(m_completed.load(std::memory_order_acquire) == m_sent.load(std::memory_order_relaxed)) break;
++		if(m_parked.load() && (i > 100)) break;
++	}
++	{
++		std::unique_lock lock(m_mutex);
++		m_idleCondition.wait(lock, [&]() { return IsQuiescent(); });
++	}
++	uint64 waitedUs = static_cast<uint64>((WsxFrameStats::Now() - start) * 1000.0);
++	g_stats.drains++;
++	g_stats.drainWaitUs += waitedUs;
++	g_stats.waitsByReason[reason]++;
++	g_stats.waitUsByReason[reason] += waitedUs;
++}
++
++void CVpu1Thread::RunSync(const std::function<void()>& function)
++{
++	assert(!IsCurrentThread());
++	Drain(DRAIN_STATE);
++	std::unique_lock lock(m_mutex);
++	m_syncCall = function;
++	m_syncCallDone = false;
++	m_workCondition.notify_all();
++	m_idleCondition.wait(lock, [&]() { return m_syncCallDone; });
++	m_syncCall = nullptr;
++}
++
++void CVpu1Thread::Discard()
++{
++	assert(!IsCurrentThread());
++	Drain(DRAIN_STATE);
++	std::unique_lock lock(m_mutex);
++	m_discard = true;
++	m_workCondition.notify_all();
++	m_idleCondition.wait(lock, [&]() { return !m_discard; });
++}
++
++void CVpu1Thread::Kick()
++{
++	{
++		std::lock_guard lock(m_mutex);
++		m_kicks++;
++	}
++	m_workCondition.notify_all();
++	AfterSend();
++}
++
++void CVpu1Thread::PostInterrupt(uint32 line)
++{
++	m_pendingInterrupts.fetch_or(1 << line);
++}
++
++uint32 CVpu1Thread::TakeInterrupts()
++{
++	if(m_pendingInterrupts.load(std::memory_order_relaxed) == 0) return 0;
++	return m_pendingInterrupts.exchange(0);
++}
++
++void CVpu1Thread::DeliverInterrupts()
++{
++	uint32 lines = TakeInterrupts();
++	if(lines && m_interruptHandler)
++	{
++		m_interruptHandler(lines);
++	}
++}
++
++void CVpu1Thread::ThreadProc()
++{
++	fesetround(FE_TOWARDZERO);
++#ifdef __EMSCRIPTEN__
++	//Compiled code calls helpers through a table each thread builds for itself.
++	Jitter::CWasmFunctionRegistry::InitializeThread();
++#endif
++	WsxProfile::t_zone = &WsxProfile::g_vpu1Zone;
++
++	std::unique_lock lock(m_mutex);
++	while(!m_quit)
++	{
++		if(m_syncCall && !m_syncCallDone)
++		{
++			m_syncCall();
++			m_syncCallDone = true;
++			m_idleCondition.notify_all();
++			continue;
++		}
++		if(m_discard)
++		{
++			//Records sent before a state load or reset belong to the machine that was replaced.
++			auto discardRing = [&](CRing& ring) {
++				while(auto record = ring.Head())
++				{
++					if((record->kind == KIND_CALL) || (record->kind == KIND_VBLANK))
++					{
++						delete record->call.function;
++					}
++					if(record->kind == KIND_VBLANK) m_vblanksDone++;
++					ring.Pop();
++					m_completed++;
++				}
++			};
++			discardRing(*m_vif1Ring);
++			discardRing(*m_path3Ring);
++			m_vif1StreamSet = false;
++			m_path3Offset = 0;
++			m_discard = false;
++			m_idleCondition.notify_all();
++			continue;
++		}
++
++		uint64 kicks = m_kicks.load();
++		uint64 sent = m_sent.load(std::memory_order_seq_cst);
++		lock.unlock();
++		{
++			WsxProfile::CZone zone(WsxProfile::ZONE_OTHER);
++			double start = WsxFrameStats::Now();
++			ProcessQueues();
++			g_stats.busyUs += static_cast<uint64>((WsxFrameStats::Now() - start) * 1000.0);
++		}
++		lock.lock();
++
++		if(m_completed.load() == m_sent.load())
++		{
++			m_idleCondition.notify_all();
++		}
++		if(m_quit || m_discard || (m_syncCall && !m_syncCallDone)) continue;
++		//More work came in, or a kick (retry stalls) while processing
++		if(m_sent.load(std::memory_order_seq_cst) != sent) continue;
++		if(m_kicks.load() != kicks) continue;
++		//Nothing to do, or stalled on the EE: wait for more work or a kick.
++		m_parkedSent = sent;
++		m_parkedKicks = kicks;
++		m_parked.store(true, std::memory_order_seq_cst);
++		m_idleCondition.notify_all();
++		m_workCondition.wait(lock, [&]() {
++			return m_quit || m_discard || (m_syncCall && !m_syncCallDone) ||
++			       (m_sent.load(std::memory_order_seq_cst) != m_parkedSent) || (m_kicks.load() != m_parkedKicks);
++		});
++		m_parked.store(false);
++	}
++}
++
++//Processes records in the order they were sent while any makes progress.
++void CVpu1Thread::ProcessQueues()
++{
++	while(true)
++	{
++		auto vif1 = m_vif1Ring->Head();
++		auto path3 = m_path3Ring->Head();
++		if(!vif1 && !path3) return;
++		bool vif1First = vif1 && (!path3 || (vif1->seq < path3->seq));
++		bool progress = false;
++		if(vif1First)
++		{
++			progress = TryVif1(*vif1);
++			if(!progress && path3) progress = TryPath3(*path3);
++		}
++		else
++		{
++			progress = TryPath3(*path3);
++			if(!progress && vif1) progress = TryVif1(*vif1);
++		}
++		if(!progress) return;
++	}
++}
++
++void CVpu1Thread::CompleteRecord(CRing& ring)
++{
++	ring.Pop();
++	g_stats.records++;
++	m_completed.fetch_add(1, std::memory_order_release);
++}
++
++bool CVpu1Thread::TryVif1(RECORD& record)
++{
++	auto& vif1 = static_cast<CVif&>(m_vpu1.GetVif());
++	switch(record.kind)
++	{
++	case KIND_VIF1_DMA:
++	{
++		m_vif1Seq = record.seq;
++		if(!m_vif1StreamSet)
++		{
++			vif1.SetThreadedSource(record.GetPayload(), record.size, record.dma.tagIncluded != 0);
++			m_vif1StreamSet = true;
++		}
++		m_vpu1.RunToCompletion();
++		uint32 before = vif1.GetThreadedAvailable();
++		uint32 remaining = vif1.ProcessThreaded();
++		m_vpu1.RunToCompletion();
++		if(remaining == 0)
++		{
++			m_vif1StreamSet = false;
++			CompleteRecord(*m_vif1Ring);
++			return true;
++		}
++		return vif1.GetThreadedAvailable() != before;
++	}
++	case KIND_VIF1_FIFO:
++		m_vif1Seq = record.seq;
++		m_vpu1.RunToCompletion();
++		vif1.SetRegister(record.fifo.address, record.fifo.value);
++		m_vpu1.RunToCompletion();
++		CompleteRecord(*m_vif1Ring);
++		return true;
++	case KIND_CALL:
++	case KIND_VBLANK:
++	{
++		//Ordered after the PATH3 data sent before it, unless that is stalled.
++		if(auto path3 = m_path3Ring->Head(); path3 && (path3->seq < record.seq))
++		{
++			if(TryPath3(*path3)) return true;
++		}
++		m_vif1Seq = record.seq;
++		m_vpu1.RunToCompletion();
++		auto function = record.call.function;
++		bool isVBlank = (record.kind == KIND_VBLANK);
++		(*function)();
++		delete function;
++		m_vpu1.RunToCompletion();
++		CompleteRecord(*m_vif1Ring);
++		if(isVBlank)
++		{
++			m_vblanksDone++;
++			std::lock_guard lock(m_mutex);
++			m_idleCondition.notify_all();
++		}
++		return true;
++	}
++	default:
++		assert(false);
++		CompleteRecord(*m_vif1Ring);
++		return true;
++	}
++}
++
++void CVpu1Thread::ResumePath3()
++{
++	assert(IsCurrentThread());
++	while(auto path3 = m_path3Ring->Head())
++	{
++		if(path3->seq > m_vif1Seq) break;
++		if(!TryPath3(*path3)) break;
++	}
++}
++
++bool CVpu1Thread::TryPath3(RECORD& record)
++{
++	switch(record.kind)
++	{
++	case KIND_PATH3_DMA:
++	{
++		uint32 qwc = record.size / 0x10;
++		uint32 done = m_path3Offset / 0x10;
++		bool tagIncluded = (record.dma.tagIncluded != 0) && (m_path3Offset == 0);
++		uint32 taken = m_gif.ReceiveMemory(record.GetPayload(), record.size, m_path3Offset, qwc - done, tagIncluded);
++		m_path3Offset += taken * 0x10;
++		if(m_path3Offset == record.size)
++		{
++			m_path3Offset = 0;
++			CompleteRecord(*m_path3Ring);
++			return true;
++		}
++		return taken != 0;
++	}
++	case KIND_GIF_FIFO:
++		m_gif.SetRegister(record.fifo.address, record.fifo.value);
++		CompleteRecord(*m_path3Ring);
++		return true;
++	default:
++		assert(false);
++		CompleteRecord(*m_path3Ring);
++		return true;
++	}
++}
+diff --git a/Source/ee/Vpu1Thread.h b/Source/ee/Vpu1Thread.h
+new file mode 100644
+index 00000000..67b53aca
+--- /dev/null
++++ b/Source/ee/Vpu1Thread.h
+@@ -0,0 +1,193 @@
++#pragma once
++
++#include <atomic>
++#include <condition_variable>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include "Types.h"
++
++class CVpu;
++class CGIF;
++class CGSHandler;
++
++//VIF1, VU1 and the GIF on a thread of their own (WebStationX).
++//
++//Together they were ~40% of the VM thread's time, and the EE only sees their work through a few doors:
++//DMA channels 1 and 2 (plus the VIF1/GIF FIFOs) feed them, and results come back as register values,
++//VU1 memory, GS events and interrupts. So the EE thread copies what it sends into a queue and carries on
++//as if the transfer completed at once (which is what the emulator did anyway, synchronously), and it
++//waits for the queue to drain (Drain) before looking through any of the doors it could see a difference
++//through: VIF1/GIF/VU1 registers and memory, state saves. What the queue sends to the GS (drawing, the
++//display registers, the end of a frame) stays in order because only this thread feeds the GS.
++//
++//Work goes into two queues, VIF1 (also carrying calls to run on this thread in order: VU1 starts from the
++//EE, display register writes, the end of a frame) and PATH3 (GIF DMA and FIFO), processed in the order
++//they were sent. Either may stall the way the hardware would, waiting on the EE (a VIF1 interrupt stall,
++//a GS SIGNAL, PATH3 masked or the GIF busy with another path): the other keeps going, and a stall counts
++//as drained, so the EE never waits on something only it can resolve. Stalls are retried when the EE
++//touches a register (Kick).
++//
++//Synchronous mode drains after every hand-over: slow, but it emulates exactly what the single thread
++//did (the determinism check compares machine fingerprints), which is what shows the plumbing is right.
++struct VPU1_THREAD_STATS
++{
++	std::atomic<uint64> drains = 0;       //Drain calls that had to wait
++	std::atomic<uint64> drainWaitUs = 0;  //EE thread time spent waiting in them
++	std::atomic<uint64> vblankWaitUs = 0; //EE waiting for the thread to catch up a frame
++	std::atomic<uint64> ringFull = 0;     //DMA transfers refused for lack of queue room
++	std::atomic<uint64> records = 0;      //records processed
++	std::atomic<uint64> busyUs = 0;       //thread time spent processing
++	std::atomic<uint64> waitsByReason[16] = {}; //Drain calls that had to wait, by DRAIN_REASON
++	std::atomic<uint64> waitUsByReason[16] = {};
++};
++
++class CVpu1Thread
++{
++public:
++	//Why the EE waited (stats)
++	enum DRAIN_REASON : uint32
++	{
++		DRAIN_OTHER,
++		DRAIN_GIF_READ,
++		DRAIN_GIF_WRITE,
++		DRAIN_VIF1_READ,
++		DRAIN_VIF1_WRITE,
++		DRAIN_VU1_AREA,
++		DRAIN_VU1_MEMORY,
++		DRAIN_VU1_FBRST,
++		DRAIN_GS_READBACK,
++		DRAIN_STATE,
++		DRAIN_QUEUE_FULL,
++		DRAIN_SYNC_MODE,
++		DRAIN_GS_HANDLER,
++		DRAIN_REASON_COUNT,
++	};
++
++	enum MODE : uint32
++	{
++		MODE_OFF,
++		MODE_SYNCHRONOUS,
++		MODE_ASYNCHRONOUS,
++	};
++
++	//Read when the EE subsystem is created (the page sets it before starting the VM).
++	static inline std::atomic<uint32> g_mode = MODE_OFF;
++
++	static inline VPU1_THREAD_STATS g_stats;
++
++	typedef std::function<void(uint32)> InterruptHandler;
++
++	CVpu1Thread(CVpu&, CGIF&, uint8* ram, uint8* spr);
++	~CVpu1Thread();
++
++	bool IsSynchronous() const
++	{
++		return m_synchronous;
++	}
++
++	//The thread itself?
++	bool IsCurrentThread() const;
++
++	//EE thread: interrupts the thread raised are handed to this (bitmask of INTC lines).
++	void SetInterruptHandler(InterruptHandler);
++
++	//EE thread: hand work over. The DMA functions return how many qwords were taken (0 when the queue
++	//is full: the DMA channel retries later, as it does for a busy device).
++	uint32 SendVif1Dma(uint32 address, uint32 qwc, bool tagIncluded);
++	void SendVif1FifoWrite(uint32 address, uint32 value);
++	uint32 SendPath3Dma(uint32 address, uint32 qwc, bool tagIncluded);
++	void SendGifFifoWrite(uint32 address, uint32 value);
++	//Runs on the thread after everything sent before it (and PATH3 sent before it, unless stalled).
++	void SendCall(std::function<void()>);
++	//End of an emulated frame: runs `finish` (the GS Finish/Flip) in order. Waits while the thread is
++	//more than a frame behind, so the EE can't run away from the GS.
++	void SendVBlank(std::function<void()> finish);
++
++	//EE thread: wait until the thread did everything it was sent (or is stalled on the EE). Afterwards,
++	//and until the EE sends or kicks again, the thread doesn't touch any state.
++	void Drain(DRAIN_REASON = DRAIN_OTHER);
++	//Drain, then run on the thread (out of band: also while stalled) and wait for it.
++	void RunSync(const std::function<void()>&);
++	//Drop everything queued (state load, reset).
++	void Discard();
++	//Something the thread may be stalled on changed.
++	void Kick();
++
++	//EE thread: interrupts raised since the last call (async mode delivers them from CountTicks).
++	uint32 TakeInterrupts();
++
++	//Thread side: raise an INTC line on the EE.
++	void PostInterrupt(uint32 line);
++	//Thread side: PATH3 was unmasked by the VIF1 data being processed; go on with the PATH3 data sent
++	//before it (what DMA channel 2 held back).
++	void ResumePath3();
++
++private:
++	struct RECORD;
++	class CRing;
++
++	enum KIND : uint32
++	{
++		KIND_PAD,
++		KIND_VIF1_DMA,
++		KIND_VIF1_FIFO,
++		KIND_PATH3_DMA,
++		KIND_GIF_FIFO,
++		KIND_CALL,
++		KIND_VBLANK,
++	};
++
++	void ThreadProc();
++	void ProcessQueues();
++	bool TryVif1(RECORD&);
++	bool TryPath3(RECORD&);
++	void CompleteRecord(CRing&);
++	void Publish(CRing&, RECORD*);
++	void AfterSend();
++	bool IsQuiescent() const;
++	void DeliverInterrupts();
++
++	CVpu& m_vpu1;
++	CGIF& m_gif;
++	uint8* m_ram = nullptr;
++	uint8* m_spr = nullptr;
++	bool m_synchronous = false;
++
++	std::unique_ptr<CRing> m_vif1Ring;
++	std::unique_ptr<CRing> m_path3Ring;
++
++	//Sequence numbers: every record gets the next one; `m_completed` counts records done.
++	uint64 m_nextSeq = 1;
++	std::atomic<uint64> m_sent = 0;
++	std::atomic<uint64> m_completed = 0;
++
++	//Current partially processed records.
++	bool m_vif1StreamSet = false;
++	uint64 m_vif1Seq = 0; //record being processed
++	uint32 m_path3Offset = 0;
++
++	std::mutex m_mutex;
++	std::condition_variable m_workCondition; //thread waits for work or a kick
++	std::condition_variable m_idleCondition; //EE waits for the thread
++	std::atomic<bool> m_parked = false;
++	uint64 m_parkedSent = 0;
++	uint64 m_parkedKicks = 0;
++	std::atomic<uint64> m_kicks = 0;
++	std::function<void()> m_syncCall;
++	bool m_syncCallDone = false;
++	bool m_discard = false;
++	bool m_quit = false;
++
++	std::atomic<uint64> m_vblanksSent = 0;
++	std::atomic<uint64> m_vblanksDone = 0;
++
++	std::atomic<uint32> m_pendingInterrupts = 0;
++	InterruptHandler m_interruptHandler;
++
++	uint32 m_vif1FifoWrites = 0;
++
++	std::thread m_thread;
++	std::thread::id m_threadId;
++};
+diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
+index 3bf5590d..40eab8d5 100644
+--- a/Source/gs/GSHandler.cpp
++++ b/Source/gs/GSHandler.cpp
+@@ -428,16 +428,43 @@ void CGSHandler::SetHBlank()
+ 
+ void CGSHandler::SetVBlank()
+ {
+-	{
+-		Finish();
+-		Flip();
+-	}
++	FinishFrame();
++	SignalVBlank();
++}
+ 
++void CGSHandler::FinishFrame()
++{
++	Finish();
++	Flip();
++}
++
++void CGSHandler::SignalVBlank()
++{
+ 	std::lock_guard registerMutexLock(m_registerMutex);
+ 	m_nCSR |= CSR_VSYNC_INT;
+ 	NotifyEvent(CSR_VSYNC_INT);
+ }
+ 
++void CGSHandler::SetGifInterruptPoster(std::function<void()> poster)
++{
++	m_gifInterruptPoster = std::move(poster);
++}
++
++//SIGNAL/FINISH met in GIF data: on a GIF thread the EE's INTC is raised through the poster.
++void CGSHandler::NotifyGifEvent(uint32 eventBit)
++{
++	if(!m_gifInterruptPoster)
++	{
++		NotifyEvent(eventBit);
++		return;
++	}
++	uint32 mask = (~m_nIMR >> 8) & 0x1F;
++	if(m_intc && ((eventBit & mask) != 0))
++	{
++		m_gifInterruptPoster();
++	}
++}
++
+ void CGSHandler::ResetVBlank()
+ {
+ 	std::lock_guard registerMutexLock(m_registerMutex);
+@@ -707,6 +734,7 @@ void CGSHandler::ProcessWriteBuffer(const CGsPacketMetadata* metadata)
+ 		{
+ 		case GS_REG_SIGNAL:
+ 		{
++			std::lock_guard registerMutexLock(m_registerMutex);
+ 			auto signal = make_convertible<SIGNAL>(write.second);
+ 			auto siglblid = make_convertible<SIGLBLID>(m_nSIGLBLID);
+ 			siglblid.sigid &= ~signal.idmsk;
+@@ -714,15 +742,19 @@ void CGSHandler::ProcessWriteBuffer(const CGsPacketMetadata* metadata)
+ 			m_nSIGLBLID = siglblid;
+ 			assert((m_nCSR & CSR_SIGNAL_EVENT) == 0);
+ 			m_nCSR |= CSR_SIGNAL_EVENT;
+-			NotifyEvent(CSR_SIGNAL_EVENT);
++			NotifyGifEvent(CSR_SIGNAL_EVENT);
+ 		}
+ 		break;
+ 		case GS_REG_FINISH:
++		{
++			std::lock_guard registerMutexLock(m_registerMutex);
+ 			m_nCSR |= CSR_FINISH_EVENT;
+-			NotifyEvent(CSR_FINISH_EVENT);
+-			break;
++			NotifyGifEvent(CSR_FINISH_EVENT);
++		}
++		break;
+ 		case GS_REG_LABEL:
+ 		{
++			std::lock_guard registerMutexLock(m_registerMutex);
+ 			auto label = make_convertible<LABEL>(write.second);
+ 			auto siglblid = make_convertible<SIGLBLID>(m_nSIGLBLID);
+ 			siglblid.lblid &= ~label.idmsk;
+diff --git a/Source/gs/GSHandler.h b/Source/gs/GSHandler.h
+index 715c8529..0e7bd98d 100644
+--- a/Source/gs/GSHandler.h
++++ b/Source/gs/GSHandler.h
+@@ -848,6 +848,11 @@ public:
+ 
+ 	void SetHBlank();
+ 	void SetVBlank();
++	//SetVBlank's two halves, for a GIF thread (CVpu1Thread): the end of the frame goes out in order with
++	//the GIF data, the VSYNC event is the EE's.
++	void FinishFrame();
++	void SignalVBlank();
++	void SetGifInterruptPoster(std::function<void()>);
+ 	void ResetVBlank();
+ 
+ 	void FeedImageData(const void*, uint32);
+@@ -1137,6 +1142,8 @@ protected:
+ 	bool m_regsDirty = false;
+ 	bool m_drawEnabled = true;
+ 	CINTC* m_intc = nullptr;
++	std::function<void()> m_gifInterruptPoster;
++	void NotifyGifEvent(uint32);
+ 	bool m_gsThreaded = true;
+ 	bool m_flipped = false;
+ 
+diff --git a/Source/ui_js/CMakeLists.txt b/Source/ui_js/CMakeLists.txt
+index 3d2f8db2..1afe83e8 100644
+--- a/Source/ui_js/CMakeLists.txt
++++ b/Source/ui_js/CMakeLists.txt
+@@ -67,7 +67,7 @@ target_link_options(Play PRIVATE "-sALLOW_MEMORY_GROWTH")
+ target_link_options(Play PRIVATE "-sMALLOC=mimalloc")
+ #target_link_options(Play PRIVATE "-sASSERTIONS=2")
+ target_link_options(Play PRIVATE "-sEXPORT_NAME=Play")
+-target_link_options(Play PRIVATE "-sPTHREAD_POOL_SIZE=2")
++target_link_options(Play PRIVATE "-sPTHREAD_POOL_SIZE=3")
+ target_link_options(Play PRIVATE "-sWASM_BIGINT")
+ target_link_options(Play PRIVATE "-sOFFSCREEN_FRAMEBUFFER=1")
+ target_link_options(Play PRIVATE "-sENVIRONMENT=web,worker")
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 55e91fca..b36769c6 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -18,6 +18,7 @@
+ #include "Ps2Const.h"
+ #include "ee/Ee_SubSystem.h"
+ #include "iop/Iop_SubSystem.h"
++#include "ee/Vpu1Thread.h"
+ #include "DefaultAppConfig.h"
+ #include "AppConfig.h"
+ #include "PS2VM_Preferences.h"
+@@ -41,6 +42,7 @@ static void CheckStateHash()
+ 	g_stateHashTarget = 0;
+ 	auto& ee = g_virtualMachine->m_ee;
+ 	auto& iop = g_virtualMachine->m_iop;
++	ee->SyncVpu1();
+ 	auto hash = [](const void* data, size_t size) {
+ 		char text[20];
+ 		snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(XXH3_64bits(data, size)));
+@@ -428,6 +430,39 @@ uintptr_t getVmZoneAddress()
+ 	return reinterpret_cast<uintptr_t>(&WsxProfile::g_current);
+ }
+ 
++// Same for the VPU1 thread (VIF1, VU1 and the GIF, CVpu1Thread).
++uintptr_t getVpu1ZoneAddress()
++{
++	return reinterpret_cast<uintptr_t>(&WsxProfile::g_vpu1Zone);
++}
++
++// VIF1/VU1/GIF on their own thread: 0 off, 1 synchronous (checks the plumbing: emulates exactly what one
++// thread does), 2 asynchronous. Must be set before initVm/initVmHosted.
++void setVpu1ThreadMode(int mode)
++{
++	CVpu1Thread::g_mode = static_cast<uint32>(mode);
++}
++
++std::string getVpu1Stats()
++{
++	auto& stats = CVpu1Thread::g_stats;
++	std::string reasons = "[";
++	for(unsigned int i = 0; i < CVpu1Thread::DRAIN_REASON_COUNT; i++)
++	{
++		if(i != 0) reasons += ",";
++		reasons += "[" + std::to_string(stats.waitsByReason[i].load()) + "," + std::to_string(stats.waitUsByReason[i].load() / 1000) + "]";
++	}
++	reasons += "]";
++	char text[512];
++	snprintf(text, sizeof(text), "{\"mode\":%u,\"drains\":%llu,\"drainWaitMs\":%.1f,\"vblankWaitMs\":%.1f,\"ringFull\":%llu,\"records\":%llu,\"busyMs\":%.1f}",
++	         CVpu1Thread::g_mode.load(), (unsigned long long)stats.drains.load(), stats.drainWaitUs.load() / 1000.0,
++	         stats.vblankWaitUs.load() / 1000.0, (unsigned long long)stats.ringFull.load(), (unsigned long long)stats.records.load(),
++	         stats.busyUs.load() / 1000.0);
++	std::string result = text;
++	result.pop_back();
++	return result + ",\"waitsByReason\":" + reasons + "}";
++}
++
+ // Sound ring (CSH_WsxRing::RING) the page's AudioWorklet plays from.
+ uintptr_t getAudioRingAddress()
+ {
+@@ -449,6 +484,9 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("getFrameStatsAddress", &getFrameStatsAddress);
+ 	function("getAudioRingAddress", &getAudioRingAddress);
+ 	function("getVmZoneAddress", &getVmZoneAddress);
++	function("getVpu1ZoneAddress", &getVpu1ZoneAddress);
++	function("setVpu1ThreadMode", &setVpu1ThreadMode);
++	function("getVpu1Stats", &getVpu1Stats);
+ 	function("setStateHashFrames", &setStateHashFrames);
+ 	function("getStateHash", &getStateHash);
+ 	function("armStateHash", &armStateHash);
+-- 
+2.51.0.windows.1
+

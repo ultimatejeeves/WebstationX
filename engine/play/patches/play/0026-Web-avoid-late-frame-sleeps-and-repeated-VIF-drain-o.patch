@@ -1,0 +1,139 @@
+From 9214497575e0ed8d1ac8b24f9f9213e90446a0fe Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 22:24:03 -0400
+Subject: [PATCH 26/43] Web: avoid late-frame sleeps and repeated VIF drain
+ overhead
+
+---
+ Source/FrameLimiter.cpp  | 16 ++++++++++++----
+ Source/ee/Vpu1Thread.cpp | 16 ++++++++++++++--
+ Source/ee/Vpu1Thread.h   |  3 +++
+ 3 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/Source/FrameLimiter.cpp b/Source/FrameLimiter.cpp
+index 308bb752..075e3de1 100644
+--- a/Source/FrameLimiter.cpp
++++ b/Source/FrameLimiter.cpp
+@@ -42,13 +42,18 @@ void CFrameLimiter::EndFrame()
+ 	if(m_minFrameDuration.count() != 0)
+ 	{
+ 		auto now = std::chrono::high_resolution_clock::now();
+-		if(!m_hasDeadline || (now - m_nextDeadline) > (m_minFrameDuration * 4))
++		if(!m_hasDeadline)
+ 		{
+-			//First frame, or we fell far behind (loading, tab in background): don't try to catch up.
+-			m_nextDeadline = now;
++			//The first frame has already done work: only wait for its remaining budget.
++			m_nextDeadline = m_lastFrameTime + m_minFrameDuration;
+ 			m_hasDeadline = true;
+ 		}
+-		m_nextDeadline += m_minFrameDuration;
++		else
++		{
++			m_nextDeadline += m_minFrameDuration;
++			//Discard a large debt without sleeping an extra frame on an already slow machine.
++			if((now - m_nextDeadline) > (m_minFrameDuration * 4)) m_nextDeadline = now;
++		}
+ 		WsxFrameStats::CScope sleepScope(WsxFrameStats::g_vmSleepUs);
+ 		//A sleep can wake up a whole OS timer tick late: 15.6 ms on Windows, where the browser usually
+ 		//doesn't raise the timer resolution for this process. Sleeping the last few ms before the deadline
+@@ -135,6 +140,9 @@ void CFrameLimiter::SetIdleWork(IdleWork idleWork)
+ 
+ void CFrameLimiter::SetFrameRate(uint32 fps)
+ {
++#ifdef __EMSCRIPTEN__
++	m_hasDeadline = false;
++#endif
+ 	if(fps == 0)
+ 	{
+ 		m_minFrameDuration = std::chrono::microseconds(0);
+diff --git a/Source/ee/Vpu1Thread.cpp b/Source/ee/Vpu1Thread.cpp
+index 994d9557..5891886a 100644
+--- a/Source/ee/Vpu1Thread.cpp
++++ b/Source/ee/Vpu1Thread.cpp
+@@ -197,7 +197,7 @@ void CVpu1Thread::Publish(CRing& ring, RECORD* record)
+ {
+ 	record->seq = m_nextSeq++;
+ 	ring.Commit(record);
+-	m_sent.store(record->seq, std::memory_order_seq_cst);
++	m_sent.store(m_nextSeq - 1, std::memory_order_seq_cst);
+ 	if(m_parked.load(std::memory_order_seq_cst))
+ 	{
+ 		std::lock_guard lock(m_mutex);
+@@ -336,6 +336,11 @@ bool CVpu1Thread::IsQuiescent() const
+ void CVpu1Thread::Drain(DRAIN_REASON reason)
+ {
+ 	assert(!IsCurrentThread());
++	const auto sent = m_sent.load(std::memory_order_acquire);
++	const auto kicks = m_kicks.load(std::memory_order_acquire);
++	//Polling a stalled VIF register can call Drain millions of times without new work.
++	//The previous drain already acquired the worker's writes; don't spin, lock or read clocks again.
++	if((sent == m_drainedSent) && (kicks == m_drainedKicks)) return;
+ 	if(m_completed.load(std::memory_order_acquire) == m_sent.load(std::memory_order_relaxed)) return;
+ 	WsxFrameStats::CScope waitScope(WsxFrameStats::g_vpu1WaitUs);
+ 	WsxProfile::CZone zone(WsxProfile::ZONE_WAIT);
+@@ -346,10 +351,13 @@ void CVpu1Thread::Drain(DRAIN_REASON reason)
+ 		if(m_completed.load(std::memory_order_acquire) == m_sent.load(std::memory_order_relaxed)) break;
+ 		if(m_parked.load() && (i > 100)) break;
+ 	}
++
+ 	{
+ 		std::unique_lock lock(m_mutex);
+ 		m_idleCondition.wait(lock, [&]() { return IsQuiescent(); });
+ 	}
++	m_drainedSent = sent;
++	m_drainedKicks = kicks;
+ 	uint64 waitedUs = static_cast<uint64>((WsxFrameStats::Now() - start) * 1000.0);
+ 	g_stats.drains++;
+ 	g_stats.drainWaitUs += waitedUs;
+@@ -362,6 +370,7 @@ void CVpu1Thread::RunSync(const std::function<void()>& function)
+ 	assert(!IsCurrentThread());
+ 	Drain(DRAIN_STATE);
+ 	std::unique_lock lock(m_mutex);
++	m_drainedSent = ~uint64(0);
+ 	m_syncCall = function;
+ 	m_syncCallDone = false;
+ 	m_workCondition.notify_all();
+@@ -374,6 +383,7 @@ void CVpu1Thread::Discard()
+ 	assert(!IsCurrentThread());
+ 	Drain(DRAIN_STATE);
+ 	std::unique_lock lock(m_mutex);
++	m_drainedSent = ~uint64(0);
+ 	m_discard = true;
+ 	m_workCondition.notify_all();
+ 	m_idleCondition.wait(lock, [&]() { return !m_discard; });
+@@ -531,6 +541,7 @@ bool CVpu1Thread::TryVif1(RECORD& record)
+ 		m_vpu1.RunToCompletion();
+ 		uint32 before = vif1.GetThreadedAvailable();
+ 		uint32 remaining = vif1.ProcessThreaded();
++		bool ranVu = m_vpu1.IsVuRunning();
+ 		m_vpu1.RunToCompletion();
+ 		if(remaining == 0)
+ 		{
+@@ -538,7 +549,8 @@ bool CVpu1Thread::TryVif1(RECORD& record)
+ 			CompleteRecord(*m_vif1Ring);
+ 			return true;
+ 		}
+-		return vif1.GetThreadedAvailable() != before;
++		//A completed microprogram can release FLUSHE/DIRECT without consuming another byte yet.
++		return ranVu || (vif1.GetThreadedAvailable() != before);
+ 	}
+ 	case KIND_VIF1_FIFO:
+ 		m_vif1Seq = record.seq;
+diff --git a/Source/ee/Vpu1Thread.h b/Source/ee/Vpu1Thread.h
+index 67b53aca..2b4cec95 100644
+--- a/Source/ee/Vpu1Thread.h
++++ b/Source/ee/Vpu1Thread.h
+@@ -159,6 +159,9 @@ private:
+ 	std::unique_ptr<CRing> m_path3Ring;
+ 
+ 	//Sequence numbers: every record gets the next one; `m_completed` counts records done.
++	//EE-only cache: no device state can change after a drain until new work or a kick.
++	uint64 m_drainedSent = ~uint64(0);
++	uint64 m_drainedKicks = ~uint64(0);
+ 	uint64 m_nextSeq = 1;
+ 	std::atomic<uint64> m_sent = 0;
+ 	std::atomic<uint64> m_completed = 0;
+-- 
+2.51.0.windows.1
+

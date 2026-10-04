@@ -1,0 +1,116 @@
+From 187fe46c1b3121d902ff3cae1b70a8221e1c9481 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 14:23:19 -0400
+Subject: [PATCH 35/43] Web: frames may end late with catch-up without losing
+ the cadence; drop debug prints
+
+---
+ Source/FrameLimiter.cpp             | 7 ++++++-
+ Source/FrameLimiter.h               | 4 ++++
+ Source/PS2VM.cpp                    | 6 ++++++
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp | 6 ++----
+ 4 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/Source/FrameLimiter.cpp b/Source/FrameLimiter.cpp
+index 486c0be5..d32765a1 100644
+--- a/Source/FrameLimiter.cpp
++++ b/Source/FrameLimiter.cpp
+@@ -83,7 +83,7 @@ void CFrameLimiter::EndFrame()
+ 		//A real hitch (work, compilation or an oversleep) must not become several
+ 		//unthrottled catch-up frames. Rebase after the late frame, including late
+ 		//wakeups inside the loop. Keep sub-ms timer noise on the running cadence.
+-		if((now - m_nextDeadline) > std::chrono::milliseconds(3)) m_nextDeadline = now;
++		if((now - m_nextDeadline) > m_lateTolerance) m_nextDeadline = now;
+ 		//Decay slowly (halves in ~45 s): a machine whose timer got finer goes back to sleeping.
+ 		m_sleepSlack -= m_sleepSlack / 4096;
+ 	}
+@@ -139,6 +139,11 @@ void CFrameLimiter::SetIdleWork(IdleWork idleWork)
+ 	m_idleWork = std::move(idleWork);
+ }
+ 
++void CFrameLimiter::SetLateTolerance(std::chrono::microseconds tolerance)
++{
++	m_lateTolerance = tolerance;
++}
++
+ double CFrameLimiter::GetLatenessUs(double fraction) const
+ {
+ 	if(!m_hasDeadline || (m_minFrameDuration.count() == 0)) return 0;
+diff --git a/Source/FrameLimiter.h b/Source/FrameLimiter.h
+index 7d400b2b..cd31b940 100644
+--- a/Source/FrameLimiter.h
++++ b/Source/FrameLimiter.h
+@@ -30,6 +30,9 @@ public:
+ 	double GetLatenessUs(double fraction) const;
+ 	//The schedule restarts from now (after a pause or a stall that isn't worth catching up on).
+ 	void Rebase(double fraction);
++	//How late a frame may end and still keep the cadence (the next one gets that much less time). Later than
++	//that is a hitch: the schedule restarts from there instead of rushing frames to make it up.
++	void SetLateTolerance(std::chrono::microseconds);
+ #endif
+ 
+ private:
+@@ -52,6 +55,7 @@ private:
+ 	//How late a sleep has been waking up lately (see EndFrame).
+ 	std::chrono::microseconds m_sleepSlack = std::chrono::microseconds(2000);
+ 	IdleWork m_idleWork;
++	std::chrono::microseconds m_lateTolerance = std::chrono::microseconds(1000);
+ #endif
+ 
+ #ifdef _WIN32
+diff --git a/Source/PS2VM.cpp b/Source/PS2VM.cpp
+index 911b071a..9a1533df 100644
+--- a/Source/PS2VM.cpp
++++ b/Source/PS2VM.cpp
+@@ -243,6 +243,11 @@ void CPS2VM::SetEeFrequencyScale(uint32 numerator, uint32 denominator)
+ void CPS2VM::SetCatchUp(bool enabled)
+ {
+ 	m_catchUpEnabled = enabled;
++#ifdef __EMSCRIPTEN__
++	//With catch-up a frame that waited on another thread ends a few milliseconds late as a matter of course
++	//(the wait is counted once it returns): that time comes out of the next frame, not out of the clock
++	m_frameLimiter.SetLateTolerance(std::chrono::microseconds(enabled ? 8000 : 1000));
++#endif
+ }
+ 
+ //A machine that can't emulate in real time used to slow the whole console down: slow motion, stretched
+@@ -1029,6 +1034,7 @@ void CPS2VM::EmuThread()
+ #ifdef __EMSCRIPTEN__
+ 	//Time the limiter would otherwise sleep goes to instantiating cached code ahead of use.
+ 	m_frameLimiter.SetIdleWork([](double budgetUs) { return WsxJitCache::Precompile(budgetUs); });
++	SetCatchUp(m_catchUpEnabled);
+ #endif
+ 	m_frameLimiter.BeginFrame();
+ 	while(1)
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 6eacb0e0..59f4c647 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -183,14 +183,13 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 	for(const auto& layer : dispInfo.layers)
+ 	{
+ 		if(!layer.enabled) continue;
+-		if(m_swDisplayedPtrs.insert(layer.bufPtr).second) printf("WSXSW displayed %x (flip %u)\n", layer.bufPtr, m_swFlipCount);
+-		if(m_swTargets.erase(layer.bufPtr)) printf("WSXSW target %x displayed: dropped\n", layer.bufPtr);
++		m_swDisplayedPtrs.insert(layer.bufPtr);
++		m_swTargets.erase(layer.bufPtr);
+ 	}
+ 	for(auto targetIterator = m_swTargets.begin(); targetIterator != m_swTargets.end();)
+ 	{
+ 		if((m_swFlipCount - targetIterator->second) > SW_TARGET_LIFETIME)
+ 		{
+-			printf("WSXSW target %x expired (flip %u)\n", targetIterator->first, m_swFlipCount);
+ 			targetIterator = m_swTargets.erase(targetIterator);
+ 		}
+ 		else
+@@ -2676,7 +2675,6 @@ void CGSH_OpenGL::SwNoteReadback(uint32 srcPtr)
+ 			if(!isFramebuffer) return;
+ 			FlushVertexBuffer();
+ 			m_renderState.isValid = false;
+-			printf("WSXSW target %x marked (flip %u, readback of %x)\n", ptr, m_swFlipCount, srcPtr);
+ 		}
+ 		m_swTargets[ptr] = m_swFlipCount;
+ 		m_ctxDirty = true;
+-- 
+2.51.0.windows.1
+

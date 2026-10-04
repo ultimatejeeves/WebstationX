@@ -1,0 +1,179 @@
+From cf221b572a06f1b12269c966fdc4b6bc76229920 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 21:30:01 -0400
+Subject: [PATCH 42/43] Debug: runtime console logging in web builds
+ (debugSetLogLevel), EE kernel state dump (debugDumpEeKernel)
+
+---
+ Source/app_shared/Log.h | 42 ++++++++++++++++++++++++++++++++++++
+ Source/ee/PS2OS.cpp     | 48 +++++++++++++++++++++++++++++++++++++++++
+ Source/ee/PS2OS.h       |  3 +++
+ Source/ui_js/Main.cpp   | 15 +++++++++++++
+ 4 files changed, 108 insertions(+)
+
+diff --git a/Source/app_shared/Log.h b/Source/app_shared/Log.h
+index 6973d237..f0bdf29c 100644
+--- a/Source/app_shared/Log.h
++++ b/Source/app_shared/Log.h
+@@ -35,6 +35,48 @@ private:
+ 	bool m_showPrints = false;
+ };
+ 
++#elif defined(__EMSCRIPTEN__)
++
++#include <cstdio>
++
++//Web builds: off by default, switched on at run time (debugSetLogLevel) and printed to the console.
++class CLog
++{
++public:
++	//0: nothing, 1: warnings, 2: everything
++	static inline int g_level = 0;
++
++	static CLog& GetInstance()
++	{
++		static CLog instance;
++		return instance;
++	}
++
++	template <typename... Args>
++	void Print(const char* logName, const char* format, Args... args)
++	{
++		if(g_level < 2) return;
++		Write(logName, format, args...);
++	}
++
++	template <typename... Args>
++	void Warn(const char* logName, const char* format, Args... args)
++	{
++		if(g_level < 1) return;
++		Write(logName, format, args...);
++	}
++
++private:
++	template <typename... Args>
++	void Write(const char* logName, const char* format, Args... args)
++	{
++		char line[512];
++		int prefix = snprintf(line, sizeof(line), "[%s] ", logName);
++		snprintf(line + prefix, sizeof(line) - prefix, format, args...);
++		fputs(line, stdout);
++	}
++};
++
+ #else
+ 
+ class CLog
+diff --git a/Source/ee/PS2OS.cpp b/Source/ee/PS2OS.cpp
+index dff52b86..d731dee7 100644
+--- a/Source/ee/PS2OS.cpp
++++ b/Source/ee/PS2OS.cpp
+@@ -1169,6 +1169,54 @@ void CPS2OS::ThreadReset(uint32 id)
+ 	context->gpr[CMIPS::RA].nV0 = BIOS_ADDRESS_THREADEPILOG;
+ }
+ 
++std::string CPS2OS::DumpKernelState() const
++{
++	static const char* statusNames[] = {"?", "running", "sleeping", "waiting", "suspended", "suspended+waiting", "suspended+sleeping", "zombie"};
++	std::string result;
++	char line[256];
++	snprintf(line, sizeof(line), "current thread %u, pc %08X, ra %08X, status %08X, cause %08X, epc %08X\n",
++	         static_cast<uint32>(m_currentThreadId), m_ee.m_State.nPC, m_ee.m_State.nGPR[CMIPS::RA].nV0,
++	         m_ee.m_State.nCOP0[CCOP_SCU::STATUS], m_ee.m_State.nCOP0[CCOP_SCU::CAUSE], m_ee.m_State.nCOP0[CCOP_SCU::EPC]);
++	result += line;
++	for(auto it = std::begin(m_threads); it != std::end(m_threads); it++)
++	{
++		auto thread = *it;
++		if(!thread) continue;
++		uint32 ra = 0;
++		if(thread->contextPtr != 0)
++		{
++			auto context = reinterpret_cast<const THREADCONTEXT*>(GetStructPtr(thread->contextPtr));
++			ra = context->gpr[CMIPS::RA].nV0;
++		}
++		snprintf(line, sizeof(line), "thread %u: %s, epc %08X, ra %08X, proc %08X, prio %u, sema %u, wakeups %u\n",
++		         static_cast<uint32>(it), statusNames[thread->status & 7], thread->epc, ra, thread->threadProc,
++		         thread->currPriority, thread->semaWait, thread->wakeUpCount);
++		result += line;
++	}
++	for(auto it = std::begin(m_semaphores); it != std::end(m_semaphores); it++)
++	{
++		auto sema = *it;
++		if(!sema) continue;
++		snprintf(line, sizeof(line), "sema %u: count %u/%u, waiting %u\n", static_cast<uint32>(it), sema->count, sema->maxCount, sema->waitCount);
++		result += line;
++	}
++	for(auto it = std::begin(m_intcHandlers); it != std::end(m_intcHandlers); it++)
++	{
++		auto handler = *it;
++		if(!handler) continue;
++		snprintf(line, sizeof(line), "intc handler %u: cause %u, address %08X\n", static_cast<uint32>(it), handler->cause, handler->address);
++		result += line;
++	}
++	for(auto it = std::begin(m_dmacHandlers); it != std::end(m_dmacHandlers); it++)
++	{
++		auto handler = *it;
++		if(!handler) continue;
++		snprintf(line, sizeof(line), "dmac handler %u: channel %u, address %08X\n", static_cast<uint32>(it), handler->channel, handler->address);
++		result += line;
++	}
++	return result;
++}
++
+ void CPS2OS::CheckLivingThreads()
+ {
+ 	//Check if we have a living thread (this is needed for autotests to work properly)
+diff --git a/Source/ee/PS2OS.h b/Source/ee/PS2OS.h
+index 0b5d2fde..9f9928d7 100644
+--- a/Source/ee/PS2OS.h
++++ b/Source/ee/PS2OS.h
+@@ -62,6 +62,9 @@ public:
+ 
+ 	void UpdateTLBEnabledState();
+ 
++	//Debug: threads, semaphores and interrupt handlers as text.
++	std::string DumpKernelState() const;
++
+ 	static uint32 TranslateAddress(CMIPS*, uint32);
+ 	static uint32 TranslateAddressTLB(CMIPS*, uint32);
+ 	static uint32 CheckTLBExceptions(CMIPS*, uint32, uint32);
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 0d2c29f0..4296ae38 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -1,3 +1,4 @@
++#include "Log.h"
+ #include <cstdio>
+ #include <atomic>
+ #include <future>
+@@ -536,6 +537,18 @@ void debugSetLocalsAsRegisters(bool enabled)
+ 	Jitter::g_wasmLocalsAsRegisters = enabled;
+ }
+ 
++// Debug: the EE kernel's threads, semaphores and interrupt handlers (read while the VM runs: a snapshot, not exact).
++std::string debugDumpEeKernel()
++{
++	return g_virtualMachine->m_ee->m_os->DumpKernelState();
++}
++
++// Debug: core logging to the console. 0 off, 1 warnings (unimplemented syscalls and module functions), 2 everything.
++void debugSetLogLevel(int level)
++{
++	CLog::g_level = level;
++}
++
+ // Debug: print every statement list the Jitter hands to the code generator (a hang while compiling shows its block last).
+ void debugSetJitTrace(bool enabled)
+ {
+@@ -728,6 +741,8 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("debugRequestVu1BlockDump", &debugRequestVu1BlockDump);
+ 	function("debugSetLocalsAsRegisters", &debugSetLocalsAsRegisters);
+ 	function("debugSetJitTrace", &debugSetJitTrace);
++	function("debugSetLogLevel", &debugSetLogLevel);
++	function("debugDumpEeKernel", &debugDumpEeKernel);
+ 	function("setStateHashFrames", &setStateHashFrames);
+ 	function("getStateHash", &getStateHash);
+ 	function("armStateHash", &armStateHash);
+-- 
+2.51.0.windows.1
+
