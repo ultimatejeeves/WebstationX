@@ -1,0 +1,162 @@
+From 2346f28500993bcb7dd8457960059c1ae6ba6aa9 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 12:51:32 -0400
+Subject: [PATCH] VU: preserve flags across microprogram uploads and make test
+ failures reliable
+
+---
+ Source/ee/VuExecutor.cpp | 56 ++--------------------------------------
+ Source/ee/VuExecutor.h   | 16 ------------
+ tools/VuTest/Test.h      | 13 +++++-----
+ 3 files changed, 9 insertions(+), 76 deletions(-)
+
+diff --git a/Source/ee/VuExecutor.cpp b/Source/ee/VuExecutor.cpp
+index 48fb3b1c..6e2ddb79 100644
+--- a/Source/ee/VuExecutor.cpp
++++ b/Source/ee/VuExecutor.cpp
+@@ -14,55 +14,9 @@ const CVuExecutor::BLOCK_COMPILE_HINTS CVuExecutor::g_blockCompileHints[] =
+ 
+ CVuExecutor::CVuExecutor(CMIPS& context, uint32 maxAddress)
+     : CGenericMipsExecutor(context, maxAddress, BLOCK_CATEGORY_PS2_VU)
+-    , m_flagAnalysis(maxAddress == PS2::MICROMEM1SIZE)
+ {
+ }
+ 
+-int CVuExecutor::Execute(int cycles)
+-{
+-	//Micro memory is only written while the VU is stopped: look at what it holds before running it again
+-	if(m_flagUseDirty) UpdateFlagUse();
+-	return CGenericMipsExecutor::Execute(cycles);
+-}
+-
+-void CVuExecutor::ClearActiveBlocksInRange(uint32 start, uint32 end, bool executing)
+-{
+-	m_flagUseDirty = true;
+-	CGenericMipsExecutor::ClearActiveBlocksInRange(start, end, executing);
+-}
+-
+-void CVuExecutor::UpdateFlagUse()
+-{
+-	m_flagUseDirty = false;
+-	if(!m_flagAnalysis) return;
+-	uint32 flagUse = 0;
+-	for(uint32 address = 0; address < m_maxAddress; address += 8)
+-	{
+-		uint32 lowerOp = m_context.m_pMemoryMap->GetInstruction(address);
+-		//Data and unused memory count too: anything that decodes as a flag read keeps the flags
+-		switch(lowerOp >> 25)
+-		{
+-		case 0x14: //FSEQ
+-		case 0x16: //FSAND
+-		case 0x17: //FSOR
+-			//The status register's current bits come from the MAC flags
+-			flagUse |= FLAG_USE_STICKY | FLAG_USE_MAC;
+-			break;
+-		case 0x18: //FMEQ
+-		case 0x1A: //FMAND
+-		case 0x1B: //FMOR
+-			flagUse |= FLAG_USE_MAC;
+-			break;
+-		}
+-	}
+-	if((flagUse & ~m_flagUse) != 0)
+-	{
+-		//Blocks compiled when nothing read these flags don't compute them
+-		ClearActiveBlocksInRangeInternal(0, m_maxAddress, nullptr);
+-	}
+-	m_flagUse = flagUse;
+-}
+-
+ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
+ {
+ 	m_blockNoClamping = std::move(blockNoClamping);
+@@ -89,8 +43,6 @@ void CVuExecutor::Reset()
+ 		m_cachedBlocks.clear();
+ 	}
+ 	m_blockNoClamping.clear();
+-	m_flagUseDirty = true;
+-	m_flagUse = FLAG_USE_ALL;
+ 	CGenericMipsExecutor::Reset();
+ }
+ 
+@@ -109,10 +61,8 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+ 	memcpy(&hash, &xxHash, sizeof(xxHash));
+ 	static_assert(sizeof(hash) == sizeof(xxHash));
+ 	auto blockKey = std::make_pair(hash, blockSizeByte);
+-	//Compiled blocks are kept per flag use: the same code computes more or fewer flags
+-	if(m_flagUseDirty) UpdateFlagUse();
+-	uint32 flagUse = m_flagAnalysis ? m_flagUse : FLAG_USE_ALL;
+-	auto cacheKey = std::make_pair(hash, blockSizeByte | (flagUse << 28));
++	// All flags remain observable by later uploads and VU0 mapped register reads.
++	auto cacheKey = blockKey;
+ 
+ 	//Don't use the cached blocks of we have a breakpoint in our block range.
+ 	bool hasBreakpoint = m_context.HasBreakpointInRange(begin, end);
+@@ -154,8 +104,6 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+ 		result->AddBlockCompileHints(VUShared::COMPILEHINT_NO_CLAMPING);
+ 	}
+ 
+-	if((flagUse & FLAG_USE_MAC) == 0) result->AddBlockCompileHints(VUShared::COMPILEHINT_SKIP_FMAC_UPDATE);
+-	if((flagUse & FLAG_USE_STICKY) == 0) result->AddBlockCompileHints(VUShared::COMPILEHINT_SKIP_STICKY_UPDATE);
+ 	result->Compile();
+ 	if(!hasBreakpoint)
+ 	{
+diff --git a/Source/ee/VuExecutor.h b/Source/ee/VuExecutor.h
+index f11ffafa..5aec199f 100644
+--- a/Source/ee/VuExecutor.h
++++ b/Source/ee/VuExecutor.h
+@@ -15,8 +15,6 @@ public:
+ 	void SetBlockNoClamping(BlockNoClampingSet);
+ 
+ 	void Reset() override;
+-	int Execute(int) override;
+-	void ClearActiveBlocksInRange(uint32, uint32, bool) override;
+ 
+ 	//Rebooting the same game: keep compiled blocks (compiling is the slow part of warming up on WebAssembly).
+ 	static void SetKeepCachedBlocksOnReset(bool);
+@@ -39,18 +37,4 @@ protected:
+ 
+ 	BlockNoClampingSet m_blockNoClamping;
+ 
+-	//Which flags the code in micro memory can read (VU1 only: the EE reads VU0's through COP2).
+-	//Every FMAC instruction otherwise computes the sign and zero bits of its result and queues them in the
+-	//MAC and sticky status pipelines, which is most of what a vertex loop compiles to, and most
+-	//microprograms never look at them (clipping uses the clip flags).
+-	enum FLAG_USE : uint32
+-	{
+-		FLAG_USE_MAC = 1,
+-		FLAG_USE_STICKY = 2,
+-		FLAG_USE_ALL = 3,
+-	};
+-	void UpdateFlagUse();
+-	bool m_flagAnalysis = false;
+-	bool m_flagUseDirty = true;
+-	uint32 m_flagUse = FLAG_USE_ALL;
+ };
+diff --git a/tools/VuTest/Test.h b/tools/VuTest/Test.h
+index fa22cb7d..2d48abf9 100644
+--- a/tools/VuTest/Test.h
++++ b/tools/VuTest/Test.h
+@@ -2,12 +2,13 @@
+ 
+ #include "TestVm.h"
+ 
+-#define TEST_VERIFY(a) \
+-	if(!(a))           \
+-	{                  \
+-		int* p = 0;    \
+-		(*p) = 0;      \
+-	}
++#include <cstdio>
++#include <stdexcept>
++
++#define TEST_VERIFY(a) do { if(!(a)) { \
++    fprintf(stderr, "%s:%d: failed: %s\n", __FILE__, __LINE__, #a); \
++    throw std::runtime_error("VU test assertion failed"); \
++} } while(false)
+ 
+ class CTest
+ {
+-- 
+2.51.0.windows.1
+

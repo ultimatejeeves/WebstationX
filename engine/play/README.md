@@ -87,6 +87,9 @@ Pinned upstream: Play! `83700b2c` (0.77-12), CodeGen `a5009f7`.
 | play/0042 | Runtime console logging and EE kernel state inspection | Diagnose core failures without recompiling for every trace |
 | play/0043 | Download rendered 32/24-bit color buffers through GL readback; GS memory inspection tools | Drawn pixels must be brought back into GS RAM before a host download |
 | play/0044 | TLB checks for wide/FPU/COP2 memory instructions; mode-aware EE code caches and active-block invalidation; translated Wasm COP2 quadword access and alignment | Prevent skipped memory faults, reuse of unchecked code, translated vector-access traps, and misaligned quadword corruption; 260 executable Wasm regression checks |
+| play/0045 | Shared paired-page/ASID/global TLB matching; all 48 indexed slots and probing; data faults, EPC/BD and common-handler routing | 525 EE Wasm checks cover instructions, permissions, handler state and retry; preserves documented HLE limitations |
+| play/0046 | Preserve VU flags across future microprogram uploads; reliable upstream test assertions | Upload regression now passes; Wasm runner exposes the pre-existing Tri-Ace one-ULP arithmetic failure (20/21 upstream tests pass) |
+
 
 ## Build
 

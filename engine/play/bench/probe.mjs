@@ -277,6 +277,10 @@ while ((Date.now() - t0) / 1000 < SECS) {
   }
   if (saveAt !== null && !saved && s >= saveAt) {
     saved = true;
+    if (process.argv.includes('--require-state-hash') &&
+        !(await page.evaluate(() => window.Module.getStateHash?.()))) {
+      throw new Error('Refusing comparison snapshot before the fixed-frame fingerprint has completed');
+    }
     console.log(`  saved state ${saveName}: ${await page.evaluate((n) => window.__saveState(n), saveName)} bytes`);
   }
   if (SAVEJIT && !savedJit && s >= SAVEJIT) {

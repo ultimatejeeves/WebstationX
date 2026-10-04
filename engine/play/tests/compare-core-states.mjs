@@ -21,6 +21,7 @@ const url = arg('url', 'http://localhost:8344/');
 const seconds = Number(arg('secs', '20'));
 assert(Number.isFinite(seconds) && seconds >= 10, '--secs must be at least 10');
 const output = path.resolve(root, arg('out', 'work/core-state-comparison'));
+const saveStates = process.argv.includes('--save-states');
 const fixtures = {
   thps: ['thps4/game.chd', 'thps4-foundry.st'],
   mirra: ['dave-mirra-freestyle-bmx-2/game.chd', 'mirra-fixed-gameplay.st'],
@@ -40,6 +41,9 @@ async function run(name, mode, label, core) {
   const logPath = `${out}.log`;
   const args = ['engine/play/bench/probe.mjs', '--url', url, '--disc', disc,
     '--query', query.toString(), '--secs', String(seconds), '--out', out];
+  // The fingerprint pauses the VM. Capture that paused state for byte-level diagnosis.
+  const snapshot = `compare-${path.basename(output)}-${name}-${mode}-${label}.st`;
+  if (saveStates) args.push('--savestate', `${seconds - 2}:${snapshot}`, '--require-state-hash');
   console.log(`${name} ${mode} ${label}: 120 emulated frames`);
   let log = '';
   const child = spawn(process.execPath, args, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -56,6 +60,7 @@ async function run(name, mode, label, core) {
   assert.doesNotMatch(log, /pageerror:|worker exception:/, `Browser exception: ${logPath}`);
   const match = log.match(/^state hash: (\{[^\r\n]+\})/m);
   assert(match, `No completed fingerprint; increase --secs and inspect ${logPath}`);
+  if (saveStates) assert.match(log, /saved state .*: [1-9]\d* bytes/, `State snapshot failed: ${logPath}`);
   const { ms, ...hash } = JSON.parse(match[1]);
   for (const key of ['eeRam', 'spr', 'eeGpr', 'eePc', 'vu0Mem', 'vu1Mem', 'vu1Regs', 'iopRam']) {
     assert.equal(typeof hash[key], 'string', `Missing ${key}: ${logPath}`);

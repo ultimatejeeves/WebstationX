@@ -7,6 +7,7 @@
 #include "COP_FPU.h"
 #include "ee/COP_VU.h"
 #include "ee/MA_EE.h"
+#include "ee/PS2OS.h"
 #include "ee/EeExecutor.h"
 #include "ee/EeBasicBlock.h"
 #include "MemoryUtils.h"
@@ -43,6 +44,7 @@ struct Fixture
 {
     CMIPS cpu{MEMORYMAP_ENDIAN_LSBF, true};
     CMA_EE arch;
+    CCOP_SCU scu{MIPS_REGSIZE_64};
     CCOP_FPU fpu{MIPS_REGSIZE_64};
     CCOP_VU vu{MIPS_REGSIZE_64};
     alignas(16) uint32 code[16] = {};
@@ -50,6 +52,7 @@ struct Fixture
     Fixture()
     {
         cpu.m_pArch = &arch;
+        cpu.m_pCOP[0] = &scu;
         cpu.m_pCOP[1] = &fpu;
         cpu.m_pCOP[2] = &vu;
         cpu.m_pAddrTranslator = &Translate;
@@ -221,12 +224,15 @@ static void ActiveCacheTests()
     CEeExecutor::SetKeepCachedBlocksOnReset(false);
 }
 
+#include "ee-tlb-tests.h"
+
 int main(int argc, char** argv)
 {
     RegisterTestFunctions();
-    if(argc > 1 && !strcmp(argv[1], "--cache")) CacheTests();
+    if(argc > 1 && !strcmp(argv[1], "--tlb")) { TlbTests(); TlbInstructionTests(); TlbDelayTests(); TlbRoutingTests(); }
+    else if(argc > 1 && !strcmp(argv[1], "--cache")) CacheTests();
     else if(argc > 1 && !strcmp(argv[1], "--quad")) QuadTests();
-    else { FaultTests(); CacheTests(); ActiveCacheTests(); QuadTests(); }
+    else { FaultTests(); CacheTests(); ActiveCacheTests(); QuadTests(); TlbTests(); TlbInstructionTests(); TlbDelayTests(); TlbRoutingTests(); }
     printf("EE memory: %u checks, %u failures\n", checks, failures);
     return failures ? 1 : 0;
 }
