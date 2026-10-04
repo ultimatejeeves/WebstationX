@@ -18,7 +18,7 @@ cmake --build "$BUILD" --target PlayCore > "$OUT/build.log" 2>&1 || { tail -60 "
 } > "$OUT/ee-test-registry.h"
 EXPORTS="['_main'$(sed -n 's/.*RegisterFunction.*"\(_[^"]*\)".*/,"\1"/p' "$SRC/Source/ui_js/Ps2VmJs.cpp" | tr -d '\r\n')]"
 mapfile -t LIBS < <(find "$BUILD/Source/ui_js/Source" -name '*.a')
-SOURCES=("$ROOT/engine/play/tests/ee-memory-test.cpp")
+SOURCES=("$ROOT/engine/play/tests/$SUITE-test.cpp")
 if [ "$SUITE" = vu ]; then
   SOURCES=("$ROOT/engine/play/tests/vu-test.cpp")
   while IFS= read -r file; do SOURCES+=("$file"); done < <(find "$SRC/tools/VuTest" -name '*.cpp' ! -name Main.cpp)

@@ -269,8 +269,8 @@ if (discName) {
   document.getElementById('outputCanvas').focus();
   const st = params.get('state');
   if (st) {
-    // Give the boot a moment to set up the VM, then restore.
-    await new Promise((r) => setTimeout(r, 1500));
+    // Vary pre-load boot progress to expose device state leaking across loads.
+    await new Promise((r) => setTimeout(r, Number(params.get('bootwait') ?? 1500)));
     // ?hash=N: fingerprint the machine N frames after the load and pause (determinism check).
     if (params.get('hash')) mod.setStateHashFrames(Number(params.get('hash')));
     // ?gstrace=N / ?viftrace=N: trace the first frames after the load (comparable between runs and threading modes)

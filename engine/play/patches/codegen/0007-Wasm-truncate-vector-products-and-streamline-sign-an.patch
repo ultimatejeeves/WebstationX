@@ -1,0 +1,200 @@
+From fd9c0888778d14e3ac258e8d2fe75497ac2a0786 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 13:36:52 -0400
+Subject: [PATCH] Wasm: truncate vector products and streamline sign and zero
+ flags
+
+---
+ include/Jitter_CodeGen_Wasm.h  |  4 ++
+ include/WasmDefs.h             |  5 ++
+ src/Jitter_CodeGen_Wasm.cpp    |  4 ++
+ src/Jitter_CodeGen_Wasm_Md.cpp | 87 ++++++++++++++++++++++++++++------
+ 4 files changed, 86 insertions(+), 14 deletions(-)
+
+diff --git a/include/Jitter_CodeGen_Wasm.h b/include/Jitter_CodeGen_Wasm.h
+index b112068..32961bc 100644
+--- a/include/Jitter_CodeGen_Wasm.h
++++ b/include/Jitter_CodeGen_Wasm.h
+@@ -35,6 +35,7 @@ namespace Jitter
+ 	{
+ 	public:
+ 		CCodeGen_Wasm();
++		void SetTruncateFloatMultiply(bool enabled) { m_truncateFloatMultiply = enabled; }
+ 
+ 		void GenerateCode(const StatementList&, unsigned int) override;
+ 		void SetStream(Framework::CStream*) override;
+@@ -253,6 +254,9 @@ namespace Jitter
+ 		uint32 m_localI64Count = 0;
+ 		uint32 m_localF32Count = 0;
+ 		uint32 m_localV128Count = 0;
++		bool m_truncateFloatMultiply = false;
++		uint32 m_mulScratch = 0;
++		void Emit_Md_MulS(const STATEMENT&);
+ 		bool m_isInsideBlock = false;
+ 		bool m_isInsideLoop = false;
+ 		uint32 m_currentBlockDepth = 0;
+diff --git a/include/WasmDefs.h b/include/WasmDefs.h
+index 6c0b181..2d6afcc 100644
+--- a/include/WasmDefs.h
++++ b/include/WasmDefs.h
+@@ -198,6 +198,10 @@ namespace Wasm
+ 		INST_F32x4_EQ = 0x41,
+ 		INST_F32x4_LT = 0x43,
+ 		INST_F32x4_GT = 0x44,
++		INST_F64x2_PROMOTE_LOW_F32x4 = 0x5F,
++		INST_F64x2_GT = 0xD9,
++		INST_F64x2_ABS = 0xEC,
++		INST_F64x2_MUL = 0xF2,
+ 		INST_V128_NOT = 0x4D,
+ 		INST_V128_AND = 0x4E,
+ 		INST_V128_OR = 0x50,
+@@ -209,6 +213,7 @@ namespace Wasm
+ 		INST_I8x16_SUB = 0x71,
+ 		INST_I8x16_SUB_SAT_S = 0x72,
+ 		INST_I8x16_SUB_SAT_U = 0x73,
++		INST_I8x16_BITMASK = 0x64,
+ 		INST_I16x8_BITMASK = 0x84,
+ 		INST_I16x8_SHL = 0x8B,
+ 		INST_I16x8_SHR_S = 0x8C,
+diff --git a/src/Jitter_CodeGen_Wasm.cpp b/src/Jitter_CodeGen_Wasm.cpp
+index 80df954..5ef39a8 100644
+--- a/src/Jitter_CodeGen_Wasm.cpp
++++ b/src/Jitter_CodeGen_Wasm.cpp
+@@ -307,6 +307,10 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
+ 	BuildLabelFlows(statements);
+ 	PrepareSignatures(moduleBuilder, statements);
+ 	PrepareLocalVars(statements);
++	if(m_truncateFloatMultiply)
++	{
++		m_mulScratch = 1 + m_localI32Count + m_localI64Count + m_localF32Count + m_localV128Count++;
++	}
+ 
+ 	for(const auto& statement : statements)
+ 	{
+diff --git a/src/Jitter_CodeGen_Wasm_Md.cpp b/src/Jitter_CodeGen_Wasm_Md.cpp
+index cd87a1b..fc609e5 100644
+--- a/src/Jitter_CodeGen_Wasm_Md.cpp
++++ b/src/Jitter_CodeGen_Wasm_Md.cpp
+@@ -15,6 +15,70 @@ static const uint8 g_unpackUpperBHShuffle[0x10] = {8, 24, 9, 25, 10, 26, 11, 27,
+ static const uint8 g_unpackUpperHWShuffle[0x10] = {8, 9, 24, 25, 10, 11, 26, 27, 12, 13, 28, 29, 14, 15, 30, 31};
+ static const uint8 g_unpackUpperWDShuffle[0x10] = {8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31};
+ 
++// A product of two binary32 significands fits exactly in binary64. Compare the
++// nearest-rounded result with that product and move one ULP toward zero only
++// when it overshot. This also turns finite overflow into the largest finite value.
++void CCodeGen_Wasm::Emit_Md_MulS(const STATEMENT& statement)
++{
++	if(!m_truncateFloatMultiply)
++	{
++		Emit_Md_MemMemMem<Wasm::INST_F32x4_MUL>(statement);
++		return;
++	}
++	auto dst = statement.dst->GetSymbol().get();
++	auto a = statement.src1->GetSymbol().get();
++	auto b = statement.src2->GetSymbol().get();
++	auto simd = [&](uint32 opcode) {
++		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
++		CWasmModuleBuilder::WriteULeb128(m_functionStream, opcode);
++	};
++	auto local = [&](uint8 opcode) {
++		m_functionStream.Write8(opcode);
++		CWasmModuleBuilder::WriteULeb128(m_functionStream, m_mulScratch);
++	};
++	auto promote = [&](bool high) {
++		if(high)
++		{
++			// Rotate the high two lanes into the low half without another load.
++			simd(Wasm::INST_V128_CONST);
++			const uint8 zero[16] = {};
++			m_functionStream.Write(zero, sizeof(zero));
++			simd(Wasm::INST_I8x16_SHUFFLE);
++			const uint8 rotate[16] = {8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7};
++			m_functionStream.Write(rotate, sizeof(rotate));
++		}
++		simd(Wasm::INST_F64x2_PROMOTE_LOW_F32x4); // f64x2.promote_low_f32x4
++	};
++	PrepareSymbolDef(dst);
++	PrepareSymbolUse(a);
++	PrepareSymbolUse(b);
++	simd(Wasm::INST_F32x4_MUL);
++	local(Wasm::INST_LOCAL_SET);
++	local(Wasm::INST_LOCAL_GET); // Result bits for the final subtraction.
++	for(bool high : {false, true})
++	{
++		local(Wasm::INST_LOCAL_GET);
++		promote(high);
++		simd(Wasm::INST_F64x2_ABS); // f64x2.abs
++		PrepareSymbolUse(a);
++		promote(high);
++		PrepareSymbolUse(b);
++		promote(high);
++		simd(Wasm::INST_F64x2_MUL); // f64x2.mul (exact binary32 product)
++		simd(Wasm::INST_F64x2_ABS);
++		simd(Wasm::INST_F64x2_GT); // f64x2.gt
++	}
++	simd(Wasm::INST_I8x16_SHUFFLE);
++	const uint8 narrow[16] = {0,1,2,3,8,9,10,11,16,17,18,19,24,25,26,27};
++	m_functionStream.Write(narrow, sizeof(narrow));
++	m_functionStream.Write8(Wasm::INST_I32_CONST);
++	m_functionStream.Write8(1);
++	simd(Wasm::INST_I32x4_SPLAT);
++	simd(Wasm::INST_V128_AND);
++	simd(Wasm::INST_I32x4_SUB);
++	CommitSymbol(dst);
++}
++
+ void CCodeGen_Wasm::MdBlendValues(uint8 mask)
+ {
+ 	m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+@@ -556,23 +620,15 @@ void CCodeGen_Wasm::Emit_Md_MakeSz_MemMem(const STATEMENT& statement)
+ 	// clang-format off
+ 	static const uint8 makeSzShufflePattern[0x10] =
+ 	{
+-		0x1E, 0x1C, 0x1A, 0x18, 0x16, 0x14, 0x12, 0x10,
+-		0x0E, 0x0C, 0x0A, 0x08, 0x06, 0x04, 0x02, 0x00,
++		0x1F, 0x1B, 0x17, 0x13, 0x0F, 0x0B, 0x07, 0x03,
++		0x1F, 0x1B, 0x17, 0x13, 0x0F, 0x0B, 0x07, 0x03,
+ 	};
+ 	// clang-format on
+ 
+ 	PrepareSymbolDef(dst);
+ 
+-	//Compute sign
+-	{
+-		PrepareSymbolUse(src1);
+-
+-		m_functionStream.Write8(Wasm::INST_I32_CONST);
+-		m_functionStream.Write8(31);
+-
+-		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+-		CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I32x4_SHR_S);
+-	}
++	// The high byte of each original lane already contains its sign bit.
++	PrepareSymbolUse(src1);
+ 
+ 	//Compute zero
+ 	{
+@@ -593,7 +649,10 @@ void CCodeGen_Wasm::Emit_Md_MakeSz_MemMem(const STATEMENT& statement)
+ 
+ 	//Extract bits
+ 	m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+-	CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I16x8_BITMASK);
++	CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I8x16_BITMASK);
++	m_functionStream.Write8(Wasm::INST_I32_CONST);
++	CWasmModuleBuilder::WriteSLeb128(m_functionStream, 0xFF);
++	m_functionStream.Write8(Wasm::INST_I32_AND);
+ 
+ 	CommitSymbol(dst);
+ }
+@@ -971,7 +1030,7 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_mdConstMatchers[] =
+ 
+ 	{ OP_MD_ADD_S,       MATCH_MEMORY128,      MATCH_MEMORY128,      MATCH_MEMORY128,     MATCH_NIL,      &CCodeGen_Wasm::Emit_Md_MemMemMem<Wasm::INST_F32x4_ADD>       },
+ 	{ OP_MD_SUB_S,       MATCH_MEMORY128,      MATCH_MEMORY128,      MATCH_MEMORY128,     MATCH_NIL,      &CCodeGen_Wasm::Emit_Md_MemMemMem<Wasm::INST_F32x4_SUB>       },
+-	{ OP_MD_MUL_S,       MATCH_MEMORY128,      MATCH_MEMORY128,      MATCH_MEMORY128,     MATCH_NIL,      &CCodeGen_Wasm::Emit_Md_MemMemMem<Wasm::INST_F32x4_MUL>       },
++	{ OP_MD_MUL_S,       MATCH_MEMORY128,      MATCH_MEMORY128,      MATCH_MEMORY128,     MATCH_NIL,      &CCodeGen_Wasm::Emit_Md_MulS       },
+ 	{ OP_MD_DIV_S,       MATCH_MEMORY128,      MATCH_MEMORY128,      MATCH_MEMORY128,     MATCH_NIL,      &CCodeGen_Wasm::Emit_Md_MemMemMem<Wasm::INST_F32x4_DIV>       },
+ 
+ 	{ OP_MD_ABS_S,       MATCH_MEMORY128,      MATCH_MEMORY128,      MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Md_MemMem<Wasm::INST_F32x4_ABS>          },
+-- 
+2.51.0.windows.1
+

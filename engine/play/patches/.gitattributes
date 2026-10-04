@@ -1,0 +1,3 @@
+# Patches contain exact upstream line endings, sometimes mixed within one file.
+# Normalizing them changes context and can make a fresh build impossible.
+*.patch -text

@@ -5,9 +5,11 @@ Emscripten and patched for speed and for embedding in WebStationX. The build lan
 `public/cores/play/` (`Play.js` + `Play.wasm`), which the app loads on the first PS2 launch.
 
 **Core accuracy work:** [the accuracy roadmap and regression workflow](CORE-ACCURACY.md)
-tracks subsystem improvements, hardware-model limitations, and the October 4 EE memory fixes.
-Run `tests/run-ee-memory-tests.sh` for instruction-level Wasm regressions and
-`tests/compare-core-states.mjs` for fixed-frame comparisons across gameplay states.
+tracks subsystem improvements, hardware-model limitations, EE memory fixes,
+sound-state restoration, and general Wasm vector multiplication. Run
+`tests/run-ee-memory-tests.sh`, `tests/run-vu-tests.sh`,
+`tests/run-spu-state-tests.sh`, and `tests/run-wasm-multiply-tests.sh` for component
+regressions, and `tests/compare-core-states.mjs` for fixed-frame game comparisons.
 
 **Current validation and limitations:** see [the October 1 review](REVIEW-2026-10-01.md) (ATV Offroad Fury 2:
 correct terrain, full speed, ~40 game frames per second in a race on the desktop below; what is left and why) and
@@ -89,6 +91,8 @@ Pinned upstream: Play! `83700b2c` (0.77-12), CodeGen `a5009f7`.
 | play/0044 | TLB checks for wide/FPU/COP2 memory instructions; mode-aware EE code caches and active-block invalidation; translated Wasm COP2 quadword access and alignment | Prevent skipped memory faults, reuse of unchecked code, translated vector-access traps, and misaligned quadword corruption; 260 executable Wasm regression checks |
 | play/0045 | Shared paired-page/ASID/global TLB matching; all 48 indexed slots and probing; data faults, EPC/BD and common-handler routing | 525 EE Wasm checks cover instructions, permissions, handler state and retry; preserves documented HLE limitations |
 | play/0046 | Preserve VU flags across future microprogram uploads; reliable upstream test assertions | Upload regression now passes; Wasm runner exposes the pre-existing Tri-Ace one-ULP arithmetic failure (20/21 upstream tests pass) |
+| play/0047 | Restore SPU input FIFO, DMA cursor, bypass, reverb phase and source clocks; deterministic legacy clock fallback | 112 replay/clock checks; fixes boot progress leaking into restored audio and the reproduced THPS4 state mismatch |
+| codegen/0007 + play/0048 | General Wasm vector multiply truncation and simpler sign/zero extraction | 320,000 multiply and 40,000 flag checks; all 21 upstream VU tests now pass without changing expected results |
 
 
 ## Build

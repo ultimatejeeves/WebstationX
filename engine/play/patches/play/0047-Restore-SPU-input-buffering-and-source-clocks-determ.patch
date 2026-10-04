@@ -1,0 +1,148 @@
+From cb5a8df29a37d46b7029f6c0fda31bb2e1b52e92 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 13:36:52 -0400
+Subject: [PATCH 47/48] Restore SPU input buffering and source clocks
+ deterministically
+
+---
+ Source/iop/Iop_SpuBase.cpp   | 43 +++++++++++++++++++++++++++++++++++-
+ Source/iop/Iop_SpuBase.h     |  4 +++-
+ Source/iop/Iop_SubSystem.cpp |  5 +++--
+ Source/iop/Iop_SubSystem.h   |  1 +
+ 4 files changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/Source/iop/Iop_SpuBase.cpp b/Source/iop/Iop_SpuBase.cpp
+index 231400b3..e72f8f61 100644
+--- a/Source/iop/Iop_SpuBase.cpp
++++ b/Source/iop/Iop_SpuBase.cpp
+@@ -231,7 +231,7 @@ void CSpuBase::Reset()
+ 	m_blockWritePtr = 0;
+ }
+ 
+-void CSpuBase::LoadState(Framework::CZipArchiveReader& archive)
++void CSpuBase::LoadState(Framework::CZipArchiveReader& archive, uint32 legacyBaseSamplingRate)
+ {
+ 	auto path = string_format(STATE_REGS_PATH_FORMAT, m_spuNumber);
+ 	auto stateCollectionFile = CRegisterStateCollectionFile(*archive.BeginReadFile(path.c_str()));
+@@ -254,6 +254,14 @@ void CSpuBase::LoadState(Framework::CZipArchiveReader& archive)
+ 		m_extInputVolL = state.GetRegister32(STATE_REGS_EXTINPVOLUMELEFT);
+ 		m_extInputVolR = state.GetRegister32(STATE_REGS_EXTINPVOLUMERIGHT);
+ 		RegisterStateUtils::ReadArray(state, m_reverb, STATE_REGS_REVERB_FORMAT);
++		m_reverbTicks = state.GetRegister32("ReverbTicks");
++		m_blockWritePtr = state.GetRegister32("BlockWritePtr");
++		// Old states omitted the clock. Use the machine's clock, never the
++		// progress of the boot that happened to precede this load.
++		auto baseRate = state.GetRegister32("BaseSamplingRate");
++		SetBaseSamplingRate(baseRate ? baseRate : legacyBaseSamplingRate);
++		m_blockReader.LoadState(state);
++
+ 	}
+ 
+ 	for(unsigned int i = 0; i < MAX_CHANNEL; i++)
+@@ -304,6 +312,12 @@ void CSpuBase::SaveState(Framework::CZipArchiveWriter& archive)
+ 		state.SetRegister32(STATE_REGS_EXTINPVOLUMELEFT, m_extInputVolL);
+ 		state.SetRegister32(STATE_REGS_EXTINPVOLUMERIGHT, m_extInputVolR);
+ 		RegisterStateUtils::WriteArray(state, m_reverb, STATE_REGS_REVERB_FORMAT);
++		state.SetRegister32("InputStateVersion", 1);
++		state.SetRegister32("BaseSamplingRate", m_baseSamplingRate);
++		state.SetRegister32("ReverbTicks", m_reverbTicks);
++		state.SetRegister32("BlockWritePtr", m_blockWritePtr);
++		m_blockReader.SaveState(state);
++
+ 		stateCollectionFile->InsertRegisterState(STATE_REGS, std::move(state));
+ 	}
+ 
+@@ -1541,6 +1555,33 @@ void CSpuBase::CBlockSampleReader::Reset()
+ 	m_dstSamplingRate = 0;
+ 	m_srcSampleIdx = SOUND_INPUT_DATA_SAMPLES * TIME_SCALE;
+ 	m_sampleStep = 0;
++	m_spdifBypass = false;
++	memset(m_blockBuffer, 0, sizeof(m_blockBuffer));
++}
++
++void CSpuBase::CBlockSampleReader::SaveState(CRegisterState& state) const
++{
++	state.SetRegister32("InputSampleIdx", m_srcSampleIdx);
++	state.SetRegister32("InputBaseRate", m_baseSamplingRate);
++	state.SetRegister32("InputBypass", m_spdifBypass);
++	RegisterStateUtils::WriteArray(state, m_blockBuffer, "InputBuffer%d");
++}
++
++void CSpuBase::CBlockSampleReader::LoadState(const CRegisterState& state)
++{
++	// Old snapshots did not contain the input FIFO. Never inherit the previous
++	// run's unread samples or partially queued DMA transfer when loading one.
++	m_srcSampleIdx = SOUND_INPUT_DATA_SAMPLES * TIME_SCALE;
++	m_spdifBypass = false;
++	memset(m_blockBuffer, 0, sizeof(m_blockBuffer));
++	if(state.GetRegister32("InputStateVersion") != 0)
++	{
++		m_srcSampleIdx = state.GetRegister32("InputSampleIdx");
++		m_baseSamplingRate = state.GetRegister32("InputBaseRate");
++		m_spdifBypass = state.GetRegister32("InputBypass") != 0;
++		RegisterStateUtils::ReadArray(state, m_blockBuffer, "InputBuffer%d");
++	}
++	UpdateSampleStep();
+ }
+ 
+ void CSpuBase::CBlockSampleReader::SetBaseSamplingRate(uint32 baseSamplingRate)
+diff --git a/Source/iop/Iop_SpuBase.h b/Source/iop/Iop_SpuBase.h
+index 1fab09e4..681718bd 100644
+--- a/Source/iop/Iop_SpuBase.h
++++ b/Source/iop/Iop_SpuBase.h
+@@ -211,7 +211,7 @@ namespace Iop
+ 
+ 		void Reset();
+ 
+-		void LoadState(Framework::CZipArchiveReader&);
++		void LoadState(Framework::CZipArchiveReader&, uint32 legacyBaseSamplingRate = 44100);
+ 		void SaveState(Framework::CZipArchiveWriter&);
+ 
+ 		bool IsEnabled() const;
+@@ -363,6 +363,8 @@ namespace Iop
+ 		{
+ 		public:
+ 			void Reset();
++			void SaveState(CRegisterState&) const;
++			void LoadState(const CRegisterState&);
+ 			void SetBaseSamplingRate(uint32);
+ 			void SetDestinationSamplingRate(uint32);
+ 			bool GetSpdifBypass();
+diff --git a/Source/iop/Iop_SubSystem.cpp b/Source/iop/Iop_SubSystem.cpp
+index dd584b33..2bf46e68 100644
+--- a/Source/iop/Iop_SubSystem.cpp
++++ b/Source/iop/Iop_SubSystem.cpp
+@@ -40,6 +40,7 @@ CSubSystem::CSubSystem(bool ps2Mode)
+ #endif
+     , m_speed(m_intc)
+     , m_ilink(m_intc)
++    , m_ps2Mode(ps2Mode)
+ {
+ 	if(ps2Mode)
+ 	{
+@@ -164,8 +165,8 @@ void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
+ 	m_counters.LoadState(archive);
+ 	m_spuSampleCache.Clear();
+ 	m_spuIrqWatcher.LoadState(archive);
+-	m_spuCore0.LoadState(archive);
+-	m_spuCore1.LoadState(archive);
++	m_spuCore0.LoadState(archive, m_ps2Mode ? 48000 : 44100);
++	m_spuCore1.LoadState(archive, m_ps2Mode ? 48000 : 44100);
+ 	m_ilink.LoadState(archive);
+ #ifdef _IOP_EMULATE_MODULES
+ 	m_sio2.LoadState(archive);
+diff --git a/Source/iop/Iop_SubSystem.h b/Source/iop/Iop_SubSystem.h
+index 493dab0b..2abb2a8a 100644
+--- a/Source/iop/Iop_SubSystem.h
++++ b/Source/iop/Iop_SubSystem.h
+@@ -76,6 +76,7 @@ namespace Iop
+ 		void CheckPendingInterrupts();
+ 
+ 		int m_dmaUpdateTicks = 0;
++		const bool m_ps2Mode;
+ 		int m_spuIrqUpdateTicks = 0;
+ 	};
+ }
+-- 
+2.51.0.windows.1
+

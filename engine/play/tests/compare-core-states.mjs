@@ -22,6 +22,11 @@ const seconds = Number(arg('secs', '20'));
 assert(Number.isFinite(seconds) && seconds >= 10, '--secs must be at least 10');
 const output = path.resolve(root, arg('out', 'work/core-state-comparison'));
 const saveStates = process.argv.includes('--save-states');
+const bootwait = Object.fromEntries(['reference', 'candidate'].map(label => {
+  const value = Number(arg(`${label}-bootwait`, '1500'));
+  assert(Number.isFinite(value) && value >= 0, `Invalid --${label}-bootwait`);
+  return [label, value];
+}));
 const fixtures = {
   thps: ['thps4/game.chd', 'thps4-foundry.st'],
   mirra: ['dave-mirra-freestyle-bmx-2/game.chd', 'mirra-fixed-gameplay.st'],
@@ -36,6 +41,7 @@ fs.mkdirSync(output, { recursive: true });
 async function run(name, mode, label, core) {
   const [disc, state] = fixtures[name];
   const query = new URLSearchParams({ state, vu1thread: mode, catchup: '0', hash: '120' });
+  query.set('bootwait', String(bootwait[label]));
   if (core) query.set('core', core);
   const out = path.join(output, `${name}-${mode}-${label}`);
   const logPath = `${out}.log`;
@@ -84,6 +90,6 @@ for (const name of cases) for (const mode of modes) {
     results.push({ name, mode, passed: false, error: String(error) });
     console.error(String(error));
   }
-  fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify({ candidate, reference: reference || 'installed', results }, null, 2));
+  fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify({ candidate, reference: reference || 'installed', bootwait, results }, null, 2));
 }
 process.exitCode = failed ? 1 : 0;
