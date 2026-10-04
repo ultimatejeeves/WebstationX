@@ -4,6 +4,7 @@
  */
 import { api } from '../core/api';
 import { app, type Screen } from '../core/app';
+import { recordPerf } from '../core/compat';
 import { clear, fmtWhen, h, icon } from '../core/dom';
 import { deviceLabel, input } from '../core/input';
 import { sfx } from '../core/sfx';
@@ -13,17 +14,21 @@ import { fetchCached } from '../emu/disc-cache';
 import { keymapHints } from '../emu/keymap';
 import { setStreamingKeepAlive } from '../emu/keepalive';
 import { EmuSession, type SessionPlayers } from '../emu/player';
+import { Ps2Session } from '../emu/ps2-session';
 import { online } from '../net/online';
 import { isNetDevice } from '../net/protocol';
 import { openKeybindDialog } from '../ui/keybind-dialog';
-import { button, confirmDialog, Dialog } from '../ui/components';
+import { button, confirmDialog, Dialog, touchMenuButton } from '../ui/components';
 import { openSettings } from './settings';
 
 const MEMCARD_FLUSH_MS = 30_000;
 const MAX_SAVES = 8;
+/** Play time is counted in steps of this many seconds while the game is actually running. */
+const PLAY_CLOCK_SECS = 15;
 
 export class PlayScreen implements Screen {
   name = 'play';
+  readonly ambient = 'off' as const;
   el: HTMLElement;
   private game: GameMeta;
   private players: SessionPlayers;
@@ -31,7 +36,7 @@ export class PlayScreen implements Screen {
   private onQuit: () => void;
   private onChangePlayers: () => void;
   private onRelaunch: () => void;
-  private session: EmuSession;
+  private session: EmuSession | Ps2Session;
   private canvasWrap: HTMLElement;
   private canvas: HTMLCanvasElement;
   private loader: HTMLElement;
@@ -39,6 +44,7 @@ export class PlayScreen implements Screen {
   private loaderText: HTMLElement;
   private menu: Dialog | null = null;
   private flushTimer = 0;
+  private playClock = 0;
   private lastMemcardHash = '';
   private quitting = false;
   private ready = false;
@@ -46,6 +52,10 @@ export class PlayScreen implements Screen {
   private unsubs: (() => void)[] = [];
   private streaming = false;
   private audioRetry = 0;
+  /** Set once a quit / player change / relaunch starts; the menu no longer resumes the game. */
+  private leaving = false;
+  /** Keys currently held on the game canvas, released by hand if focus leaves mid-press. */
+  private keysDown = new Map<string, string>();
 
   constructor(
     game: GameMeta,
@@ -61,7 +71,8 @@ export class PlayScreen implements Screen {
     this.onQuit = onQuit;
     this.onChangePlayers = onChangePlayers;
     this.onRelaunch = onRelaunch;
-    this.session = new EmuSession(game, (l) => this.pushLog(l));
+    this.session = game.system === 'ps2' ? new Ps2Session(game, (l) => this.pushLog(l)) : new EmuSession(game, (l) => this.pushLog(l));
+    if (this.session instanceof Ps2Session) this.session.onProblem = (message) => app.toast(message, 'warn', 8000);
     this.canvas = h('canvas.game-canvas', { tabindex: 0 }) as HTMLCanvasElement;
     this.canvasWrap = h('div.canvas-wrap', this.canvas, h('div.crt-overlay'));
     this.loaderBar = h('div.loader-bar', h('div.loader-fill'));
@@ -81,7 +92,7 @@ export class PlayScreen implements Screen {
         this.loaderText,
       ),
     );
-    this.el = h('div.play', h('div.bg-play'), this.canvasWrap, this.loader);
+    this.el = h('div.play', h('div.bg-play'), this.canvasWrap, this.loader, touchMenuButton());
   }
 
   async mount() {
@@ -90,6 +101,11 @@ export class PlayScreen implements Screen {
     window.addEventListener('resize', this.fitCanvas);
     document.addEventListener('visibilitychange', this.onVisibility);
     window.addEventListener('beforeunload', this.onBeforeUnload);
+    window.addEventListener('blur', this.onWindowBlur);
+    window.addEventListener('focus', this.onWindowFocus);
+    this.canvas.addEventListener('keydown', this.onCanvasKey);
+    this.canvas.addEventListener('keyup', this.onCanvasKey);
+    this.canvas.addEventListener('blur', this.releaseKeys);
     this.fitCanvas();
     try {
       await this.load();
@@ -102,11 +118,16 @@ export class PlayScreen implements Screen {
   unmount() {
     this.quitting = true;
     clearInterval(this.flushTimer);
+    clearInterval(this.playClock);
     clearInterval(this.audioRetry);
+    // How the game ran here feeds the library's device check next time.
+    if (this.session instanceof Ps2Session && this.session.perf) recordPerf(this.game.id, this.session.perf);
     this.stopStreaming();
     window.removeEventListener('resize', this.fitCanvas);
     document.removeEventListener('visibilitychange', this.onVisibility);
     window.removeEventListener('beforeunload', this.onBeforeUnload);
+    window.removeEventListener('blur', this.onWindowBlur);
+    window.removeEventListener('focus', this.onWindowFocus);
     for (const u of this.unsubs) u();
     input.suspended = false;
     this.session.exit();
@@ -122,13 +143,20 @@ export class PlayScreen implements Screen {
   private async load() {
     const pid = store.profile?.id;
     const bios = store.catalog.bios;
+    const ps2 = this.game.system === 'ps2';
 
-    this.progress('Reading disc', 0);
-    const disc = await fetchCached(this.game.discUrl, (l, t) => this.progress(l < t ? `Downloading disc · ${Math.round((l / t) * 100)}%` : 'Disc ready', (l / t) * 0.8));
+    let disc: Blob | null = null;
     let biosBlob: Blob | null = null;
-    if (bios) {
-      this.progress('Loading system', 0.82);
-      biosBlob = await fetchCached(bios);
+    if (ps2) {
+      // PS2 discs are gigabytes: the session streams them from the server as the game reads.
+      this.progress('Spinning up the disc', 0.3);
+    } else {
+      this.progress('Reading disc', 0);
+      disc = await fetchCached(this.game.discUrl, (l, t) => this.progress(l < t ? `Downloading disc · ${Math.round((l / t) * 100)}%` : 'Disc ready', (l / t) * 0.8));
+      if (bios) {
+        this.progress('Loading system', 0.82);
+        biosBlob = await fetchCached(bios);
+      }
     }
     let memcard: Blob | null = null;
     let state: Blob | null = null;
@@ -165,8 +193,12 @@ export class PlayScreen implements Screen {
     this.fitCanvas();
     this.canvas.focus();
     this.flushTimer = window.setInterval(() => void this.flushMemcard(), MEMCARD_FLUSH_MS);
+    store.addPlayTime(this.game.id, 0);
+    this.playClock = window.setInterval(() => {
+      if (!this.menu && !this.leaving && !document.hidden) store.addPlayTime(this.game.id, PLAY_CLOCK_SECS);
+    }, PLAY_CLOCK_SECS * 1000);
     if (state) app.toast('Game restored', 'ok');
-    app.toast('Esc or Select+Start opens the menu', 'info', 3500);
+    app.toast(matchMedia('(pointer: coarse)').matches ? 'Select+Start or the corner button opens the menu' : 'Esc or Select+Start opens the menu', 'info', 3500);
   }
 
   /* ---------- Online (host) ---------- */
@@ -285,8 +317,8 @@ export class PlayScreen implements Screen {
   /* ---------- Pause menu ---------- */
 
   private openMenu() {
-    if (!this.ready || this.menu) return;
-    this.session.pause();
+    if (!this.ready || this.menu || this.leaving) return;
+    this.session.hold('menu');
     this.host?.setPhase('paused');
     input.suspended = false;
     const onlineLine = this.host
@@ -313,7 +345,7 @@ export class PlayScreen implements Screen {
       ),
       onlineLine,
     );
-    const dlg = new Dialog({
+    const dlg: Dialog = new Dialog({
       title: this.game.title,
       body,
       actions: [
@@ -326,7 +358,14 @@ export class PlayScreen implements Screen {
         { label: 'Change players', icon: 'users', onClick: () => void this.changePlayers() },
         { label: 'Quit to library', icon: 'home', variant: 'danger', onClick: () => void this.quit() },
       ],
-      onCancel: () => this.closeMenu(),
+      onCancel: () => dlg.close(),
+      // The menu key (Esc is Back here) toggles the menu shut again.
+      onNav: (e): boolean => {
+        if (e.action !== 'menu') return false;
+        dlg.close();
+        return true;
+      },
+      onClose: () => this.onMenuClosed(dlg),
     });
     dlg.el.classList.add('pause-menu');
     this.menu = dlg;
@@ -334,12 +373,17 @@ export class PlayScreen implements Screen {
   }
 
   private closeMenu() {
-    if (!this.menu) return;
-    this.menu.close();
+    this.menu?.close();
+  }
+
+  /** The game resumes whenever the pause menu goes away, whatever closed it. */
+  private onMenuClosed(dlg: Dialog) {
+    if (this.menu !== dlg) return;
     this.menu = null;
-    app.closeAllModals();
+    app.closeAllModals(); // sub-dialogs (settings, controls, load) go with it
+    if (this.leaving || this.quitting) return;
     input.suspended = true;
-    this.session.resume();
+    this.session.release('menu');
     this.host?.setPhase('playing');
     sfx.close();
   }
@@ -487,6 +531,7 @@ export class PlayScreen implements Screen {
 
   /** Suspend and start the same session again so new bindings take effect. */
   private async relaunch() {
+    if (!this.beginLeaving()) return;
     await this.suspend();
     this.onRelaunch();
   }
@@ -494,19 +539,27 @@ export class PlayScreen implements Screen {
   private async restart() {
     if (!(await confirmDialog('Restart the game?', 'Unsaved progress since your last save will be lost.', 'Restart'))) return;
     this.session.restart();
-    this.session.pause();
     app.toast('Game restarted', 'info');
     this.closeMenu();
   }
 
   private async changePlayers() {
+    if (!this.beginLeaving()) return;
     await this.suspend();
     this.onChangePlayers();
   }
 
   private async quit() {
+    if (!this.beginLeaving()) return;
     await this.suspend();
     this.onQuit();
+  }
+
+  /** Guards against a second quit/change/relaunch while the first is still saving. */
+  private beginLeaving() {
+    if (this.leaving) return false;
+    this.leaving = true;
+    return true;
   }
 
   /** Save a "suspend" state plus the memory card, then leave. */
@@ -527,9 +580,31 @@ export class PlayScreen implements Screen {
     if (!this.ready) return;
     if (this.streaming) return; // remote players keep playing; the keep-alive drives frames
     if (document.hidden) {
-      this.session.pause();
+      this.releaseKeys();
+      this.session.hold('hidden');
       void this.flushMemcard();
-    } else if (!this.menu) this.session.resume();
+    } else this.session.release('hidden');
+  };
+
+  private onWindowBlur = () => this.releaseKeys();
+
+  private onWindowFocus = () => {
+    if (this.ready && !this.menu && !this.leaving && !app.hasModal) this.canvas.focus();
+  };
+
+  private onCanvasKey = (e: KeyboardEvent) => {
+    if (!e.isTrusted) return;
+    if (e.type === 'keydown') this.keysDown.set(e.code, e.key);
+    else this.keysDown.delete(e.code);
+  };
+
+  /**
+   * The core only hears keys on its canvas, so a key held while focus leaves (alt-tab, the
+   * menu opening, a click elsewhere) never gets its keyup and stays pressed in the game.
+   */
+  private releaseKeys = () => {
+    for (const [code, key] of this.keysDown) this.canvas.dispatchEvent(new KeyboardEvent('keyup', { code, key, bubbles: true }));
+    this.keysDown.clear();
   };
 
   private onBeforeUnload = () => {

@@ -16,7 +16,7 @@ import { codeToRetroKey, mouseButtonToRetro, wheelToRetro, type PsxButton } from
 import { realGetGamepads } from '../emu/virtual-pads';
 import type { ClientSession } from '../net/online';
 import type { LobbySnapshot, Phase } from '../net/protocol';
-import { button, confirmDialog, Dialog, hintBar } from '../ui/components';
+import { button, confirmDialog, Dialog, hintBar, touchMenuButton } from '../ui/components';
 
 const COLORS = ['p1', 'p2', 'p3', 'p4'];
 
@@ -53,6 +53,7 @@ const AXIS: Partial<Record<PsxButton, [number, number]>> = {
 
 export class RemoteScreen implements Screen {
   name = 'remote';
+  readonly ambient = 'off' as const;
   el: HTMLElement;
   private client: ClientSession;
   private onLeave: () => void;
@@ -94,7 +95,7 @@ export class RemoteScreen implements Screen {
       ]),
     );
     this.overlay = h('div.remote-overlay');
-    this.el = h('div.play.remote', h('div.bg-play'), this.videoWrap, this.room, this.overlay);
+    this.el = h('div.play.remote', h('div.bg-play'), this.videoWrap, this.room, this.overlay, touchMenuButton());
   }
 
   async mount() {

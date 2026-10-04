@@ -97,6 +97,9 @@ export function icon(name: string, cls = ''): HTMLElement {
     volume: '<path d="M4 9v6h3l5 4V5L7 9z" stroke-linejoin="round"/><path d="M16 9a4 4 0 0 1 0 6M18.5 6.5a7.5 7.5 0 0 1 0 11" stroke-linecap="round"/>',
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
     zap: '<path d="M13 2L4 14h7l-1 8 9-12h-7z" stroke-linejoin="round"/>',
+    warn: '<path d="M12 3.5l9.5 16.5h-19z" stroke-linejoin="round"/><path d="M12 10v4.5M12 17.2v.3" stroke-linecap="round"/>',
+    clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2" stroke-linecap="round" stroke-linejoin="round"/>',
+    sort: '<path d="M7 5v14M4 16l3 3 3-3M13 7h8M13 12h6M13 17h4" stroke-linecap="round" stroke-linejoin="round"/>',
   };
   const span = document.createElement('span');
   span.className = `icon ${cls}`.trim();

@@ -52,6 +52,8 @@ export type DialogOpts = {
   onCancel?: () => void;
   wide?: boolean;
   onNav?: (e: NavEvent, dlg: Dialog) => boolean | void;
+  /** Runs once whenever the dialog goes away, however it was closed. */
+  onClose?: () => void;
 };
 
 export class Dialog implements Modal {
@@ -95,6 +97,7 @@ export class Dialog implements Modal {
     if (this.closed) return;
     this.closed = true;
     app.removeModal(this);
+    this.opts.onClose?.();
   }
 
   open() {
@@ -286,6 +289,18 @@ export function hintBar(items: { glyph: string; label: string }[]) {
   return h(
     'footer.hintbar',
     items.map((i) => h('span.hint', h(`span.glyph.glyph-${i.glyph}`, icon(i.glyph)), i.label)),
+  );
+}
+
+/**
+ * A small corner button for touch screens, where there is no Esc key: opens the in-game menu the same
+ * way the keyboard and controller shortcuts do. Hidden by CSS unless the pointer is coarse.
+ */
+export function touchMenuButton() {
+  return h(
+    'button.touch-menu',
+    { type: 'button', 'aria-label': 'Menu', onClick: () => input.emit({ action: 'menu', device: 'kb', repeat: false }) },
+    icon('pause'),
   );
 }
 

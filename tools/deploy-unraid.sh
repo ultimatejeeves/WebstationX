@@ -25,7 +25,16 @@ echo "== Uploading to $HOST:$APPDATA"
 "${SSH[@]}" "mkdir -p $APPDATA/src $APPDATA/library $APPDATA/bios $APPDATA/data && rm -rf $APPDATA/src/*"
 "${SCP[@]}" work/webstationx-src.tgz "$HOST:$APPDATA/src/"
 "${SSH[@]}" "cd $APPDATA/src && tar -xzf webstationx-src.tgz && rm webstationx-src.tgz"
-"${SCP[@]}" -r library/. "$HOST:$APPDATA/library/"
+# Library: only send files that are new or changed size (PS2 discs are gigabytes).
+"${SSH[@]}" "cd $APPDATA/library && find . -type f -printf '%P %s\n'" | sort > work/deploy-remote-library.txt
+(cd library && find . -type f -printf '%P %s\n') | sort > work/deploy-local-library.txt
+comm -23 work/deploy-local-library.txt work/deploy-remote-library.txt | sed 's/ [0-9]*$//' > work/deploy-library-changed.txt
+if [ -s work/deploy-library-changed.txt ]; then
+  echo "   library: $(wc -l < work/deploy-library-changed.txt) file(s) to send"
+  tar -C library -cf - -T work/deploy-library-changed.txt | "${SSH[@]}" "tar -xf - -C $APPDATA/library"
+else
+  echo "   library: up to date"
+fi
 "${SCP[@]}" bios/*.BIN bios/*.bin "$HOST:$APPDATA/bios/" 2>/dev/null || true
 
 echo "== Building image on host"
@@ -34,6 +43,11 @@ echo "== Building image on host"
 echo "== Recreating container"
 "${SCP[@]}" tools/unraid-run.sh "$HOST:$APPDATA/run.sh"
 "${SSH[@]}" "chmod +x $APPDATA/run.sh && WSX_APPDATA=$APPDATA $APPDATA/run.sh"
+
+# Each rebuild orphans the previous image and its build stage; Unraid's docker.img
+# is a fixed 20 GB, so drop the dangling ones or they fill it.
+echo "== Pruning dangling images"
+"${SSH[@]}" "docker image prune -f >/dev/null; df -h /var/lib/docker | tail -1"
 
 echo "== Done. Health:"
 "${SSH[@]}" "sleep 3; docker ps --filter name=webstationx --format '{{.Names}} {{.Status}} {{.Ports}}'; wget -qO- http://127.0.0.1:8090/api/session; echo"

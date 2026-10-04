@@ -10,3 +10,4 @@ Games/
 bios/*.BIN
 bios/*.bin
 *.log
+/PS2/

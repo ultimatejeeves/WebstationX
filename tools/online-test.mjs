@@ -6,6 +6,10 @@
  * button presses show up on the host's virtual gamepad.
  *
  *   node tools/online-test.mjs [--url http://localhost:5174] [--code INVITE] [--shots work/shots]
+ *        [--game <id>] [--gpu]
+ *
+ * --game hosts that game instead of the front case; --gpu renders on the real GPU (needed for PS2
+ * games, which are far too slow on SwiftShader).
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -29,6 +33,8 @@ function firstInviteCode() {
   }
 }
 const INVITE = arg('code', firstInviteCode());
+const GAME = arg('game', null);
+const GPU = process.argv.includes('--gpu');
 
 const chrome = ['C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'].find((p) =>
   fs.existsSync(p),
@@ -38,8 +44,9 @@ const browser = await puppeteer.launch({
   headless: 'new',
   args: [
     '--use-gl=angle',
-    '--use-angle=swiftshader',
-    '--enable-unsafe-swiftshader',
+    ...(GPU ? ['--use-angle=d3d11', '--enable-gpu', '--ignore-gpu-blocklist'] : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader']),
+    '--disable-background-timer-throttling',
+    '--disable-renderer-backgrounding',
     '--autoplay-policy=no-user-gesture-required',
     '--window-size=1280,800',
     '--no-sandbox',
@@ -118,7 +125,18 @@ try {
   remote = await newPlayer('Remote');
 
   step('Host opens a multiplayer lobby');
-  await host.page.click('.game-card');
+  if (GAME) {
+    const sel = `.game-card[data-game="${GAME}"]`;
+    for (const key of ['ArrowRight', 'ArrowLeft']) {
+      for (let i = 0; i < 40; i++) {
+        if (await host.page.evaluate((s) => document.querySelector(s)?.classList.contains('selected'), sel)) break;
+        await host.page.keyboard.press(key);
+        await wait(120);
+      }
+    }
+    await wait(700);
+  }
+  await host.page.click('.game-card.selected');
   await wait(400);
   if (await host.page.$('.resume-pick')) {
     await host.clickText('Start from the disc');
@@ -162,6 +180,7 @@ try {
   console.log('   emulator running on host');
   console.log('   host pads as the emulator sees them:', await host.page.evaluate(() => navigator.getGamepads().map((g, i) => (g ? `${i}:${g.index}:${g.id.slice(0, 16)}` : `${i}:-`))));
   console.log('   cfg:', await host.page.evaluate(() => {
+    if (!window.__wsx.session['inst']) return '(not RetroArch)';
     const fs = window.__wsx.session['inst'].getEmscriptenFS();
     const txt = new TextDecoder().decode(fs.readFile('/home/web_user/retroarch/userdata/retroarch.cfg'));
     return txt.split(String.fromCharCode(10)).filter((l) => /^(input_player[12]_joypad_index|input_libretro_device_p[12]|input_player2_(b|down)_btn|input_player1_b_btn) =/.test(l)).join(' | ');
@@ -223,35 +242,39 @@ try {
     await wait(1200);
   };
 
-  step('Control: RetroArch menu toggle from the host keyboard (F8)');
-  await host.page.evaluate(() => document.querySelector('canvas')?.focus());
-  const g0 = await greenRatio();
-  await press(host.page, 'F8');
-  const g1 = await greenRatio();
-  await host.shot('04b-host-menu-kb');
-  await press(host.page, 'F8'); // close it again
-  const g2 = await greenRatio();
-  console.log(`   green pixels: before ${g0} -> menu ${g1} -> closed ${g2}`);
-  const kbWorks = g1 > g0 + 0.3 && g2 < g1 - 0.3;
-  if (!kbWorks) throw new Error(`keyboard hotkey control failed (${g0} -> ${g1} -> ${g2})`);
+  // The next two checks drive RetroArch's own menu, so they only apply to PS1 games.
+  const retroArch = await host.page.evaluate(() => !!window.__wsx.session['inst']);
+  if (retroArch) {
+    step('Control: RetroArch menu toggle from the host keyboard (F8)');
+    await host.page.evaluate(() => document.querySelector('canvas:not(.fx-scene)')?.focus());
+    const g0 = await greenRatio();
+    await press(host.page, 'F8');
+    const g1 = await greenRatio();
+    await host.shot('04b-host-menu-kb');
+    await press(host.page, 'F8'); // close it again
+    const g2 = await greenRatio();
+    console.log(`   green pixels: before ${g0} -> menu ${g1} -> closed ${g2}`);
+    const kbWorks = g1 > g0 + 0.3 && g2 < g1 - 0.3;
+    if (!kbWorks) throw new Error(`keyboard hotkey control failed (${g0} -> ${g1} -> ${g2})`);
 
-  step('RetroArch must react to the remote pad in port 2: Down moves the RGUI cursor');
-  const pixelDiff = async (x, y) => {
-    const [ra, rb] = await Promise.all([x, y].map((png) => sharp(png).resize(320, 200, { fit: 'fill' }).raw().toBuffer()));
-    let n = 0;
-    for (let i = 0; i < ra.length; i += 3) if (Math.abs(ra[i] - rb[i]) + Math.abs(ra[i + 1] - rb[i + 1]) + Math.abs(ra[i + 2] - rb[i + 2]) > 60) n++;
-    return n;
-  };
-  await press(host.page, 'F8'); // open the menu from the host keyboard
-  const before = await host.page.screenshot();
-  for (let i = 0; i < 3; i++) await press(remote.page, 'ArrowDown'); // remote keyboard -> virtual pad D-pad Down
-  const after = await host.page.screenshot({ path: path.join(SHOTS, 'online-04c-host-menu-remote-down.png') });
-  const moved = await pixelDiff(before, after);
-  await press(host.page, 'F8'); // close it again
-  console.log(`   menu cursor moved by the port-2 remote pad: ${moved} px differ`);
-  // RGUI may only honour extra ports in some builds, so this is advisory, not fatal.
-  if (moved < 50) console.log('   WARNING: RGUI cursor did not move from the port-2 pad (advisory check; verify in-game)');
-  else console.log('   RetroArch reads the remote pad on port 2');
+    step('RetroArch must react to the remote pad in port 2: Down moves the RGUI cursor');
+    const pixelDiff = async (x, y) => {
+      const [ra, rb] = await Promise.all([x, y].map((png) => sharp(png).resize(320, 200, { fit: 'fill' }).raw().toBuffer()));
+      let n = 0;
+      for (let i = 0; i < ra.length; i += 3) if (Math.abs(ra[i] - rb[i]) + Math.abs(ra[i + 1] - rb[i + 1]) + Math.abs(ra[i + 2] - rb[i + 2]) > 60) n++;
+      return n;
+    };
+    await press(host.page, 'F8'); // open the menu from the host keyboard
+    const before = await host.page.screenshot();
+    for (let i = 0; i < 3; i++) await press(remote.page, 'ArrowDown'); // remote keyboard -> virtual pad D-pad Down
+    const after = await host.page.screenshot({ path: path.join(SHOTS, 'online-04c-host-menu-remote-down.png') });
+    const moved = await pixelDiff(before, after);
+    await press(host.page, 'F8'); // close it again
+    console.log(`   menu cursor moved by the port-2 remote pad: ${moved} px differ`);
+    // RGUI may only honour extra ports in some builds, so this is advisory, not fatal.
+    if (moved < 50) console.log('   WARNING: RGUI cursor did not move from the port-2 pad (advisory check; verify in-game)');
+    else console.log('   RetroArch reads the remote pad on port 2');
+  }
 
   step('Play a little from the remote (Cross)');
   await remote.page.keyboard.down('KeyX');

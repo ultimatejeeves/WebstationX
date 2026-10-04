@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
- * Headless end-to-end smoke test: boots the UI, creates a profile, launches the first game,
+ * Headless end-to-end smoke test: boots the UI, creates a profile, launches a game (the first one,
+ * or --game <title>),
  * verifies the emulator actually draws frames, exercises save/load, and quits.
  *
- *   node tools/smoke-test.mjs [--url http://localhost:5173] [--keep] [--shots work/shots]
+ *   node tools/smoke-test.mjs [--url http://localhost:5173] [--game "Ape Escape"] [--keep] [--shots work/shots]
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -15,6 +16,7 @@ const arg = (n, d) => {
 };
 const URL = arg('url', 'http://localhost:5173');
 const SHOTS = arg('shots', 'work/shots');
+const GAME = arg('game', null);
 fs.mkdirSync(SHOTS, { recursive: true });
 
 function firstInviteCode() {
@@ -58,6 +60,16 @@ const shot = async (name) => {
   console.log(`   screenshot -> ${p}`);
 };
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const openGame = async () => {
+  // A click on a side case only brings it forward; clicking the front case plays it.
+  if (!GAME) return page.click('.game-card.selected');
+  const front = await page.evaluate((t) => !!document.querySelector('.game-card.selected')?.textContent.includes(t), GAME);
+  await clickText(GAME, '.game-card');
+  if (!front) {
+    await wait(900);
+    await clickText(GAME, '.game-card');
+  }
+};
 const clickText = async (text, sel = 'button') => {
   const ok = await page.evaluate(
     (text, sel) => {
@@ -114,20 +126,22 @@ try {
   await shot('02-library');
 
   step('Launch single player');
-  await page.click('.game-card');
+  await openGame();
   await wait(400);
   if (await page.$('.resume-pick')) {
     await clickText('Start from the disc');
     await wait(400);
   }
-  await clickText('Single Player');
+  // One-player games launch straight away; the rest ask Single Player / Multiplayer first.
+  const onePlayer = !(await page.evaluate(() => [...document.querySelectorAll('button')].some((b) => b.textContent.includes('Single Player'))));
+  if (!onePlayer) await clickText('Single Player');
   await page.waitForFunction(() => window.__wsx?.session?.status === 'running', { timeout: 120000 });
   console.log('   emulator running');
   await wait(6000);
 
   step('Verify frames are drawn');
   const stats = await page.evaluate(async () => {
-    const c = document.querySelector('canvas');
+    const c = document.querySelector('canvas:not(.fx-scene)');
     const gl = c.getContext('webgl') || c.getContext('webgl2');
     let draws = 0;
     let maxNon = 0;
@@ -204,19 +218,22 @@ try {
   await shot('07-library-after');
   console.log('   suspended save visible:', await page.evaluate(() => document.querySelector('.detail')?.textContent.includes('Suspended')));
 
-  step('Multiplayer lobby');
-  await page.click('.game-card');
-  await wait(400);
-  if (await page.$('.resume-pick')) {
-    await clickText('Continue');
+  // One-player games have no Multiplayer option, so there is no lobby to open.
+  if (!onePlayer) {
+    step('Multiplayer lobby');
+    await openGame();
     await wait(400);
+    if (await page.$('.resume-pick')) {
+      await clickText('Continue');
+      await wait(400);
+    }
+    await clickText('Multiplayer');
+    await page.waitForSelector('.lobby', { timeout: 10000 });
+    await wait(500);
+    await shot('08-lobby');
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('.library', { timeout: 10000 });
   }
-  await clickText('Multiplayer');
-  await page.waitForSelector('.lobby', { timeout: 10000 });
-  await wait(500);
-  await shot('08-lobby');
-  await page.keyboard.press('Escape');
-  await page.waitForSelector('.library', { timeout: 10000 });
 
   console.log('\nSMOKE TEST PASSED');
 } catch (e) {

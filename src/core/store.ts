@@ -5,6 +5,7 @@
  */
 import { api, type SessionState } from './api';
 import { sfx } from './sfx';
+import { music } from './music';
 import { normalizeKeymap } from '../emu/keymap';
 import { DEFAULT_PREFS, type Catalog, type GameMeta, type Prefs, type Profile } from './types';
 
@@ -12,6 +13,30 @@ const LS_PROFILE = 'wsx.profile';
 const LS_PREFS = 'wsx.prefs.';
 const LS_LAST = 'wsx.lastGame.';
 const LS_BOOTED = 'wsx.booted';
+const LS_STATS = 'wsx.stats.';
+const LS_FAVS = 'wsx.favs.';
+const LS_VIEW = 'wsx.libview.';
+
+/** When a game was last played on this browser and for how long in total. */
+export type PlayStats = { last: number; secs: number };
+
+/** How the library shelf is filtered and ordered (remembered per profile on this browser). */
+export type LibraryView = {
+  system: 'all' | 'ps1' | 'ps2';
+  /** Minimum player count: 0 = any. */
+  players: 0 | 2 | 3;
+  sort: 'title' | 'recent' | 'year' | 'added';
+  favOnly: boolean;
+};
+export const DEFAULT_VIEW: LibraryView = { system: 'all', players: 0, sort: 'title', favOnly: false };
+
+function readLocal<T>(key: string, fallback: T): T {
+  try {
+    return (JSON.parse(localStorage.getItem(key) ?? 'null') as T | null) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 type Listener = () => void;
 
@@ -70,6 +95,7 @@ class Store {
       this.prefs = { ...DEFAULT_PREFS };
     }
     sfx.setEnabled(this.prefs.uiSounds);
+    music.setVolume(this.prefs.musicVolume);
     this.notify();
   }
 
@@ -77,6 +103,7 @@ class Store {
     this.prefs = { ...this.prefs, ...patch };
     this.prefs.keymap = normalizeKeymap(this.prefs.keymap);
     sfx.setEnabled(this.prefs.uiSounds);
+    music.setVolume(this.prefs.musicVolume);
     if (this.profile) {
       localStorage.setItem(LS_PREFS + this.profile.id, JSON.stringify(this.prefs));
       api.updateProfile(this.profile.id, { prefs: patch }).catch(() => {});
@@ -91,6 +118,42 @@ class Store {
     if (!this.profile) return;
     if (id) localStorage.setItem(LS_LAST + this.profile.id, id);
     else localStorage.removeItem(LS_LAST + this.profile.id);
+  }
+
+  /* ---------- Per-profile library extras (this browser only) ---------- */
+
+  private get pid() {
+    return this.profile?.id ?? 'guest';
+  }
+
+  get playStats(): Record<string, PlayStats> {
+    return readLocal<Record<string, PlayStats>>(LS_STATS + this.pid, {});
+  }
+
+  /** Adds play time to a game and stamps it as played now. */
+  addPlayTime(gameId: string, secs: number) {
+    const all = this.playStats;
+    all[gameId] = { last: Date.now(), secs: (all[gameId]?.secs ?? 0) + secs };
+    localStorage.setItem(LS_STATS + this.pid, JSON.stringify(all));
+  }
+
+  get favorites(): string[] {
+    return readLocal<string[]>(LS_FAVS + this.pid, []);
+  }
+
+  /** Returns whether the game is a favourite afterwards. */
+  toggleFavorite(gameId: string): boolean {
+    const favs = this.favorites;
+    const on = !favs.includes(gameId);
+    localStorage.setItem(LS_FAVS + this.pid, JSON.stringify(on ? [...favs, gameId] : favs.filter((f) => f !== gameId)));
+    return on;
+  }
+
+  get libraryView(): LibraryView {
+    return { ...DEFAULT_VIEW, ...readLocal<Partial<LibraryView>>(LS_VIEW + this.pid, {}) };
+  }
+  set libraryView(v: LibraryView) {
+    localStorage.setItem(LS_VIEW + this.pid, JSON.stringify(v));
   }
 
   /** The boot animation plays once per browser session. */

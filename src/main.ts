@@ -1,6 +1,7 @@
 import './styles.css';
 import { api, UNAUTHORIZED_EVENT } from './core/api';
 import { app } from './core/app';
+import { initHardware } from './core/hardware';
 import { store } from './core/store';
 import type { DeviceId, GameMeta } from './core/types';
 import type { SessionPlayers } from './emu/player';
@@ -19,6 +20,9 @@ import { ProfilesScreen } from './screens/profiles';
 // Must run before the emulator core loads: remote controllers and stream audio hook in here.
 installVirtualPads();
 installAudioTap();
+
+// Measure this device once (cached per browser) so the first game launch has its graphics preset.
+void initHardware();
 
 const root = document.getElementById('app')!;
 app.init(root);

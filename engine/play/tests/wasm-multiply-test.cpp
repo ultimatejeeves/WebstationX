@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cstddef>
+#include <chrono>
 #include <vector>
 #include "Jitter.h"
 #include "Jitter_CodeGen_Wasm.h"
@@ -70,6 +71,10 @@ static unsigned TestSignZero()
                 ++failures;
             }
         }
+        auto start = std::chrono::steady_clock::now();
+        for(unsigned i = 0; i < 5000000; ++i) function(&context);
+        double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / 5000000;
+        printf("Sign/zero locals=%u: %zu module bytes, %.1f ns/call\n", locals, size_t(code.GetSize()), ns);
     }
     printf("Wasm sign/zero: %u checks, %u failures\n", checks, failures);
     return failures;

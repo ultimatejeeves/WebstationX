@@ -125,7 +125,7 @@ try {
   }, cfg, USE_VPAD);
   console.log('virtual pad:', alloc, '\noverride:', cfg);
 
-  await page.click('.game-card');
+  await page.click('.game-card.selected');
   await wait(400);
   if (await page.$('.resume-pick')) {
     await clickText('Start from the disc');
@@ -136,7 +136,7 @@ try {
   console.log('emulator running');
   await wait(5000);
   console.log('gamepad event log:', await page.evaluate(() => window.__evlog));
-  await page.evaluate(() => document.querySelector('canvas')?.focus());
+  await page.evaluate(() => document.querySelector('canvas:not(.fx-scene)')?.focus());
 
   const g0 = await greenRatio('0-before');
   await page.keyboard.down('F8');

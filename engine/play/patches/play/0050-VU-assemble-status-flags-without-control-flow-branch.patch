@@ -1,0 +1,117 @@
+From 3ee0efd5cf0c632c61794dfefda605039d7a6a5a Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 14:37:50 -0400
+Subject: [PATCH 50/50] VU: assemble status flags without control-flow branches
+
+---
+ Source/ee/VUShared.cpp | 92 ++++++++++--------------------------------
+ 1 file changed, 22 insertions(+), 70 deletions(-)
+
+diff --git a/Source/ee/VUShared.cpp b/Source/ee/VUShared.cpp
+index c26f3f5d..f3ff822d 100644
+--- a/Source/ee/VUShared.cpp
++++ b/Source/ee/VUShared.cpp
+@@ -307,78 +307,30 @@ void VUShared::GetStatus(CMipsJitter* codeGen, size_t dstOffset, uint32 relative
+ 	CheckFlagPipeline(g_pipeInfoMac, codeGen, relativePipeTime);
+ 	CheckFlagPipeline(g_pipeInfoSticky, codeGen, relativePipeTime);
+ 
+-	//Reset result
+-	codeGen->PushCst(0);
++	// Each comparison produces 0 or 1. Assemble once instead of opening five
++	// control-flow blocks (which also interrupt register allocation).
++	auto pushFlag = [&](size_t source, uint32 mask, uint32 shift) {
++		codeGen->PushRel(source);
++		if(mask != ~0U)
++		{
++			codeGen->PushCst(mask);
++			codeGen->And();
++		}
++		codeGen->PushCst(0);
++		codeGen->Cmp(Jitter::CONDITION_NE);
++		if(shift) codeGen->Shl(shift);
++	};
++	pushFlag(offsetof(CMIPS, m_State.nCOP2MF), 0x0F, 0);
++	pushFlag(offsetof(CMIPS, m_State.nCOP2MF), 0xF0, 1);
++	codeGen->Or();
++	pushFlag(offsetof(CMIPS, m_State.nCOP2SF), 0x0F, 6);
++	codeGen->Or();
++	pushFlag(offsetof(CMIPS, m_State.nCOP2SF), 0xF0, 7);
++	codeGen->Or();
++	pushFlag(offsetof(CMIPS, m_State.nCOP2DF), ~0U, 5);
++	codeGen->Or();
+ 	codeGen->PullRel(dstOffset);
+ 
+-	//Check Z flag
+-	codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2MF));
+-	codeGen->PushCst(0x000F);
+-	codeGen->And();
+-	codeGen->PushCst(0);
+-	codeGen->BeginIf(Jitter::CONDITION_NE);
+-	{
+-		codeGen->PushRel(dstOffset);
+-		codeGen->PushCst(STATUS_Z);
+-		codeGen->Or();
+-		codeGen->PullRel(dstOffset);
+-	}
+-	codeGen->EndIf();
+-
+-	//Check S flag
+-	codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2MF));
+-	codeGen->PushCst(0x00F0);
+-	codeGen->And();
+-	codeGen->PushCst(0);
+-	codeGen->BeginIf(Jitter::CONDITION_NE);
+-	{
+-		codeGen->PushRel(dstOffset);
+-		codeGen->PushCst(STATUS_S);
+-		codeGen->Or();
+-		codeGen->PullRel(dstOffset);
+-	}
+-	codeGen->EndIf();
+-
+-	//Check ZS flag
+-	codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2SF));
+-	codeGen->PushCst(0x000F);
+-	codeGen->And();
+-	codeGen->PushCst(0);
+-	codeGen->BeginIf(Jitter::CONDITION_NE);
+-	{
+-		codeGen->PushRel(dstOffset);
+-		codeGen->PushCst(STATUS_ZS);
+-		codeGen->Or();
+-		codeGen->PullRel(dstOffset);
+-	}
+-	codeGen->EndIf();
+-
+-	//Check SS flag
+-	codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2SF));
+-	codeGen->PushCst(0x00F0);
+-	codeGen->And();
+-	codeGen->PushCst(0);
+-	codeGen->BeginIf(Jitter::CONDITION_NE);
+-	{
+-		codeGen->PushRel(dstOffset);
+-		codeGen->PushCst(STATUS_SS);
+-		codeGen->Or();
+-		codeGen->PullRel(dstOffset);
+-	}
+-	codeGen->EndIf();
+-
+-	//Check D flag
+-	codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2DF));
+-	codeGen->PushCst(0);
+-	codeGen->BeginIf(Jitter::CONDITION_NE);
+-	{
+-		codeGen->PushRel(dstOffset);
+-		codeGen->PushCst(STATUS_D);
+-		codeGen->Or();
+-		codeGen->PullRel(dstOffset);
+-	}
+-	codeGen->EndIf();
+-
+ 	//TODO: Check other flags
+ }
+ 
+-- 
+2.51.0.windows.1
+

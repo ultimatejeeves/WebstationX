@@ -130,7 +130,7 @@ try {
   await wait(300);
 
   console.log('== Launch and inspect retroarch.cfg');
-  await page.click('.game-card');
+  await page.click('.game-card.selected');
   await wait(400);
   if (await page.$('.resume-pick')) {
     await clickText('Start from the disc');

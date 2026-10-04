@@ -6,10 +6,12 @@ Emscripten and patched for speed and for embedding in WebStationX. The build lan
 
 **Core accuracy work:** [the accuracy roadmap and regression workflow](CORE-ACCURACY.md)
 tracks subsystem improvements, hardware-model limitations, EE memory fixes,
-sound-state restoration, and general Wasm vector multiplication. Run
+sound-state restoration, general Wasm vector multiplication, and accurate-add edge behavior. Run
 `tests/run-ee-memory-tests.sh`, `tests/run-vu-tests.sh`,
 `tests/run-spu-state-tests.sh`, and `tests/run-wasm-multiply-tests.sh` for component
 regressions, and `tests/compare-core-states.mjs` for fixed-frame game comparisons.
+`tests/run-vu-fp-edge-tests.sh` exercises accurate EE ADD/SUB and VU ADDI,
+and `tests/run-vu-status-tests.sh` compares complete state after flag reads.
 
 **Current validation and limitations:** see [the October 1 review](REVIEW-2026-10-01.md) (ATV Offroad Fury 2:
 correct terrain, full speed, ~40 game frames per second in a race on the desktop below; what is left and why) and
@@ -93,6 +95,8 @@ Pinned upstream: Play! `83700b2c` (0.77-12), CodeGen `a5009f7`.
 | play/0046 | Preserve VU flags across future microprogram uploads; reliable upstream test assertions | Upload regression now passes; Wasm runner exposes the pre-existing Tri-Ace one-ULP arithmetic failure (20/21 upstream tests pass) |
 | play/0047 | Restore SPU input FIFO, DMA cursor, bypass, reverb phase and source clocks; deterministic legacy clock fallback | 112 replay/clock checks; fixes boot progress leaking into restored audio and the reproduced THPS4 state mismatch |
 | codegen/0007 + play/0048 | General Wasm vector multiply truncation and simpler sign/zero extraction | 320,000 multiply and 40,000 flag checks; all 21 upstream VU tests now pass without changing expected results |
+| play/0049 | Honor accurate ADDI on Wasm, register the shared accurate-add helper for EE/VU calls, and handle signed zeros, denormals and extended exponents in that helper | 392,162 model-derived edge, rounding, destination and pipeline checks; existing accurate-block selection is retained |
+| play/0050 | Assemble STATUS with comparisons and shifts | 400,000 complete-state comparisons; smaller generated status modules, with flag production and timing preserved |
 
 
 ## Build

@@ -15,7 +15,8 @@ export class FocusRing {
     this.container = container;
     container.addEventListener('pointermove', (e) => {
       const t = (e.target as HTMLElement).closest<HTMLElement>('[data-focus]');
-      if (t && t !== this.current && this.container.contains(t) && !t.matches('[disabled],[aria-disabled="true"]')) this.set(t, true);
+      // data-nohover: elements that move under the pointer (the game carousel) only take focus on click.
+      if (t && t !== this.current && !t.hasAttribute('data-nohover') && this.container.contains(t) && !t.matches('[disabled],[aria-disabled="true"]')) this.set(t, true);
     });
   }
 
@@ -127,6 +128,7 @@ function isVisible(el: HTMLElement) {
 }
 
 function scrollIntoViewWithin(el: HTMLElement, parent: HTMLElement) {
+  if (parent.dataset.scroll === 'none') return; // lays itself out; never scroll it
   const pr = parent.getBoundingClientRect();
   const r = el.getBoundingClientRect();
   const pad = 24;

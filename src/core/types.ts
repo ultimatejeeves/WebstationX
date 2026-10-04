@@ -3,6 +3,8 @@ import { DEFAULT_KEYMAP, type Keymap } from '../emu/keymap';
 export type GameMeta = {
   id: string;
   title: string;
+  /** Console the disc belongs to (absent = 'ps1'). PS2 games run on the Play! core. */
+  system?: 'ps1' | 'ps2';
   players: number;
   year?: number;
   publisher?: string;
@@ -13,8 +15,26 @@ export type GameMeta = {
   disc: string;
   cover: string;
   size?: number;
+  /** When the game was ingested (ISO date). */
+  addedAt?: string;
+  /** How heavy the game is to emulate (PS2; absent = 'medium'). Feeds the device check. */
+  demand?: 'light' | 'medium' | 'heavy';
+  /** Known emulation state from our own testing, shown to every device. */
+  compat?: { status: 'ok' | 'issues' | 'broken'; note?: string };
   discUrl: string;
   coverUrl: string | null;
+  /** Scraped game art (URLs), present only for the pieces that exist. `accent` is a '#rrggbb' colour. */
+  art?: {
+    box?: string;
+    back?: string;
+    disc?: string;
+    logo?: string;
+    title?: string;
+    snap?: string;
+    fanart?: string;
+    video?: string;
+    accent?: string;
+  };
 };
 
 export type Catalog = { games: GameMeta[]; bios: string | null };
@@ -34,8 +54,6 @@ export type Prefs = {
   filter: 'crt' | 'sharp' | 'smooth';
   /** Force 4:3 (authentic) or stretch to fill. */
   aspect: '4:3' | 'fill';
-  /** Render internal resolution at 2x where the machine can afford it. */
-  enhanced: boolean;
   /** Let the core skip frames to keep audio smooth on slow machines. */
   autoFrameskip: boolean;
   /** Show the real console boot sequence before the game. */
@@ -44,6 +62,8 @@ export type Prefs = {
   volume: number;
   /** UI sound effects on/off. */
   uiSounds: boolean;
+  /** Ambient menu music volume 0..100 (0 = off). */
+  musicVolume: number;
   /** Remember the last game and offer to resume it on the library screen. */
   quickResume: boolean;
   /** Keyboard & mouse bindings for the keyboard player. */
@@ -53,21 +73,14 @@ export type Prefs = {
 export const DEFAULT_PREFS: Prefs = {
   filter: 'crt',
   aspect: '4:3',
-  enhanced: autoEnhanced(),
   autoFrameskip: false,
   consoleBoot: false,
   volume: 80,
   uiSounds: true,
+  musicVolume: 50,
   quickResume: true,
   keymap: { ...DEFAULT_KEYMAP },
 };
-
-/** Pick a sane default for the 2x-resolution enhancement based on the machine we run on. */
-function autoEnhanced(): boolean {
-  const cores = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency ?? 2 : 2;
-  const mobile = typeof navigator !== 'undefined' && /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
-  return !mobile && cores >= 6;
-}
 
 export type SaveSummary = {
   memcard: { updatedAt: string; size: number } | null;
@@ -94,6 +107,7 @@ export type NavAction =
   | 'confirm'
   | 'back'
   | 'menu'
+  | 'alt'
   | 'start'
   | 'prev'
   | 'next'

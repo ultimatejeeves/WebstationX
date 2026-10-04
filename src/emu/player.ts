@@ -7,6 +7,7 @@
  * multitap is switched on so the game sees a real 4-controller setup.
  */
 import { Nostalgist } from 'nostalgist';
+import { deviceGraphics, hardwareReady } from '../core/hardware';
 import type { DeviceId, GameMeta, Prefs } from '../core/types';
 import { isMouseBinding, PSX_BUTTONS } from './keymap';
 import { clearPortMap, setPortMap } from './virtual-pads';
@@ -15,7 +16,8 @@ export type SessionPlayers = (DeviceId | null)[]; // index = PSX player 0..3
 
 export type LaunchArgs = {
   game: GameMeta;
-  disc: Blob;
+  /** The whole disc image (PS1). PS2 sessions stream the disc themselves and get null. */
+  disc: Blob | null;
   bios: Blob | null;
   players: SessionPlayers;
   prefs: Prefs;
@@ -84,8 +86,22 @@ const STD_AXIS: Partial<Record<string, string>> = { l_x_minus: '-0', l_x_plus: '
 const RETRO_DEVICE_NONE = 0;
 const RETRO_DEVICE_JOYPAD = 1;
 const RETRO_DEVICE_ANALOG = 5;
-// PCSX-ReARMed's DualShock is subclass 0 of ANALOG: ((0 + 1) << 8) | 5
-const PSX_DUALSHOCK = ((0 + 1) << 8) | RETRO_DEVICE_ANALOG;
+// PCSX-ReARMed's ANALOG subclasses: 0 = Dual Analog, 1 = DualShock, 2 = neGcon. DualShock-only
+// games (Ape Escape) reject the Dual Analog, so use subclass 1: ((1 + 1) << 8) | 5
+const PSX_DUALSHOCK = ((1 + 1) << 8) | RETRO_DEVICE_ANALOG;
+
+// RetroArch ignores input_libretro_device_pN in retroarch.cfg: with no remap file loaded it resets
+// every port to the plain pad at launch. The device types therefore also go into the core's remap
+// file, which RetroArch auto-loads before it connects the ports.
+const REMAP_DIR = '/home/web_user/retroarch/userdata/config/remaps';
+const REMAP_FILE = `${REMAP_DIR}/PCSX-ReARMed/PCSX-ReARMed.rmp`;
+
+export function buildRemapFile(cfg: Record<string, string | number | boolean>): string {
+  const lines = Object.entries(cfg)
+    .filter(([k]) => k.startsWith('input_libretro_device_p'))
+    .map(([k, v]) => `${k} = "${v}"`);
+  return lines.join('\n') + '\n';
+}
 
 export function buildRetroarchConfig(args: Pick<LaunchArgs, 'players' | 'prefs' | 'game'>): Record<string, string | number | boolean> {
   const { players, prefs, game } = args;
@@ -118,6 +134,8 @@ export function buildRetroarchConfig(args: Pick<LaunchArgs, 'players' | 'prefs' 
     video_message_bgcolor_enable: false,
     // Prevent RetroArch from remapping ports on hotplug; we pin ports explicitly below.
     input_remap_binds_enable: true,
+    auto_remaps_enable: true,
+    input_remapping_directory: REMAP_DIR,
   };
   for (const k of HOTKEYS_OFF) cfg[k] = 'nul';
 
@@ -180,6 +198,7 @@ export function buildRetroarchConfig(args: Pick<LaunchArgs, 'players' | 'prefs' 
 
 export function buildCoreConfig(args: Pick<LaunchArgs, 'players' | 'prefs' | 'game'>): Record<string, string> {
   const { players, prefs, game } = args;
+  const { preset } = deviceGraphics();
   const count = players.filter(Boolean).length;
   const highest = players.reduce((m, d, i) => (d ? i + 1 : m), 0);
   const needsMultitap = Math.max(count, highest) > 2 && game.multitap !== 'none';
@@ -188,10 +207,10 @@ export function buildCoreConfig(args: Pick<LaunchArgs, 'players' | 'prefs' | 'ga
     pcsx_rearmed_show_bios_bootlogo: prefs.consoleBoot ? 'enabled' : 'disabled',
     pcsx_rearmed_multitap: needsMultitap ? (game.multitap === 'port2' ? 'port 2' : 'port 1') : 'disabled',
     pcsx_rearmed_memcard2: 'none',
-    pcsx_rearmed_neon_enhancement_enable: prefs.enhanced ? 'enabled' : 'disabled',
+    pcsx_rearmed_neon_enhancement_enable: preset.ps1Enhanced ? 'enabled' : 'disabled',
     pcsx_rearmed_neon_enhancement_no_main: 'disabled',
-    pcsx_rearmed_dithering: prefs.enhanced ? 'disabled' : 'enabled',
-    pcsx_rearmed_frameskip_type: prefs.autoFrameskip ? 'auto' : 'disabled',
+    pcsx_rearmed_dithering: preset.ps1Enhanced ? 'disabled' : 'enabled',
+    pcsx_rearmed_frameskip_type: prefs.autoFrameskip || preset.ps1Frameskip ? 'auto' : 'disabled',
     pcsx_rearmed_duping_enable: 'enabled',
     pcsx_rearmed_display_fps_v2: 'disabled',
     pcsx_rearmed_vibration: 'enabled',
@@ -214,6 +233,7 @@ export class EmuSession {
   readonly game: GameMeta;
   private readonly onLog?: (l: string) => void;
   private aborted = false;
+  private readonly holds = new Set<string>();
 
   constructor(game: GameMeta, onLog?: (l: string) => void) {
     this.game = game;
@@ -221,11 +241,13 @@ export class EmuSession {
   }
 
   async launch(args: LaunchArgs) {
+    await hardwareReady();
     const retroarchConfig = buildRetroarchConfig(args);
     const retroarchCoreConfig = buildCoreConfig(args);
     this.onLog?.(`ports: ${args.players.map((p, i) => `${i + 1}=${p ?? '-'}`).join(' ')} multitap=${retroarchCoreConfig.pcsx_rearmed_multitap}`);
 
     setPortMap(args.players);
+    if (!args.disc) throw new Error('No disc');
     const rom = { fileName: `${args.game.id}.chd`, fileContent: args.disc };
     const bios = args.bios ? [{ fileName: 'scph1001.bin', fileContent: args.bios }] : [];
 
@@ -246,6 +268,11 @@ export class EmuSession {
       respondToGlobalEvents: false,
       retroarchConfig: retroarchConfig as never,
       retroarchCoreConfig,
+      beforeLaunch: (n) => {
+        const fs = n.getEmscriptenFS() as { mkdirTree(p: string): void; writeFile(p: string, d: string): void };
+        fs.mkdirTree(REMAP_FILE.slice(0, REMAP_FILE.lastIndexOf('/')));
+        fs.writeFile(REMAP_FILE, buildRemapFile(retroarchConfig));
+      },
       emscriptenModule: {
         print: (s: string) => this.onLog?.(s),
         printErr: (s: string) => this.onLog?.(s),
@@ -255,11 +282,13 @@ export class EmuSession {
       this.exit();
       return;
     }
+    if (this.holds.size) this.applyPause();
     args.canvas.focus();
   }
 
   get status() {
-    return this.inst?.getStatus() ?? 'initial';
+    const s = this.inst?.getStatus() ?? 'initial';
+    return s === 'running' && this.holds.size > 0 ? 'paused' : s;
   }
   /** Raw Emscripten module (FS, HEAP...). Used by the headless tests to read retroarch.cfg. */
   get module(): unknown {
@@ -269,15 +298,40 @@ export class EmuSession {
     return this.status === 'running';
   }
 
-  pause() {
-    this.inst?.pause();
+  /**
+   * Pausing is reference counted by reason ('menu', 'hidden', ...): the game runs only while
+   * nothing holds it. Nostalgist's pause()/resume() send a *toggle* to RetroArch and guess the
+   * resulting state, so a quick open/close of the menu or a focus change at the wrong moment
+   * could leave the core paused while the UI thought it was running (a "frozen" game). The core
+   * exports idempotent pause/unpause commands, so we always send the state we want.
+   */
+  hold(reason: string) {
+    this.holds.add(reason);
+    this.applyPause();
   }
-  resume() {
-    this.inst?.resume();
-    this.inst?.getCanvas().focus();
+  release(reason: string) {
+    if (!this.holds.delete(reason)) return;
+    this.applyPause();
+    if (this.holds.size === 0) this.inst?.getCanvas().focus();
+  }
+  isHeld(reason: string) {
+    return this.holds.has(reason);
+  }
+  private applyPause() {
+    if (!this.inst || this.inst.getStatus() === 'terminated') return;
+    const m = this.inst.getEmscriptenModule() as { _cmd_pause?: () => void; _cmd_unpause?: () => void };
+    const paused = this.holds.size > 0;
+    try {
+      if (m._cmd_pause && m._cmd_unpause) (paused ? m._cmd_pause : m._cmd_unpause)();
+      else if (paused) this.inst.pause();
+      else this.inst.resume();
+    } catch (e) {
+      this.onLog?.(`pause command failed: ${e}`);
+    }
   }
   restart() {
     this.inst?.restart();
+    this.applyPause(); // a reset must not un-pause a game whose menu is still open
   }
   async saveState() {
     if (!this.inst) throw new Error('not running');

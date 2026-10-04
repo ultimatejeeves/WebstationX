@@ -13,16 +13,19 @@
     "start:dev": "tsx server/index.ts",
     "invite": "node tools/invite.mjs",
     "ingest": "node tools/ingest-game.mjs",
-    "assets": "node tools/gen-assets.mjs"
+    "assets": "node tools/gen-assets.mjs",
+    "scrape": "node tools/scrape-art.mjs"
   },
   "dependencies": {
     "express": "^5.1.0",
     "nostalgist": "^0.22.0",
+    "three": "^0.186.1",
     "ws": "^8.22.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^24.6.0",
+    "@types/three": "^0.186.0",
     "@types/ws": "^8.18.1",
     "concurrently": "^9.2.1",
     "cross-env": "^10.0.0",

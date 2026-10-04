@@ -278,6 +278,26 @@ const ASSETS = [
       "lighting, portrait orientation, no text, no logos",
     negative: NEG_COMMON + ", realistic, photo, gore, blood, humans, title, box, packaging",
   },
+  {
+    id: "cover-ape-escape",
+    purpose: "Placeholder box art: monkey-catching adventure",
+    file: "cover-ape-escape.jpg",
+    format: "jpg",
+    quality: 82,
+    gen: [768, 1072],
+    size: [600, 840],
+    thumb: 200,
+    model: "phoenix",
+    alchemy: true,
+    presetStyle: "ILLUSTRATION",
+    contrast: 3.5,
+    prompt:
+      "Stylised video game box-art illustration, a spiky-haired cartoon boy leaping forward swinging a " +
+      "butterfly net, mischievous cartoon monkeys wearing flashing siren helmets scattering in every " +
+      "direction, lush prehistoric jungle with giant ferns and a volcano behind, bright saturated late-1990s " +
+      "cartoon style, dynamic comedic composition, thick outlines, portrait orientation, no text, no logos",
+    negative: NEG_COMMON + ", realistic, photo, dark, gore, title, box, packaging",
+  },
   ...[
     ["01", "a polished mirror chrome sphere reflecting soft blue studio light"],
     ["02", "a translucent glowing aqua cyan glass orb with a bright specular highlight"],

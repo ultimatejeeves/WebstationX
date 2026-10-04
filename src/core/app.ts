@@ -5,12 +5,17 @@
 import { clear, h } from './dom';
 import { FocusRing } from './focus';
 import { input } from './input';
+import { scene, type SceneMode } from '../fx/scene';
+import { music } from './music';
 import { sfx } from './sfx';
 import type { NavEvent } from './types';
 
 export interface Screen {
   readonly el: HTMLElement;
   readonly name: string;
+  /** Backdrop while this screen is up: the animated tower field ('menu', default), its rise-up
+   *  intro ('boot'), or nothing ('off', for screens showing a game). Menu music follows it. */
+  readonly ambient?: SceneMode;
   mount(): void | Promise<void>;
   unmount(): void;
   /** Return true when the event was consumed. */
@@ -21,6 +26,8 @@ export interface Modal {
   readonly el: HTMLElement;
   readonly ring: FocusRing;
   onNav(e: NavEvent): boolean | void;
+  /** Back/Circle/Esc: lets the owner react (resume a game, resolve a prompt) before closing. */
+  cancel(): void;
   close(): void;
 }
 
@@ -39,9 +46,13 @@ class App {
     this.modalLayer = h('div.modal-layer');
     this.toastLayer = h('div.toast-layer');
     root.append(this.stage, this.modalLayer, this.toastLayer);
+    scene.mount(root);
     input.on((e) => this.dispatch(e));
     input.start();
-    const unlock = () => sfx.unlock();
+    const unlock = () => {
+      sfx.unlock();
+      music.unlock();
+    };
     window.addEventListener('pointerdown', unlock, { once: true });
     window.addEventListener('keydown', unlock, { once: true });
   }
@@ -55,7 +66,7 @@ class App {
       else if (e.action === 'confirm') top.ring.activate();
       else if (e.action === 'back') {
         sfx.back();
-        top.close();
+        top.cancel();
       }
       return;
     }
@@ -83,6 +94,10 @@ class App {
     if (transition === 'fade') next.el.classList.add('screen-in');
     this.stage.appendChild(next.el);
     document.body.dataset.screen = next.name;
+    const ambient = next.ambient ?? 'menu';
+    scene.setMode(ambient);
+    if (ambient === 'menu') music.play();
+    else music.stop(ambient === 'off' ? 0.8 : 1.2);
     await next.mount();
     requestAnimationFrame(() => next.el.classList.remove('screen-in'));
     this.transitioning = false;

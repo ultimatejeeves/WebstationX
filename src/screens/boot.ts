@@ -8,6 +8,7 @@ import type { NavEvent } from '../core/types';
 
 export class BootScreen implements Screen {
   name = 'boot';
+  readonly ambient = 'boot' as const;
   el: HTMLElement;
   private done: () => void;
   private finished = false;
@@ -34,7 +35,7 @@ export class BootScreen implements Screen {
       this.el.classList.add('boot-go');
       sfx.boot();
     });
-    this.timer = window.setTimeout(() => this.finish(), 4600);
+    this.timer = window.setTimeout(() => this.finish(), 5400);
   }
 
   unmount() {

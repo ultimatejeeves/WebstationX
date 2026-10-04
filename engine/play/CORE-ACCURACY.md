@@ -302,6 +302,94 @@ Raw evidence: `work/accuracy-clock-before/`, `work/accuracy-clock-after/`,
 `work/accuracy-thps-cycle.log`, and `work/accuracy-etm-cycle.log`. Diagnostic snapshots remain under
 `work/ps2-bench-states/`.
 
+### Fourth iteration: accurate-add edges and smaller flag code
+
+`play/0049` fixes two Wasm integration gaps: VU ADDI ignored the existing
+accurate-add hint, and the shared `FpAddTruncate` helper was absent from the
+hosted import registry/export list. EE ADD.S/SUB.S blocks selecting that helper
+could therefore fail to compile. Both call paths now work, including aliased
+destinations and VU writes targeting the VF0 scratch result.
+
+The helper now uses integer significands with one alignment guard bit. It
+flushes exponent-zero inputs/results to signed zero, preserves exponent-255
+finite encodings, and saturates overflow to the signed maximum PS2 encoding.
+Its previous IEEE NaN/infinity branches, unnormalized denormal inputs and
+underflow shifting are removed. Exact cancellation produces positive zero;
+two negative zeros retain their sign.
+
+The model follows the published
+[PCSX2 add/subtract alignment research](https://pcsx2.net/blog/2009/ps2-vu-vector-unit-documentation-part-1/)
+and [PS2Tek floating-point format](https://psi-rockin.github.io/ps2tek/).
+The test expectations are **model-derived, not newly captured hardware traces**.
+The independent oracle masks the smaller operand and uses double-precision
+arithmetic; it does not call or reproduce the helper's integer normalization.
+Fixed cases, all exponent fields, guard-bit boundary gaps, seeded random patterns,
+all VU destination masks, aliases, both Wasm allocator modes, flag latency and
+actual EE ADD.S/SUB.S instructions total **392,162 passing checks**. The initial
+261,474-check reproducer failed 4,283 checks before the changes.
+
+This retains existing accurate-block selection. It does **not** enable software
+addition globally, change the ordinary vector add/subtract emitters, or implement
+the remaining multiply/divide/square-root edge cases. U/O/I and their sticky
+flags remain incomplete. Full PS2 floating-point equivalence remains open.
+
+`play/0050` assembles STATUS with boolean comparisons and shifts, avoiding five conditional blocks.
+The STATUS test passes **400,000 complete CPU-state comparisons**, including every
+8-bit MAC/sticky combination with D clear/set, random queue indices and pending
+write times. Flag queues, production and latency are retained.
+Existing 40,000 sign/zero checks, 320,000 multiply checks, all 21 upstream VU tests,
+upload regressions, 525 EE checks and 112 SPU checks also pass.
+
+The generated STATUS test module shrinks from 1,371 to 1,250 bytes with locals,
+and from 1,608 to 1,548 without. Its single-run microbenchmark is approximately
+14 ns/call before and after; this is a code-size improvement, not evidence of a
+runtime speedup. A separate sign/zero extraction experiment reduced its test
+module from 187 to 184 bytes but showed no repeatable microbenchmark benefit
+(roughly 3.6–4.2 ns/call across both versions). It was rejected; the previous
+byte-mask emitter remains in place. Its patch is retained only as
+`work/rejected-sign-extraction.patch`.
+
+The initial candidate `accuracy-fp-flags-final`, binary `f8cce5eaa044`, matches all eight
+fixed-frame machine fingerprint fields for THPS4, Mirra and ATV2 in both VPU1-off
+and synchronous modes, with catch-up disabled. These comparisons cover six
+workloads against `accuracy-rounding-state`; they do not compare entire save-state
+archives or prove that either core matches hardware.
+
+Warmed ATV2 measurements used 65-second runs, VPU1 off, catch-up off and no
+limiter. In A/B/B/A order, the baseline measured 28.2 and 28.9 delivered
+pictures/sec over the final ten samples; the initial candidate measured 28.1
+and 27.4. After dropping the extraction experiment, `accuracy-fp-status`
+(`709620516e21`) measured 28.7, followed by a baseline repeat at 24.7.
+That variation prevents a reliable speedup claim. These are desktop measurements;
+no target-device or mobile performance result is established.
+
+The final `709620516e21` build also passes all six fixed-frame comparisons against
+the saved baseline fingerprints. Its component rerun passes all 392,162 arithmetic
+checks and 400,000 complete-state status comparisons; the retained sign/zero
+emitter passes the existing 320,000 multiply and 40,000 sign/zero checks.
+
+THPS4 and Enter the Matrix each passed a 35-second asynchronous VPU1 probe with
+a save/load cycle at 18 seconds. Both returned `saved loaded`, resumed rendering,
+and reported no browser/worker exception. Final-ten-sample presentation rates were
+58.7 and 60.0 pictures/sec. Post-load screenshots were inspected; these are short
+lifecycle checks, not long-play compatibility or hardware-accuracy claims.
+
+The tested `709620516e21` files are installed in `public/cores/play/` with the
+matching cache-busting version. The previous `a9435d52a35a` binary is preserved
+as `accuracy-rounding-state`. No deployment was performed.
+
+All 50 Play patches and seven CodeGen patches replay exactly from the pinned
+baselines to the edited sources, excluding Play's separately managed CodeGen
+gitlink. Raw results are in `work/vu-fp-edge-before.log`,
+`work/vu-fp-edge-final.log`, `work/vu-status-before.log`,
+`work/vu-status-after.log`, `work/wasm-arithmetic-round4.log`,
+`work/vu-round4.log`, `work/ee-round4.log`, `work/spu-round4.log`,
+`work/accuracy-round4/`, `work/perf-round4-{0,1,2,3}.log`,
+`work/perf-status-{0,1}.log`, `work/sign-bench-{old,new}.log`,
+`work/accuracy-status-final/`, `work/fp-status-edges.log`, `work/fp-status-flags.log`,
+`work/round4-thps-cycle.log`, `work/round4-etm-cycle.log`,
+and `work/patch-replay-round4/report.json`.
+
 ## Validation commands
 
 Activate Emscripten, set `PLAY_SRC` if needed, and use Git Bash on Windows:
@@ -312,6 +400,8 @@ engine/play/tests/run-ee-memory-tests.sh
 engine/play/tests/run-vu-tests.sh
 engine/play/tests/run-spu-state-tests.sh
 engine/play/tests/run-wasm-multiply-tests.sh
+engine/play/tests/run-vu-fp-edge-tests.sh
+engine/play/tests/run-vu-status-tests.sh
 engine/play/build-dev.sh accuracy-rounding-state
 ```
 
@@ -351,14 +441,15 @@ gameplay, audio and save/load tests alongside them.
 | Area | Evidence in the current source | Next implementation and acceptance test |
 |---|---|---|
 | EE MMU and exceptions | Data matching, COP0 TLB instructions and fault routing now have component coverage. HLE default mappings, instruction fetch and custom scratchpad mappings remain incomplete. | Obtain hardware traces; add fetch-fault and scratchpad fixtures before replacing HLE mappings or removing handler fallbacks. |
-| EE/VU floating point and flags | Accurate arithmetic is selected for some blocks. The unsafe whole-memory flag scan is removed; general Wasm vector multiplication now passes all 21 upstream tests. | Add hardware-derived add/subtract, denormal, extended-range and flag-pipeline fixtures, including VU0 mapped reads of VU1 state. Profile flag correctness on target devices without discarding observable state. |
+| EE/VU floating point and flags | Accurate EE ADD/SUB and VU ADDI now work on Wasm with model-derived range/denormal tests; ordinary vector add/subtract still uses host arithmetic. General Wasm multiply passes all 21 upstream tests, and smaller flag code preserves existing state. | Obtain hardware traces for add/subtract, signed underflow/overflow, multiplier low bits, divide/square-root and U/O/I flags. Extend uniform arithmetic only after those fixtures and performance checks, including VU0 mapped reads of VU1 state. |
 | Guest timing | `CPS2VM::TakeCatchUpTicks` advances guest time based on host lateness; the existing VU/GIF model does not account for all device work in guest cycles. | Establish cycle-based VU/VIF/GIF completion and interrupt tests. Replace host-dependent timing shortcuts only when the modeled devices can deliver the same ordering under different host loads. Always disable catch-up in accuracy comparisons. |
 | DMA/VIF/GIF ordering | The asynchronous VPU1 queue has already required completion, interrupt and snapshot fixes. | Add small command-stream tests for partial transfers, FIFO backpressure, stalled interrupt delivery, DMA STR completion, reset and save/load. Compare single-thread and synchronous modes exactly; validate asynchronous mode by observable device ordering and gameplay, not wall-time fingerprints. |
 | GS memory coherence and pixels | OpenGL readback supports only part of the color/depth/format space; the software target path remains disabled after incorrect output. | Establish transfer/readback fixtures for 16/24/32-bit color/depth, aliasing, overlap, alpha, masks and scaled targets. Compare integer pixel values against hardware results, then fix format/coherence rules. Screenshot appearance alone cannot validate GS data used as commands. |
 | IOP HLE and disc/SPU scheduling | Source-clock and input-buffer restoration now have replay tests. Past `CdSync` failure involved a waiter waking after another thread started a read. | Audit remaining SPU2 wrapper registers and IRQ state; add scheduler tests for multiple waiters, callbacks, cancellation, priorities and read completion. Keep boot delays and audio-rate variations in integration runs. |
 
-The next concrete arithmetic tranche is general add/subtract rounding and PS2
-range/denormal behavior, using hardware-derived cases before changing semantics. Device timing and GS coherence remain separate
+The next concrete arithmetic tranche is uniform vector add/subtract rounding and PS2
+range/denormal behavior beyond the selected accurate blocks, using hardware-derived
+cases before broadening semantics. Device timing and GS coherence remain separate
 workstreams requiring their own command-stream and hardware fixtures.
 
 ## Working rules

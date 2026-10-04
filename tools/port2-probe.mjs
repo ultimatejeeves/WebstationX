@@ -120,7 +120,7 @@ try {
   }, cfg, TWO, PRESS_SLOT);
   console.log('virtual pad:', alloc, '\noverride:', cfg);
 
-  await page.click('.game-card');
+  await page.click('.game-card.selected');
   await wait(400);
   if (await page.$('.resume-pick')) {
     await clickText('Start from the disc');
@@ -130,7 +130,7 @@ try {
   await page.waitForFunction(() => window.__wsx?.session?.status === 'running', { timeout: 120000 });
   console.log('emulator running');
   await wait(5000);
-  await page.evaluate(() => document.querySelector('canvas')?.focus());
+  await page.evaluate(() => document.querySelector('canvas:not(.fx-scene)')?.focus());
   const ports = await page.evaluate(() => {
     const fs = window.__wsx.session['inst'].getEmscriptenFS();
     const txt = new TextDecoder().decode(fs.readFile('/home/web_user/retroarch/userdata/retroarch.cfg'));

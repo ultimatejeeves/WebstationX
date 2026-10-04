@@ -29,6 +29,13 @@ fs.mkdirSync(path.join(dataDir, 'saves'), { recursive: true });
 
 const app = express();
 app.disable('x-powered-by');
+// Cross-origin isolation: the PS2 core runs on several threads sharing memory, which browsers only
+// allow (SharedArrayBuffer) on isolated pages. Everything the app loads is same-origin, so it's free.
+app.use((_req, res, next) => {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  next();
+});
 // Behind a reverse proxy (Unraid + Nginx Proxy Manager / SWAG / Cloudflare Tunnel) trust the
 // forwarded protocol so session cookies are marked Secure and rate limits see real IPs.
 if (process.env.WSX_TRUST_PROXY !== '0') app.set('trust proxy', true);
@@ -89,6 +96,7 @@ app.use('/bios', gate);
 type GameMeta = {
   id: string;
   title: string;
+  system?: 'ps1' | 'ps2';
   players: number;
   year?: number;
   publisher?: string;
@@ -99,7 +107,24 @@ type GameMeta = {
   disc: string;
   cover: string;
   size?: number;
+  sourceName?: string;
+  art?: Record<string, unknown> & { accent?: string; sources?: unknown; scrapedAt?: string };
 };
+
+const ART_KINDS = ['box', 'back', 'disc', 'logo', 'title', 'snap', 'fanart', 'video'] as const;
+
+/** Art paths that exist on disk, as URLs, plus the accent colour. Scrape provenance stays server-side. */
+function artUrls(g: GameMeta): Record<string, string> | undefined {
+  if (!g.art) return undefined;
+  const out: Record<string, string> = {};
+  for (const kind of ART_KINDS) {
+    const rel = g.art[kind];
+    if (typeof rel !== 'string' || rel.includes('..')) continue;
+    if (fs.existsSync(path.join(libraryDir, g.id, rel))) out[kind] = `/library/${g.id}/${rel}`;
+  }
+  if (typeof g.art.accent === 'string' && /^#[0-9a-f]{6}$/i.test(g.art.accent)) out.accent = g.art.accent;
+  return Object.keys(out).length ? out : undefined;
+}
 
 function readCatalog(): GameMeta[] {
   const p = path.join(libraryDir, 'catalog.json');
@@ -111,6 +136,7 @@ function readCatalog(): GameMeta[] {
 app.get('/api/catalog', (_req, res) => {
   const games = readCatalog().map((g) => ({
     ...g,
+    art: artUrls(g),
     discUrl: `/library/${g.id}/${g.disc}`,
     coverUrl: fs.existsSync(path.join(libraryDir, g.id, g.cover)) ? `/library/${g.id}/${g.cover}` : null,
   }));
@@ -295,14 +321,42 @@ app.delete('/api/saves/:pid/:gid/state/:slot', async (req, res) => {
   res.json({ ok: true });
 });
 
+/* ---------- Diagnostics ---------- */
+
+// Reports from the client when a game stalls or its core aborts (see Ps2Session's watchdog), one JSON
+// object per line. Kept small: the oldest half is dropped past 2 MB.
+const diagLog = path.join(dataDir, 'diag.log');
+app.post('/api/diag', async (req, res) => {
+  const line = JSON.stringify({ at: new Date().toISOString(), from: auth.sessionOf(req)?.name ?? null, ...req.body }).slice(0, 64_000);
+  try {
+    const st = await fsp.stat(diagLog).catch(() => null);
+    if (st && st.size > 2_000_000) {
+      const text = await fsp.readFile(diagLog, 'utf8');
+      await fsp.writeFile(diagLog, text.slice(text.indexOf('\n', text.length / 2) + 1));
+    }
+    await fsp.appendFile(diagLog, line + '\n');
+  } catch (e) {
+    console.error('diag write failed', e);
+  }
+  console.warn(`[diag] ${String(req.body?.kind ?? '?')} ${String(req.body?.game ?? '')}`);
+  res.json({ ok: true });
+});
+
 /* ---------- UI (production) ---------- */
 
 if (fs.existsSync(distDir)) {
+  // The PS2 core is requested from a folder named after its build (/cores/play/<version>/Play.js, see
+  // src/emu/ps2/runtime.ts), so those URLs can be cached forever; the files live in dist/cores/play.
+  app.get(/^\/cores\/play\/[0-9a-f]{6,40}\/(Play\.(?:js|wasm))$/, (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.sendFile(path.join(distDir, 'cores', 'play', req.params[0]));
+  });
   app.use(
     express.static(distDir, {
       setHeaders(res, filePath) {
         const p = filePath.replace(/\\/g, '/');
-        if (/\/(assets|cores|fonts)\//.test(p)) res.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
+        // Unversioned core files must revalidate: the core's workers used to fetch /cores/play/Play.js.
+        if (/\/(assets|fonts)\//.test(p)) res.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
         else res.setHeader('Cache-Control', 'no-cache');
       },
     }),

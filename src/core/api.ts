@@ -68,4 +68,7 @@ export const api = {
       });
   },
   deleteState: (pid: string, gid: string, slot: string) => fetch(`/api/saves/${pid}/${gid}/state/${slot}`, { method: 'DELETE' }),
+
+  /** Best-effort problem report (a stalled or crashed core); lands in the server's data/diag.log. */
+  diag: (report: Record<string, unknown>) => fetch('/api/diag', jsonBody('POST', report)).catch(() => undefined),
 };

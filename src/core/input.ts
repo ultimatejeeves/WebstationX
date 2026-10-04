@@ -45,6 +45,8 @@ class InputService {
   capture: ((e: KeyboardEvent | MouseEvent | WheelEvent) => void) | null = null;
   /** Devices seen at least once (gamepads only report through getGamepads). */
   readonly gamepads = new Map<number, string>();
+  /** Indices of `gamepads` as last synced, e.g. "0,2,". */
+  private padKey = '';
   onGamepadsChanged: (() => void) | null = null;
   /** Fires with the raw gamepad snapshot every frame (used by the lobby "controller test"). */
   onFrame: ((pads: (Gamepad | null)[]) => void) | null = null;
@@ -85,6 +87,7 @@ class InputService {
     const before = [...this.gamepads.keys()].join(',');
     this.gamepads.clear();
     for (const p of realGetGamepads()) if (p) this.gamepads.set(p.index, p.id);
+    this.padKey = [...this.gamepads.keys()].map((i) => `${i},`).join('');
     if ([...this.gamepads.keys()].join(',') !== before) this.onGamepadsChanged?.();
   };
 
@@ -124,6 +127,9 @@ class InputService {
         return 'next';
       case 'F1':
         return 'menu';
+      case 'f':
+      case 'F':
+        return 'alt';
     }
     return null;
   }
@@ -178,6 +184,11 @@ class InputService {
   private loop = () => {
     this.raf = requestAnimationFrame(this.loop);
     const pads = realGetGamepads();
+    // Don't rely on gamepadconnected alone: if the event is missed (pad woke up during page
+    // load, browser quirks), the pad still appears here, so resync the list whenever it differs.
+    let seen = '';
+    for (const p of pads) if (p) seen += `${p.index},`;
+    if (seen !== this.padKey) this.refreshPads();
     this.onFrame?.(pads);
     if (this.capture) return;
     if (this._suspended) {
@@ -213,6 +224,7 @@ class InputService {
         [GP.R1, 'next'],
         [GP.HOME, 'menu'],
         [GP.Y, 'menu'],
+        [GP.X, 'alt'],
       ];
       let anyPressed = false;
       for (const [btn, action] of map) {
