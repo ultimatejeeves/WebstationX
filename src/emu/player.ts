@@ -248,7 +248,13 @@ export class EmuSession {
 
     setPortMap(args.players);
     if (!args.disc) throw new Error('No disc');
-    const rom = { fileName: `${args.game.id}.chd`, fileContent: args.disc };
+    const discName = args.game.files?.[0]?.name ?? args.game.disc;
+    const rom = [{ fileName: discName, fileContent: args.disc }];
+    for (const file of args.game.files?.slice(1) ?? []) {
+      const response = await fetch(file.url);
+      if (!response.ok) throw new Error(`Could not read ${file.name}`);
+      rom.push({ fileName: file.name, fileContent: await response.blob() });
+    }
     const bios = args.bios ? [{ fileName: 'scph1001.bin', fileContent: args.bios }] : [];
 
     this.inst = await Nostalgist.launch({
@@ -258,7 +264,7 @@ export class EmuSession {
         js: '/cores/pcsx_rearmed_libretro.js',
         wasm: '/cores/pcsx_rearmed_libretro.wasm',
       },
-      rom,
+      rom: rom.length === 1 ? rom[0] : rom,
       bios,
       sram: args.memcard ?? undefined,
       state: args.state ?? undefined,

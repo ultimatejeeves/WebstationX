@@ -28,13 +28,19 @@ type ClientMsg =
   | { t: 'leave' };
 
 export function attachSignaling(server: Server, auth: Auth, path = '/ws') {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
   const rooms = new Map<string, Room>();
   let nextId = 1;
 
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://x');
     if (url.pathname !== path) return; // Vite's HMR socket in dev, or something else
+    const protocol = process.env.WSX_TRUST_PROXY === '1' && req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    if (req.headers.origin && req.headers.origin !== `${protocol}://${req.headers.host}`) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     const user = auth.enabled ? auth.sessionOf(req) : { name: 'Open access', code: '', owner: true };
     if (!user) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');

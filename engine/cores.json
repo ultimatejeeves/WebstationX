@@ -1,0 +1,19 @@
+{
+  "ps1": {
+    "distribution": "https://github.com/arianrhodsandlot/retroarch-emscripten-build/tree/d03a5b0d642ea638d4d8447960e9796a45fb074e",
+    "retroarch": "a609b70",
+    "pcsxRearmed": "228c14e"
+  },
+  "ps2": {
+    "play": "83700b2c31e593bc94e845b4b31b797be84dda59",
+    "codegen": "a5009f7dca062695b8e5aebbd71e67b4ddfa9251",
+    "patches": "engine/play/patches",
+    "emscripten": "6.0.10"
+  },
+  "sha256": {
+    "pcsx_rearmed_libretro.js": "89c3b0910e087732c08ccc741df1ed0df068a79791e163a6d21ae957f2499d32",
+    "pcsx_rearmed_libretro.wasm": "ecd3a8092f7342ca3cd55af715c79deab30f2618c5ca1b9d88bdd509b17807db",
+    "play/Play.js": "665a2f2382ea45b44ea5d3f32e39b69ea0ea11bca8b37ff91d5433d7c53f92bd",
+    "play/Play.wasm": "4df7275ae9c6817330b5e75184cb6911afc9e9d2a45c652337bf103c7ca81dc4"
+  }
+}

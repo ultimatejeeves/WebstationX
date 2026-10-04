@@ -14,7 +14,10 @@
     "invite": "node tools/invite.mjs",
     "ingest": "node tools/ingest-game.mjs",
     "assets": "node tools/gen-assets.mjs",
-    "scrape": "node tools/scrape-art.mjs"
+    "scrape": "node tools/scrape-art.mjs",
+    "desktop": "npm run build && electron .",
+    "build:desktop": "npm run build && electron-builder --win portable --x64 --publish never",
+    "test": "tsx --test tests/*.test.ts && tsx tools/ps2-unit-test.ts"
   },
   "dependencies": {
     "express": "^5.1.0",
@@ -29,11 +32,24 @@
     "@types/ws": "^8.18.1",
     "concurrently": "^9.2.1",
     "cross-env": "^10.0.0",
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3",
     "esbuild": "^0.28.2",
     "puppeteer-core": "^25.12.0",
     "sharp": "^0.35.5",
     "tsx": "^4.20.6",
     "typescript": "^5.9.2",
     "vite": "^7.1.7"
-  }
+  },
+  "description": "PlayStation games in your browser or a portable desktop app",
+  "author": "ultimatejeeves",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ultimatejeeves/WebstationX.git"
+  },
+  "main": "desktop/main.cjs",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "license": "MIT"
 }

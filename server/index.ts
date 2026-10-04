@@ -17,18 +17,27 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Auth } from './auth';
 import { attachSignaling } from './signaling';
+import { scanGames } from './games';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const dataDir = path.join(root, 'data');
-const libraryDir = path.join(root, 'library');
-const biosDir = path.join(root, 'bios');
-const distDir = path.join(root, 'dist');
+const dataDir = process.env.WSX_DATA_DIR ?? path.join(root, 'data');
+const libraryDir = process.env.WSX_LIBRARY_DIR ?? path.join(root, 'library');
+const gamesDir = process.env.WSX_GAMES_DIR ?? path.join(root, 'Games');
+const biosDir = process.env.WSX_BIOS_DIR ?? path.join(root, 'bios');
+const distDir = process.env.WSX_DIST_DIR ?? path.join(root, 'dist');
 const PORT = Number(process.env.WSX_PORT ?? 8090);
 
 fs.mkdirSync(path.join(dataDir, 'saves'), { recursive: true });
+for (const system of ['psx', 'ps2']) fs.mkdirSync(path.join(gamesDir, system), { recursive: true });
 
 const app = express();
 app.disable('x-powered-by');
+if (process.env.WSX_BIND === '127.0.0.1') {
+  app.use((req, res, next) => {
+    if (!/^(127\.0\.0\.1|localhost):\d+$/.test(req.headers.host ?? '')) return res.sendStatus(403);
+    next();
+  });
+}
 // Cross-origin isolation: the PS2 core runs on several threads sharing memory, which browsers only
 // allow (SharedArrayBuffer) on isolated pages. Everything the app loads is same-origin, so it's free.
 app.use((_req, res, next) => {
@@ -38,12 +47,21 @@ app.use((_req, res, next) => {
 });
 // Behind a reverse proxy (Unraid + Nginx Proxy Manager / SWAG / Cloudflare Tunnel) trust the
 // forwarded protocol so session cookies are marked Secure and rate limits see real IPs.
-if (process.env.WSX_TRUST_PROXY !== '0') app.set('trust proxy', true);
+if (process.env.WSX_TRUST_PROXY === '1') app.set('trust proxy', 1);
 
 /* ---------- Access gate ---------- */
 
 const auth = new Auth(dataDir);
 app.use(express.json({ limit: '1mb' }));
+// Cross-site pages must not write to the local server or private hosted profiles.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && origin !== `${req.protocol}://${req.headers.host}` && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    return res.status(403).json({ error: 'Cross-origin writes are not allowed' });
+  }
+  next();
+});
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 app.get('/api/session', (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
@@ -90,6 +108,7 @@ const gate = auth.require();
 app.use('/api', gate);
 app.use('/library', gate);
 app.use('/bios', gate);
+app.use('/games', gate);
 
 /* ---------- Library ---------- */
 
@@ -133,7 +152,9 @@ function readCatalog(): GameMeta[] {
   return games.filter((g) => fs.existsSync(path.join(libraryDir, g.id, g.disc)));
 }
 
+let discovered = scanGames(gamesDir);
 app.get('/api/catalog', (_req, res) => {
+  discovered = scanGames(gamesDir);
   const games = readCatalog().map((g) => ({
     ...g,
     art: artUrls(g),
@@ -142,7 +163,14 @@ app.get('/api/catalog', (_req, res) => {
   }));
   const bios = fs.existsSync(path.join(biosDir, 'SCPH1001.BIN')) ? '/bios/SCPH1001.BIN' : null;
   res.setHeader('Cache-Control', 'no-store');
-  res.json({ games, bios });
+  res.json({ games: [...games, ...discovered.games], bios });
+});
+
+app.get('/games/:id/:file', (req, res) => {
+  const file = discovered.files.get(`${req.params.id}/${req.params.file}`);
+  if (!file || !fs.existsSync(file) || fs.lstatSync(file).isSymbolicLink()) return res.sendStatus(404);
+  res.setHeader('Cache-Control', 'private, no-cache');
+  res.sendFile(file);
 });
 
 const immutable = {
@@ -361,16 +389,22 @@ if (fs.existsSync(distDir)) {
       },
     }),
   );
-  app.get(/^\/(?!api|library|bios).*/, (_req, res) => res.sendFile(path.join(distDir, 'index.html')));
+  app.get(/^\/(?!api|library|bios|games).*/, (_req, res) => res.sendFile(path.join(distDir, 'index.html')));
 }
 
 const server = http.createServer(app);
 const signaling = attachSignaling(server, auth);
 
-server.listen(PORT, '0.0.0.0', () => {
+export const ready = new Promise<string>((resolve, reject) => {
+server.once('error', reject);
+server.listen(PORT, process.env.WSX_BIND ?? '0.0.0.0', () => {
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : PORT;
   const invites = auth.invites().filter((i) => !i.revokedAt).length;
-  console.log(`WebStationX server on http://localhost:${PORT}  (library: ${readCatalog().length} game(s), invites: ${invites})`);
+  console.log(`WebStationX server on http://localhost:${port}  (library: ${readCatalog().length + discovered.games.length} game(s), invites: ${invites})`);
   if (!auth.enabled) console.log('No invite codes yet: access is OPEN. Create one with: npm run invite -- add "Name"');
+  resolve(`http://127.0.0.1:${port}`);
+});
 });
 
 process.on('SIGTERM', () => {

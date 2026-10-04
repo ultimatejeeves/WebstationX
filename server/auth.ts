@@ -77,7 +77,8 @@ export class Auth {
   }
 
   get enabled() {
-    return this.invites().some((i) => !i.revokedAt);
+    // Once configured, revoking the last code must never reopen the server.
+    return fs.existsSync(this.invitesPath);
   }
 
   /* ---------- Session tokens ---------- */
@@ -117,7 +118,9 @@ export class Auth {
     if (!raw) return null;
     for (const part of raw.split(';')) {
       const [k, ...v] = part.trim().split('=');
-      if (k === COOKIE) return decodeURIComponent(v.join('='));
+      if (k === COOKIE) {
+        try { return decodeURIComponent(v.join('=')); } catch { return null; }
+      }
     }
     return null;
   }
@@ -127,7 +130,7 @@ export class Auth {
   }
 
   private secure(req: express.Request) {
-    return req.secure || req.headers['x-forwarded-proto'] === 'https';
+    return req.secure;
   }
 
   setCookie(req: express.Request, res: express.Response, token: string) {

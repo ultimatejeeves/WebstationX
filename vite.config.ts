@@ -30,6 +30,7 @@ export default defineConfig({
       '/api': `http://${API}`,
       '/library': `http://${API}`,
       '/bios': `http://${API}`,
+      '/games': `http://${API}`,
       '/ws': { target: `ws://${API}`, ws: true },
     },
   },

@@ -85,6 +85,8 @@ export class LibraryScreen implements Screen {
   private video: HTMLVideoElement | null = null;
   private launching = false;
   private wheelAt = 0;
+  private refreshTimer = 0;
+  private refreshing = false;
 
   constructor(onLaunch: (i: LaunchIntent) => void, onSwitchProfile: () => void, onJoinOnline: () => void) {
     this.onLaunch = onLaunch;
@@ -187,6 +189,19 @@ export class LibraryScreen implements Screen {
     );
     this.view = store.libraryView;
     this.applyView(true);
+    this.refreshTimer = window.setInterval(async () => {
+      if (this.refreshing || this.launching) return;
+      this.refreshing = true;
+      try {
+        const before = JSON.stringify(store.catalog);
+        const catalog = await api.catalog();
+        if (before !== JSON.stringify(catalog)) {
+          store.catalog = catalog;
+          this.applyView(true);
+        }
+      } catch { /* A temporarily unavailable server should not interrupt browsing. */ }
+      finally { this.refreshing = false; }
+    }, 5000);
     // Load save summaries in the background so the detail panel can show "Continue".
     if (store.profile) {
       for (const g of store.catalog.games) {
@@ -202,6 +217,7 @@ export class LibraryScreen implements Screen {
   }
 
   unmount() {
+    window.clearInterval(this.refreshTimer);
     window.removeEventListener('pointerdown', markPointer, { capture: true });
     this.bar.dispose();
     input.onGamepadsChanged = null;
@@ -340,7 +356,7 @@ export class LibraryScreen implements Screen {
     this.cards = [];
     if (this.games.length === 0) {
       const none = store.catalog.games.length === 0;
-      this.track.appendChild(h('div.shelf-empty', none ? 'No games published yet. Add one with: npm run ingest' : 'No games match these filters.'));
+      this.track.appendChild(h('div.shelf-empty', none ? 'Add games to Games/psx or Games/ps2. They appear here automatically. PS1: CHD, ISO, PBP or CUE + BIN. PS2: CHD or ISO. Extract ZIP and 7z files first.' : 'No games match these filters.'));
       return;
     }
     const favs = store.favorites;

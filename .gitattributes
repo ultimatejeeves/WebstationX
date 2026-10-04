@@ -1,0 +1,7 @@
+* text=auto
+*.sh text eol=lf
+*.yml text eol=lf
+*.patch -text
+*.wasm binary
+*.woff2 binary
+licenses/** -whitespace

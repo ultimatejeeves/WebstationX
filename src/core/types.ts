@@ -22,6 +22,7 @@ export type GameMeta = {
   /** Known emulation state from our own testing, shown to every device. */
   compat?: { status: 'ok' | 'issues' | 'broken'; note?: string };
   discUrl: string;
+  files?: { name: string; url: string }[];
   coverUrl: string | null;
   /** Scraped game art (URLs), present only for the pieces that exist. `accent` is a '#rrggbb' colour. */
   art?: {

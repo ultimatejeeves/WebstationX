@@ -1,20 +1,22 @@
-# Unraid / Docker deployment. Put this behind an HTTPS reverse proxy (Nginx Proxy Manager,
-# SWAG, or a Cloudflare Tunnel): browsers only expose gamepads and WebRTC on https origins.
 services:
   webstationx:
     build: .
-    image: webstationx:latest
+    image: webstationx:local
     container_name: webstationx
     restart: unless-stopped
     ports:
-      - "8090:8090"
+      - "${WSX_LISTEN_ADDRESS:-127.0.0.1}:${WSX_PORT:-8090}:8090"
     environment:
-      - WSX_PORT=8090
-      # Trust X-Forwarded-Proto from the reverse proxy (default on). Set to 0 if exposed directly.
-      - WSX_TRUST_PROXY=1
-      # Optional TURN relay for friends behind strict NAT, e.g.
-      # - WSX_ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:turn.example.com:3478","username":"wsx","credential":"secret"}]
+      WSX_PORT: "8090"
+      WSX_TRUST_PROXY: "${WSX_TRUST_PROXY:-0}"
     volumes:
-      - /mnt/user/appdata/webstationx/library:/app/library
-      - /mnt/user/appdata/webstationx/bios:/app/bios
-      - /mnt/user/appdata/webstationx/data:/app/data
+      - ./Games:/app/Games
+      - ./library:/app/library:ro
+      - ./bios:/app/bios:ro
+      - wsx-data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  wsx-data:

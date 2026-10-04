@@ -1,5 +1,4 @@
 {
-  "generatedAt": "2026-09-28T02:42:14.342Z",
   "assets": [
     {
       "id": "bg-main",
@@ -7,11 +6,6 @@
       "width": 1920,
       "height": 1080,
       "purpose": "Main menu / library background",
-      "format": "jpg",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null,
       "thumb": "bg-main.thumb.jpg"
     },
     {
@@ -20,11 +14,6 @@
       "width": 1920,
       "height": 1080,
       "purpose": "Boot screen background",
-      "format": "jpg",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null,
       "thumb": "bg-boot.thumb.jpg"
     },
     {
@@ -33,11 +22,6 @@
       "width": 1920,
       "height": 1080,
       "purpose": "Behind-the-game-screen background",
-      "format": "jpg",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null,
       "thumb": "bg-play.thumb.jpg"
     },
     {
@@ -45,72 +29,42 @@
       "file": "emblem.png",
       "width": 1024,
       "height": 1024,
-      "purpose": "Logo emblem (screen-blend over dark UI)",
-      "format": "png",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Logo emblem (screen-blend over dark UI)"
     },
     {
       "id": "hero-controller",
       "file": "hero-controller.png",
       "width": 1024,
       "height": 1024,
-      "purpose": "Hero image: grey dual-analog controller",
-      "format": "png",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Hero image: grey dual-analog controller"
     },
     {
       "id": "hero-memcard",
       "file": "hero-memcard.png",
       "width": 1024,
       "height": 1024,
-      "purpose": "Hero image: grey memory card",
-      "format": "png",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Hero image: grey memory card"
     },
     {
       "id": "hero-disc",
       "file": "hero-disc.png",
       "width": 1024,
       "height": 1024,
-      "purpose": "Hero image: black-bottomed game disc",
-      "format": "png",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Hero image: black-bottomed game disc"
     },
     {
       "id": "texture-metal",
       "file": "texture-metal.jpg",
       "width": 1024,
       "height": 1024,
-      "purpose": "Seamless brushed aluminium tile",
-      "format": "jpg",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Seamless brushed aluminium tile"
     },
     {
       "id": "texture-glass",
       "file": "texture-glass.png",
       "width": 1024,
       "height": 256,
-      "purpose": "Aqua glass button sheen strip",
-      "format": "png",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Aqua glass button sheen strip"
     },
     {
       "id": "cover-crash-bash",
@@ -118,11 +72,6 @@
       "width": 600,
       "height": 840,
       "purpose": "Placeholder box art: cartoon party arena",
-      "format": "jpg",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null,
       "thumb": "cover-crash-bash.thumb.jpg"
     },
     {
@@ -131,11 +80,6 @@
       "width": 600,
       "height": 840,
       "purpose": "Placeholder box art: skeleton knight",
-      "format": "jpg",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null,
       "thumb": "cover-medievil.thumb.jpg"
     },
     {
@@ -143,72 +87,42 @@
       "file": "avatar-01.png",
       "width": 512,
       "height": 512,
-      "purpose": "Profile avatar orb 01",
-      "format": "png",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Profile avatar orb 01"
     },
     {
       "id": "avatar-02",
       "file": "avatar-02.png",
       "width": 512,
       "height": 512,
-      "purpose": "Profile avatar orb 02",
-      "format": "png",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Profile avatar orb 02"
     },
     {
       "id": "avatar-03",
       "file": "avatar-03.png",
       "width": 512,
       "height": 512,
-      "purpose": "Profile avatar orb 03",
-      "format": "png",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Profile avatar orb 03"
     },
     {
       "id": "avatar-04",
       "file": "avatar-04.png",
       "width": 512,
       "height": 512,
-      "purpose": "Profile avatar orb 04",
-      "format": "png",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Profile avatar orb 04"
     },
     {
       "id": "avatar-05",
       "file": "avatar-05.png",
       "width": 512,
       "height": 512,
-      "purpose": "Profile avatar orb 05",
-      "format": "png",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Profile avatar orb 05"
     },
     {
       "id": "avatar-06",
       "file": "avatar-06.png",
       "width": 512,
       "height": 512,
-      "purpose": "Profile avatar orb 06",
-      "format": "png",
-      "model": "phoenix",
-      "candidate": 1,
-      "candidates": 2,
-      "generationId": null
+      "purpose": "Profile avatar orb 06"
     }
   ]
 }

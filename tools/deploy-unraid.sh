@@ -1,53 +1,18 @@
 #!/usr/bin/env bash
-# Deploy WebStationX to an Unraid (or any Docker) host over SSH.
-#
-#   tools/deploy-unraid.sh                 # uses user@your-server and ~/.ssh/id_webstationx
-#   WSX_HOST=user@your-server WSX_KEY=~/.ssh/id_ed25519 tools/deploy-unraid.sh
-#
-# Steps: upload the source tree (tracked + untracked, minus ignored files), sync library/ and
-# bios/ into the appdata share, build the image on the host, and (re)create the container.
-# Player data in appdata/webstationx/data is never touched.
+# Upload committed source and rebuild without copying personal games, BIOS, or saves.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-
-HOST="${WSX_HOST:-user@your-server}"
-KEY="${WSX_KEY:-$HOME/.ssh/id_webstationx}"
+: "${WSX_HOST:?Set WSX_HOST to your SSH destination (for example user@server)}"
 APPDATA="${WSX_APPDATA:-/mnt/user/appdata/webstationx}"
-SSH=(ssh -i "$KEY" -o BatchMode=yes "$HOST")
-SCP=(scp -q -i "$KEY")
-
-echo "== Packaging source"
+[[ "$APPDATA" =~ ^/[a-zA-Z0-9_/-]+$ && "$APPDATA" != / ]] || { echo 'WSX_APPDATA must be an absolute path without spaces or shell characters.' >&2; exit 1; }
+SSH=(ssh -o BatchMode=yes)
+SCP=(scp -q)
+if [[ -n "${WSX_KEY:-}" ]]; then SSH+=(-i "$WSX_KEY"); SCP+=(-i "$WSX_KEY"); fi
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+REMOTE="$APPDATA/releases/$STAMP"
 mkdir -p work
-git ls-files -co --exclude-standard | grep -v '^library/\|^\.claude/' > work/deploy-files.txt
-tar -czf work/webstationx-src.tgz -T work/deploy-files.txt
-
-echo "== Uploading to $HOST:$APPDATA"
-"${SSH[@]}" "mkdir -p $APPDATA/src $APPDATA/library $APPDATA/bios $APPDATA/data && rm -rf $APPDATA/src/*"
-"${SCP[@]}" work/webstationx-src.tgz "$HOST:$APPDATA/src/"
-"${SSH[@]}" "cd $APPDATA/src && tar -xzf webstationx-src.tgz && rm webstationx-src.tgz"
-# Library: only send files that are new or changed size (PS2 discs are gigabytes).
-"${SSH[@]}" "cd $APPDATA/library && find . -type f -printf '%P %s\n'" | sort > work/deploy-remote-library.txt
-(cd library && find . -type f -printf '%P %s\n') | sort > work/deploy-local-library.txt
-comm -23 work/deploy-local-library.txt work/deploy-remote-library.txt | sed 's/ [0-9]*$//' > work/deploy-library-changed.txt
-if [ -s work/deploy-library-changed.txt ]; then
-  echo "   library: $(wc -l < work/deploy-library-changed.txt) file(s) to send"
-  tar -C library -cf - -T work/deploy-library-changed.txt | "${SSH[@]}" "tar -xf - -C $APPDATA/library"
-else
-  echo "   library: up to date"
-fi
-"${SCP[@]}" bios/*.BIN bios/*.bin "$HOST:$APPDATA/bios/" 2>/dev/null || true
-
-echo "== Building image on host"
-"${SSH[@]}" "cd $APPDATA/src && docker build -t webstationx:latest ."
-
-echo "== Recreating container"
-"${SCP[@]}" tools/unraid-run.sh "$HOST:$APPDATA/run.sh"
-"${SSH[@]}" "chmod +x $APPDATA/run.sh && WSX_APPDATA=$APPDATA $APPDATA/run.sh"
-
-# Each rebuild orphans the previous image and its build stage; Unraid's docker.img
-# is a fixed 20 GB, so drop the dangling ones or they fill it.
-echo "== Pruning dangling images"
-"${SSH[@]}" "docker image prune -f >/dev/null; df -h /var/lib/docker | tail -1"
-
-echo "== Done. Health:"
-"${SSH[@]}" "sleep 3; docker ps --filter name=webstationx --format '{{.Names}} {{.Status}} {{.Ports}}'; wget -qO- http://127.0.0.1:8090/api/session; echo"
+git archive --format=tar.gz --output=work/webstationx-src.tgz HEAD
+"${SSH[@]}" "$WSX_HOST" "mkdir -p '$REMOTE' '$APPDATA/Games/psx' '$APPDATA/Games/ps2' '$APPDATA/library' '$APPDATA/bios' '$APPDATA/data'"
+"${SCP[@]}" work/webstationx-src.tgz "$WSX_HOST:$REMOTE/source.tgz"
+"${SSH[@]}" "$WSX_HOST" "cd '$REMOTE' && tar -xzf source.tgz && docker build -t webstationx:latest . && WSX_APPDATA='$APPDATA' bash tools/unraid-run.sh"
+echo "Deployed $(git rev-parse --short HEAD). Source retained at $REMOTE; game and save volumes were preserved."
