@@ -16,7 +16,7 @@ No games or console BIOS files are included.
 There is no installer, Node.js setup, or separate browser to install. The app includes its browser runtime and emulator cores. First launch extracts the application into a temporary directory, so allow a little time for it to open. Local play works offline.
 
 ```text
-WebStationX-0.1.0-windows-x64.exe
+WebStationX-0.1.1-windows-x64.exe
 Games/
   psx/                 PS1 games
   ps2/                 PS2 games
