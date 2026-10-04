@@ -4,4 +4,5 @@
 *.patch -text
 *.wasm binary
 *.woff2 binary
+public/cores/** -text
 licenses/** -whitespace
