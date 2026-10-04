@@ -1,0 +1,120 @@
+From e2f8d633d1e82c83f7c1558b9dbf7775179ef131 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 15:19:03 -0400
+Subject: [PATCH 14/43] Web: frame limiter stops trusting short sleeps; idle
+ work hook
+
+A sleep can wake a whole OS timer tick late (15.6 ms on Windows, where the browser usually
+doesn't raise the timer resolution for the process). Sleeping the last ms before the deadline made
+~1 frame in 15 late at 60 fps, followed by rushed catch-up frames: 466 of 537 slow VM frames in a
+THPS4 run were oversleeps, not emulation. The limiter now tracks how late sleeps wake (up at once,
+decaying slowly), only sleeps while the deadline is further than that, and spends the rest on idle
+work (SetIdleWork) and then spins.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/FrameLimiter.cpp | 34 ++++++++++++++++++++++++++++++++--
+ Source/FrameLimiter.h   | 11 +++++++++++
+ 2 files changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/Source/FrameLimiter.cpp b/Source/FrameLimiter.cpp
+index 0f74521d..308bb752 100644
+--- a/Source/FrameLimiter.cpp
++++ b/Source/FrameLimiter.cpp
+@@ -1,4 +1,5 @@
+ #include "FrameLimiter.h"
++#include <algorithm>
+ #include <cassert>
+ #include <thread>
+ #include "WsxFrameStats.h"
+@@ -49,13 +50,35 @@ void CFrameLimiter::EndFrame()
+ 		}
+ 		m_nextDeadline += m_minFrameDuration;
+ 		WsxFrameStats::CScope sleepScope(WsxFrameStats::g_vmSleepUs);
++		//A sleep can wake up a whole OS timer tick late: 15.6 ms on Windows, where the browser usually
++		//doesn't raise the timer resolution for this process. Sleeping the last few ms before the deadline
++		//then made about one frame in 15 late (the next ones rushed to catch up): visible micro-stutter.
++		//So only sleep while the deadline is further away than sleeps have recently overshot, and spend the
++		//rest on idle work, then spin. The slack estimate follows overshoots up at once and decays slowly.
++		bool idleWorkLeft = static_cast<bool>(m_idleWork);
+ 		while(now < m_nextDeadline)
+ 		{
+ 			auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(m_nextDeadline - now);
+-			//Coarse sleep first, then short sleeps to land close to the deadline.
+-			std::this_thread::sleep_for(remaining > std::chrono::microseconds(2000) ? remaining - std::chrono::microseconds(1000) : std::chrono::microseconds(200));
++			auto margin = m_sleepSlack + std::chrono::microseconds(500);
++			if(remaining > margin)
++			{
++				auto request = remaining - margin;
++				auto before = now;
++				std::this_thread::sleep_for(request);
++				now = std::chrono::high_resolution_clock::now();
++				auto overshoot = std::chrono::duration_cast<std::chrono::microseconds>(now - before) - request;
++				m_sleepSlack = std::max(m_sleepSlack, overshoot);
++				continue;
++			}
++			if(idleWorkLeft && (remaining > std::chrono::microseconds(400)))
++			{
++				//Stop short of the deadline: one piece of work can take a few hundred microseconds.
++				idleWorkLeft = m_idleWork(static_cast<double>((remaining - std::chrono::microseconds(300)).count()));
++			}
+ 			now = std::chrono::high_resolution_clock::now();
+ 		}
++		//Decay slowly (halves in ~45 s): a machine whose timer got finer goes back to sleeping.
++		m_sleepSlack -= m_sleepSlack / 4096;
+ 	}
+ 	m_frameStarted = false;
+ 	return;
+@@ -103,6 +126,13 @@ void CFrameLimiter::EndFrame()
+ 	m_frameStarted = false;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++void CFrameLimiter::SetIdleWork(IdleWork idleWork)
++{
++	m_idleWork = std::move(idleWork);
++}
++#endif
++
+ void CFrameLimiter::SetFrameRate(uint32 fps)
+ {
+ 	if(fps == 0)
+diff --git a/Source/FrameLimiter.h b/Source/FrameLimiter.h
+index db484e30..0b28f610 100644
+--- a/Source/FrameLimiter.h
++++ b/Source/FrameLimiter.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <chrono>
++#include <functional>
+ #include "Types.h"
+ 
+ #ifdef _WIN32
+@@ -18,6 +19,13 @@ public:
+ 
+ 	void SetFrameRate(uint32);
+ 
++#ifdef __EMSCRIPTEN__
++	//Work to do instead of waiting for the frame deadline: called with a budget in microseconds, returns
++	//false when it has nothing to do.
++	typedef std::function<bool(double)> IdleWork;
++	void SetIdleWork(IdleWork);
++#endif
++
+ private:
+ 	typedef std::chrono::high_resolution_clock::time_point TimePoint;
+ 
+@@ -35,6 +43,9 @@ private:
+ #ifdef __EMSCRIPTEN__
+ 	TimePoint m_nextDeadline;
+ 	bool m_hasDeadline = false;
++	//How late a sleep has been waking up lately (see EndFrame).
++	std::chrono::microseconds m_sleepSlack = std::chrono::microseconds(2000);
++	IdleWork m_idleWork;
+ #endif
+ 
+ #ifdef _WIN32
+-- 
+2.51.0.windows.1
+

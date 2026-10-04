@@ -1,0 +1,29 @@
+appId: io.github.ultimatejeeves.webstationx
+productName: WebStationX
+directories:
+  output: release
+files:
+  - desktop/main.cjs
+  - dist/server.js
+  - package.json
+extraResources:
+  - from: dist
+    to: app-content/dist
+    filter:
+      - '**/*'
+      - '!server.js'
+  - from: THIRD_PARTY_NOTICES.md
+    to: app-content/THIRD_PARTY_NOTICES.md
+  - from: licenses
+    to: app-content/licenses
+asar: true
+win:
+  target:
+    - target: portable
+      arch: [x64]
+  artifactName: WebStationX-${version}-windows-x64.exe
+  signExecutable: false
+  icon: desktop/icon.ico
+portable:
+  requestExecutionLevel: user
+  unpackDirName: false

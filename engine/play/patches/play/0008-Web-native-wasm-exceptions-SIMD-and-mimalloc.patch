@@ -1,0 +1,58 @@
+From 90ebf088515e20ad329efd18d1836ebedb682e2c Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 10:46:56 -0400
+Subject: [PATCH 08/43] Web: native wasm exceptions, SIMD and mimalloc
+
+-fexceptions alone selects Emscripten's JavaScript exceptions, where every call that may throw from
+a try block or past a live destructor bounces through a JS trampoline. -fwasm-exceptions removes all
+34 invoke_* trampolines. -msimd128 lets clang vectorize, and mimalloc replaces dlmalloc's single lock
+(the JIT and GS threads allocate constantly).
+
+THPS4, uncapped, same save state: 71.7 fps -> 75.5 (wasm exceptions) -> 85.7 (+SIMD, mimalloc).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ CMakeLists.txt              | 13 +++++++++++++
+ Source/ui_js/CMakeLists.txt |  2 ++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d4c2cf6f..16170dcd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -15,6 +15,19 @@ set(CMAKE_MODULE_PATH
+ )
+ include(Header)
+ 
++if(EMSCRIPTEN)
++	#Native WebAssembly exceptions. Header's -fexceptions alone selects Emscripten's JavaScript based
++	#exceptions, where every call that may throw from inside a try block or past a live destructor
++	#bounces through a JavaScript trampoline. -fwasm-exceptions takes precedence when both are given,
++	#so subprojects that include Header again still get native exceptions.
++	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fwasm-exceptions")
++	add_link_options(-fwasm-exceptions)
++	#Let clang vectorize (texture conversions, sound mixing, block copies): every browser that can
++	#run the core (cross-origin isolated threads, OffscreenCanvas WebGL2) has WebAssembly SIMD.
++	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msimd128")
++	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msimd128")
++endif()
++
+ set(BUILD_PLAY ON CACHE BOOL "Build Play! Emulator")
+ set(BUILD_PSFPLAYER OFF CACHE BOOL "Build PsfPlayer")
+ set(BUILD_TESTS ON CACHE BOOL "Build Tests")
+diff --git a/Source/ui_js/CMakeLists.txt b/Source/ui_js/CMakeLists.txt
+index 403c0ec5..3595d33f 100644
+--- a/Source/ui_js/CMakeLists.txt
++++ b/Source/ui_js/CMakeLists.txt
+@@ -61,6 +61,8 @@ target_link_options(Play PRIVATE "-sEXPORTED_RUNTIME_METHODS=['ccall', 'FS', 'HE
+ target_link_options(Play PRIVATE "-sFORCE_FILESYSTEM")
+ target_link_options(Play PRIVATE "-sALLOW_TABLE_GROWTH")
+ target_link_options(Play PRIVATE "-sALLOW_MEMORY_GROWTH")
++#The VM (JIT compiler) and GS threads allocate constantly; dlmalloc serializes them on one lock.
++target_link_options(Play PRIVATE "-sMALLOC=mimalloc")
+ #target_link_options(Play PRIVATE "-sASSERTIONS=2")
+ target_link_options(Play PRIVATE "-sEXPORT_NAME=Play")
+ target_link_options(Play PRIVATE "-sPTHREAD_POOL_SIZE=2")
+-- 
+2.51.0.windows.1
+

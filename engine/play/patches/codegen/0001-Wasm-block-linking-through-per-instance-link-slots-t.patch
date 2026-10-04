@@ -1,0 +1,219 @@
+From 6d55d92358e130d4ce85a884f9dc45711ea69e06 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 02:25:10 -0400
+Subject: [PATCH 1/6] Wasm: block linking through per-instance link slots (tail
+ calls)
+
+OP_EXTERNJMP_DYN now emits a return_call_indirect into a second imported table
+(the table holding compiled blocks). The target index is read from a link slot
+in linear memory whose base comes from an immutable 'linkBase' global import, so
+slots can be rewritten at run time and each instance of a module has its own.
+---
+ include/Jitter_CodeGen_Wasm.h |  1 +
+ include/MemoryFunction.h      |  6 ++++++
+ include/WasmDefs.h            |  3 +++
+ src/Jitter_CodeGen_Wasm.cpp   | 26 ++++++++++++++++++++++++++
+ src/MemoryFunction.cpp        | 25 ++++++++++++++++++++-----
+ src/WasmModuleBuilder.cpp     | 19 +++++++++++++++++--
+ 6 files changed, 73 insertions(+), 7 deletions(-)
+
+diff --git a/include/Jitter_CodeGen_Wasm.h b/include/Jitter_CodeGen_Wasm.h
+index e2f1fbe..2fa7855 100644
+--- a/include/Jitter_CodeGen_Wasm.h
++++ b/include/Jitter_CodeGen_Wasm.h
+@@ -153,6 +153,7 @@ namespace Jitter
+ 		void Emit_RetVal_Tmp(const STATEMENT&);
+ 
+ 		void Emit_ExternJmp(const STATEMENT&);
++		void Emit_ExternJmpDynamic(const STATEMENT&);
+ 
+ 		void Emit_Jmp(const STATEMENT&);
+ 		void Emit_CondJmp_AnyAny(const STATEMENT&);
+diff --git a/include/MemoryFunction.h b/include/MemoryFunction.h
+index fca4a0f..4be41d0 100644
+--- a/include/MemoryFunction.h
++++ b/include/MemoryFunction.h
+@@ -31,6 +31,12 @@ public:
+ 
+ 	CMemoryFunction CreateInstance();
+ 
++#if defined(__EMSCRIPTEN__)
++	//Address of the link slots (uint32 table indices) read by OP_EXTERNJMP_DYN in the next function instantiated on
++	//this thread (the next constructor or CreateInstance call).
++	static void SetNextWasmLinkBase(uintptr_t);
++#endif
++
+ private:
+ 	void ClearCache();
+ 	void Reset();
+diff --git a/include/WasmDefs.h b/include/WasmDefs.h
+index 0036a51..caceb44 100644
+--- a/include/WasmDefs.h
++++ b/include/WasmDefs.h
+@@ -22,6 +22,7 @@ namespace Wasm
+ 		IMPORT_EXPORT_TYPE_FUNCTION = 0x00,
+ 		IMPORT_EXPORT_TYPE_TABLE = 0x01,
+ 		IMPORT_EXPORT_TYPE_MEMORY = 0x02,
++		IMPORT_EXPORT_TYPE_GLOBAL = 0x03,
+ 	};
+ 
+ 	enum TYPE_CODE
+@@ -56,9 +57,11 @@ namespace Wasm
+ 		INST_BR_IF = 0x0D,
+ 		INST_BR_TABLE = 0x0E,
+ 		INST_CALL_INDIRECT = 0x11,
++		INST_RETURN_CALL_INDIRECT = 0x13,
+ 		INST_SELECT = 0x1B,
+ 		INST_LOCAL_GET = 0x20,
+ 		INST_LOCAL_SET = 0x21,
++		INST_GLOBAL_GET = 0x23,
+ 		INST_I32_LOAD = 0x28,
+ 		INST_I64_LOAD = 0x29,
+ 		INST_F32_LOAD = 0x2A,
+diff --git a/src/Jitter_CodeGen_Wasm.cpp b/src/Jitter_CodeGen_Wasm.cpp
+index 3f86e4a..324b3db 100644
+--- a/src/Jitter_CodeGen_Wasm.cpp
++++ b/src/Jitter_CodeGen_Wasm.cpp
+@@ -127,6 +127,7 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
+ 	{ OP_RETVAL,         MATCH_TEMPORARY,      MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_RetVal_Tmp                             },
+ 
+ 	{ OP_EXTERNJMP,      MATCH_NIL,            MATCH_CONSTANTPTR,    MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_ExternJmp                              },
++	{ OP_EXTERNJMP_DYN,  MATCH_NIL,            MATCH_CONSTANTPTR,    MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_ExternJmpDynamic                       },
+ 
+ 	{ OP_JMP,            MATCH_NIL,            MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Jmp                                    },
+ 
+@@ -1156,6 +1157,31 @@ void CCodeGen_Wasm::Emit_ExternJmp(const STATEMENT& statement)
+ 	m_functionStream.Write8(0x00);   //Table index
+ }
+ 
++void CCodeGen_Wasm::Emit_ExternJmpDynamic(const STATEMENT& statement)
++{
++	//Tail call to the function whose table index is stored in link slot N (src1) of this instance.
++	//Link slots live in linear memory at the address given by the "linkBase" import, so the target can be
++	//changed at run time (block linking) without touching the (immutable) code, and instances of the
++	//same module can have different targets.
++
++	auto src1 = statement.src1->GetSymbol().get();
++	assert(src1->m_type == SYM_CONSTANTPTR);
++	uint32 slot = src1->m_valueLow;
++
++	PushContext();
++
++	m_functionStream.Write8(Wasm::INST_GLOBAL_GET);
++	CWasmModuleBuilder::WriteULeb128(m_functionStream, 0); //linkBase
++
++	m_functionStream.Write8(Wasm::INST_I32_LOAD);
++	m_functionStream.Write8(0x02);
++	CWasmModuleBuilder::WriteULeb128(m_functionStream, slot * 4);
++
++	m_functionStream.Write8(Wasm::INST_RETURN_CALL_INDIRECT);
++	m_functionStream.Write8(0x00); //Signature index ("vi", always registered first)
++	m_functionStream.Write8(0x01); //Table index (blockTable)
++}
++
+ void CCodeGen_Wasm::Emit_Jmp(const STATEMENT& statement)
+ {
+ 	auto labelFlowIterator = m_labelFlows.find(statement.jmpBlock);
+diff --git a/src/MemoryFunction.cpp b/src/MemoryFunction.cpp
+index 73a3dab..2937b67 100644
+--- a/src/MemoryFunction.cpp
++++ b/src/MemoryFunction.cpp
+@@ -44,14 +44,16 @@
+ #include <sys/mman.h>
+ #include <pthread.h>
+ #elif defined(MEMFUNC_USE_WASM)
+-EM_JS_DEPS(WasmMemoryFunction, "$addFunction,$removeFunction");
+-EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle),
++EM_JS_DEPS(WasmMemoryFunction, "$addFunction,$removeFunction,$wasmTable");
++EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle, uintptr_t linkBase),
+ {
+ 	let module = Emval.toValue(moduleHandle);
+ 	let moduleInstance = new WebAssembly.Instance(module, {
+ 		env: {
+ 			memory: wasmMemory,
+-			fctTable : Module.codeGenImportTable
++			fctTable : Module.codeGenImportTable,
++			blockTable : wasmTable,
++			linkBase : new WebAssembly.Global({ value: 'i32', mutable: false }, linkBase)
+ 		}
+ 	});
+ 	let fct = moduleInstance.exports.codeGenFunc;
+@@ -76,6 +78,19 @@ EM_JS(emscripten::EM_VAL, WasmCreateModule, (uintptr_t code, uintptr_t size),
+ 	let module = new WebAssembly.Module(moduleBytes);
+ 	return Emval.toHandle(module);
+ });
++static thread_local uintptr_t g_wasmNextLinkBase = 0;
++
++static uintptr_t ConsumeWasmLinkBase()
++{
++	auto linkBase = g_wasmNextLinkBase;
++	g_wasmNextLinkBase = 0;
++	return linkBase;
++}
++
++void CMemoryFunction::SetNextWasmLinkBase(uintptr_t linkBase)
++{
++	g_wasmNextLinkBase = linkBase;
++}
+ #else
+ #error "No API to use for CMemoryFunction"
+ #endif
+@@ -131,7 +146,7 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
+ #elif defined(MEMFUNC_USE_WASM)
+ 	m_wasmModule = emscripten::val::take_ownership(WasmCreateModule(reinterpret_cast<uintptr_t>(code), size));
+ 	m_size = size;
+-	m_code = reinterpret_cast<void*>(WasmCreateFunction(m_wasmModule.as_handle()));
++	m_code = reinterpret_cast<void*>(WasmCreateFunction(m_wasmModule.as_handle(), ConsumeWasmLinkBase()));
+ #endif
+ 	ClearCache();
+ #if !defined(MEMFUNC_USE_WASM)
+@@ -236,7 +251,7 @@ CMemoryFunction CMemoryFunction::CreateInstance()
+ 	CMemoryFunction result;
+ 	result.m_wasmModule = m_wasmModule;
+ 	result.m_size = m_size;
+-	result.m_code = reinterpret_cast<void*>(WasmCreateFunction(m_wasmModule.as_handle()));
++	result.m_code = reinterpret_cast<void*>(WasmCreateFunction(m_wasmModule.as_handle(), ConsumeWasmLinkBase()));
+ 	return result;
+ #else
+ 	return CMemoryFunction(GetCode(), GetSize());
+diff --git a/src/WasmModuleBuilder.cpp b/src/WasmModuleBuilder.cpp
+index 9f4ad6f..2549a6c 100644
+--- a/src/WasmModuleBuilder.cpp
++++ b/src/WasmModuleBuilder.cpp
+@@ -122,9 +122,9 @@ void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
+ 
+ 	//Section "Import"
+ 	{
+-		WriteSectionHeader(stream, Wasm::SECTION_ID_IMPORT, 0x23);
++		WriteSectionHeader(stream, Wasm::SECTION_ID_IMPORT, 0x46);
+ 
+-		stream.Write8(2); //Import vector size
++		stream.Write8(4); //Import vector size
+ 
+ 		//Import 0
+ 		WriteName(stream, "env");    //Import module name
+@@ -141,6 +141,21 @@ void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
+ 		stream.Write8(0x70); //Funcref
+ 		stream.Write8(0x00); //Flags
+ 		stream.Write8(0x01); //Initial
++
++		//Import 2: table holding the compiled blocks (target of linked block tail calls)
++		WriteName(stream, "env");
++		WriteName(stream, "blockTable");
++		stream.Write8(Wasm::IMPORT_EXPORT_TYPE_TABLE);
++		stream.Write8(0x70); //Funcref
++		stream.Write8(0x00); //Flags
++		stream.Write8(0x01); //Initial
++
++		//Import 3: address of this instance's link slots (see Emit_ExternJmpDynamic)
++		WriteName(stream, "env");
++		WriteName(stream, "linkBase");
++		stream.Write8(Wasm::IMPORT_EXPORT_TYPE_GLOBAL);
++		stream.Write8(Wasm::TYPE_I32);
++		stream.Write8(0x00); //Immutable
+ 	}
+ 
+ 	//Section "Function"
+-- 
+2.51.0.windows.1
+

@@ -1,0 +1,10 @@
+{
+  "name": "WebStationX",
+  "short_name": "WebStationX",
+  "start_url": "/",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "background_color": "#050914",
+  "theme_color": "#050914",
+  "icons": [{ "src": "/assets/emblem.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any" }]
+}

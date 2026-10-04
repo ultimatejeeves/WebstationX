@@ -1,0 +1,201 @@
+From 5b590dbaae4e9ee91055f5f8939cdcbdb0124f86 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 11:04:19 -0400
+Subject: [PATCH 10/43] EE: treat threads that only yield to each other as idle
+
+During THPS4's FMVs two threads bounce through RotateThreadReadyQueue about 5.5 million times per
+emulated second, with under 32 EE cycles of work between yields, while the IPU decodes. The bounce
+strategy never kicks in: interrupts arrive long before it counts 1000 bounces. The yield-spin
+strategy counts the EE cycles executed between rotations; after 16 rotations less than 64 cycles
+apart the EE is idle for the rest of its slice. Any other syscall or an interrupt ends it, so a
+thread that starts working again is never throttled.
+
+The intro FMVs went from 27-30 fps (slow motion, a hitch almost every second) to 60.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ Source/ee/Ee_IdleEvaluator.cpp | 51 +++++++++++++++++++++++++++++++++-
+ Source/ee/Ee_IdleEvaluator.h   | 22 +++++++++++++++
+ Source/ee/Ee_SubSystem.cpp     |  1 +
+ Source/ee/PS2OS.cpp            |  3 ++
+ Source/ee/PS2OS.h              |  7 +++++
+ 5 files changed, 83 insertions(+), 1 deletion(-)
+
+diff --git a/Source/ee/Ee_IdleEvaluator.cpp b/Source/ee/Ee_IdleEvaluator.cpp
+index 815349b4..11d1123f 100644
+--- a/Source/ee/Ee_IdleEvaluator.cpp
++++ b/Source/ee/Ee_IdleEvaluator.cpp
+@@ -7,13 +7,15 @@ void CIdleEvaluator::Reset()
+ 	m_semaChecker.Reset();
+ 	m_selfThreadRotate.Reset();
+ 	m_threadRotateBounce.Reset();
++	m_yieldSpin.Reset();
+ }
+ 
+ bool CIdleEvaluator::IsIdle() const
+ {
+ 	return m_semaChecker.m_isIdle ||
+ 	       m_selfThreadRotate.m_isIdle ||
+-	       m_threadRotateBounce.m_isIdle;
++	       m_threadRotateBounce.m_isIdle ||
++	       m_yieldSpin.m_isIdle;
+ }
+ 
+ void CIdleEvaluator::NotifyEvent(EVENT eventType, uint32 arg0, uint32 arg1)
+@@ -21,6 +23,53 @@ void CIdleEvaluator::NotifyEvent(EVENT eventType, uint32 arg0, uint32 arg1)
+ 	m_semaChecker.NotifyEvent(eventType, arg0, arg1);
+ 	m_selfThreadRotate.NotifyEvent(eventType, arg0, arg1);
+ 	m_threadRotateBounce.NotifyEvent(eventType, arg0, arg1);
++	m_yieldSpin.NotifyEvent(eventType, arg0, arg1);
++}
++
++void CIdleEvaluator::NotifyRotate(uint64 cyclesSinceLastRotate)
++{
++	m_yieldSpin.NotifyRotate(cyclesSinceLastRotate);
++}
++
++void CIdleEvaluator::STRATEGY_YIELDSPIN::Reset()
++{
++	m_spinCount = 0;
++	m_isIdle = false;
++}
++
++void CIdleEvaluator::STRATEGY_YIELDSPIN::NotifyEvent(EVENT eventType, uint32 arg0, uint32 arg1)
++{
++	switch(eventType)
++	{
++	case EVENT_SYSCALL:
++		//arg0: syscall number. Rotations keep the count (NotifyRotate decides), anything else ends the spin.
++		m_isIdle = false;
++		if((arg0 != 0x2B) && (arg0 != 0x2C))
++		{
++			m_spinCount = 0;
++		}
++		break;
++	case EVENT_INTERRUPT:
++		m_spinCount = 0;
++		m_isIdle = false;
++		break;
++	default:
++		break;
++	}
++}
++
++void CIdleEvaluator::STRATEGY_YIELDSPIN::NotifyRotate(uint64 cyclesSinceLastRotate)
++{
++	if(cyclesSinceLastRotate < MAX_CYCLES_BETWEEN_YIELDS)
++	{
++		m_spinCount++;
++		m_isIdle = (m_spinCount >= MIN_YIELDS);
++	}
++	else
++	{
++		m_spinCount = 0;
++		m_isIdle = false;
++	}
+ }
+ 
+ void CIdleEvaluator::STRATEGY_SEMACHECKER::Reset()
+diff --git a/Source/ee/Ee_IdleEvaluator.h b/Source/ee/Ee_IdleEvaluator.h
+index ee33c277..8b5f3a0e 100644
+--- a/Source/ee/Ee_IdleEvaluator.h
++++ b/Source/ee/Ee_IdleEvaluator.h
+@@ -17,9 +17,12 @@ namespace Ee
+ 			EVENT_SIGNALSEMA,
+ 			EVENT_ROTATETHREADREADYQUEUE,
+ 			EVENT_CHANGETHREAD,
++			EVENT_SYSCALL,
+ 		};
+ 
+ 		void NotifyEvent(EVENT, uint32, uint32 = 0);
++		//RotateThreadReadyQueue, with the EE cycles executed since the previous one
++		void NotifyRotate(uint64 cyclesSinceLastRotate);
+ 
+ 	private:
+ 		//For Shadow of the Colossus
+@@ -55,5 +58,24 @@ namespace Ee
+ 			uint32 m_bounceCount = 0;
+ 			bool m_isIdle = false;
+ 		} m_threadRotateBounce;
++
++		//For Tony Hawk's Pro Skater 4 (FMVs): threads that do nothing but yield to each other, millions of
++		//times per second, with interrupts coming too often for the bounce strategy's count to build up.
++		//Idle only while the last syscall was such a yield; any other syscall or an interrupt ends it.
++		struct STRATEGY_YIELDSPIN
++		{
++			void Reset();
++			void NotifyEvent(EVENT, uint32, uint32);
++			void NotifyRotate(uint64);
++
++			enum
++			{
++				MAX_CYCLES_BETWEEN_YIELDS = 64,
++				MIN_YIELDS = 16,
++			};
++
++			uint32 m_spinCount = 0;
++			bool m_isIdle = false;
++		} m_yieldSpin;
+ 	};
+ }
+diff --git a/Source/ee/Ee_SubSystem.cpp b/Source/ee/Ee_SubSystem.cpp
+index ba721952..ff7f6a87 100644
+--- a/Source/ee/Ee_SubSystem.cpp
++++ b/Source/ee/Ee_SubSystem.cpp
+@@ -252,6 +252,7 @@ int CSubSystem::ExecuteCpu(int quota)
+ 	{
+ 		executed = (quota - m_EE.m_executor->Execute(quota));
+ 	}
++	m_os->CountExecutedCycles(executed);
+ 	if(m_EE.m_State.nHasException)
+ 	{
+ 		switch(m_EE.m_State.nHasException)
+diff --git a/Source/ee/PS2OS.cpp b/Source/ee/PS2OS.cpp
+index 857855c3..dff52b86 100644
+--- a/Source/ee/PS2OS.cpp
++++ b/Source/ee/PS2OS.cpp
+@@ -2224,6 +2224,8 @@ void CPS2OS::sc_RotateThreadReadyQueue()
+ 	ThreadShakeAndBake();
+ 
+ 	m_idleEvaluator.NotifyEvent(Ee::CIdleEvaluator::EVENT_ROTATETHREADREADYQUEUE, threadIdBefore, m_currentThreadId);
++	m_idleEvaluator.NotifyRotate(m_executedCycles - m_lastRotateCycles);
++	m_lastRotateCycles = m_executedCycles;
+ }
+ 
+ //2D/2E
+@@ -3183,6 +3185,7 @@ void CPS2OS::HandleSyscall()
+ 	}
+ 
+ 	uint32 func = m_ee.m_State.nGPR[CMIPS::V1].nV[0];
++	m_idleEvaluator.NotifyEvent(Ee::CIdleEvaluator::EVENT_SYSCALL, (func & 0x80000000) ? (0 - func) : func);
+ 
+ 	if(func == SYSCALL_CUSTOM_RESCHEDULE)
+ 	{
+diff --git a/Source/ee/PS2OS.h b/Source/ee/PS2OS.h
+index 8dab3424..0b5d2fde 100644
+--- a/Source/ee/PS2OS.h
++++ b/Source/ee/PS2OS.h
+@@ -33,6 +33,11 @@ public:
+ 	void Release();
+ 
+ 	bool IsIdle() const;
++	//EE cycles executed, counted by the subsystem (the idle evaluator measures work between yields).
++	void CountExecutedCycles(uint32 cycles)
++	{
++		m_executedCycles += cycles;
++	}
+ 
+ 	void BootFromFile(const fs::path&);
+ 	void BootFromVirtualPath(const char*, const ArgumentList&);
+@@ -476,6 +481,8 @@ private:
+ 	std::string m_executableName;
+ 
+ 	Ee::CIdleEvaluator m_idleEvaluator;
++	uint64 m_executedCycles = 0;
++	uint64 m_lastRotateCycles = 0;
+ 
+ #ifdef DEBUGGER_INCLUDED
+ 	static const SYSCALL_NAME g_syscallNames[];
+-- 
+2.51.0.windows.1
+

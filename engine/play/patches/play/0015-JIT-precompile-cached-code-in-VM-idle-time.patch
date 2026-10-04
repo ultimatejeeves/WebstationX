@@ -1,0 +1,310 @@
+From 53f99ccde76a314cfec99062fc478078fe7a833b Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 15:19:03 -0400
+Subject: [PATCH 15/43] JIT: precompile cached code in VM idle time
+
+A cache hit still cost V8 a WebAssembly.Module + Instance (~100 us), the hitch left when a session
+first reaches code. The VM thread now instantiates loaded cache entries ahead of use, in first-seen
+order, in time the frame limiter would otherwise sleep and while paused (20 ms slices). Each gets
+its own link slot pair from an arena; the block that later hits the entry adopts the instance and
+points its link slots there (m_wasmLinkSlots is now a pointer). jitCacheSetPrecompile(n) sets how
+many (0 = off); stats report precompiled / adopted counts and time.
+
+THPS4 from a save state with a 14k entry cache, VM paused 1.5 s before boot: all 14,176 entries
+precompiled in 1.2 s, 14,128 adopted; hitches over 50 ms 13 -> 2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/BasicBlock.cpp |  13 +++++-
+ Source/BasicBlock.h   |   6 ++-
+ Source/PS2VM.cpp      |  11 +++++
+ Source/WsxJitCache.h  | 100 +++++++++++++++++++++++++++++++++++++++++-
+ Source/ui_js/Main.cpp |  12 ++++-
+ 5 files changed, 135 insertions(+), 7 deletions(-)
+
+diff --git a/Source/BasicBlock.cpp b/Source/BasicBlock.cpp
+index a3d92d8c..23379745 100644
+--- a/Source/BasicBlock.cpp
++++ b/Source/BasicBlock.cpp
+@@ -117,7 +117,8 @@ void CBasicBlock::Compile()
+ #ifdef __EMSCRIPTEN__
+ 	bool cacheable = !IsEmpty() && IsCompileCacheable() && (m_category != BLOCK_CATEGORY_UNKNOWN);
+ 	WsxJitCache::KEY cacheKey;
+-	const WsxJitCache::ENTRY* cached = nullptr;
++	WsxJitCache::ENTRY* cached = nullptr;
++	m_wasmLinkSlots = m_wasmOwnLinkSlots;
+ 	if(cacheable)
+ 	{
+ 		cacheKey = ComputeCacheKey(m_context, m_begin, m_end, m_category, m_blockCompileHints, GetCompileSalt());
+@@ -129,6 +130,16 @@ void CBasicBlock::Compile()
+ 			{
+ 				m_linkBlockTrampolineOffset[i] = cached->linkOffsets[i];
+ 			}
++			uint32* precompiledSlots = nullptr;
++			if(WsxJitCache::TakePrecompiled(*cached, m_function, precompiledSlots))
++			{
++				m_wasmLinkSlots = precompiledSlots;
++				for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
++				{
++					ResetWasmLinkSlot(static_cast<LINK_SLOT>(i));
++				}
++				return;
++			}
+ 			CMemoryFunction::SetNextWasmLinkBase(reinterpret_cast<uintptr_t>(m_wasmLinkSlots));
+ 			m_function = CMemoryFunction(cached->code, cached->size);
+ 			return;
+diff --git a/Source/BasicBlock.h b/Source/BasicBlock.h
+index b096ebb9..3b178887 100644
+--- a/Source/BasicBlock.h
++++ b/Source/BasicBlock.h
+@@ -145,8 +145,10 @@ private:
+ 	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];
+ 	uint32 m_linkBlockTrampolineOffset[LINK_SLOT_MAX];
+ #ifdef __EMSCRIPTEN__
+-	//Table index of the function each link slot tail calls into (a trampoline when unlinked).
+-	uint32 m_wasmLinkSlots[LINK_SLOT_MAX];
++	//Table index of the function each link slot tail calls into (a trampoline when unlinked). The slots
++	//are the block's own, or the ones a precompiled instance was made with (WsxJitCache::Precompile).
++	uint32 m_wasmOwnLinkSlots[LINK_SLOT_MAX];
++	uint32* m_wasmLinkSlots = m_wasmOwnLinkSlots;
+ 	void ResetWasmLinkSlot(LINK_SLOT);
+ #endif
+ #ifdef _DEBUG
+diff --git a/Source/PS2VM.cpp b/Source/PS2VM.cpp
+index 1abde8c8..a8aa7fdc 100644
+--- a/Source/PS2VM.cpp
++++ b/Source/PS2VM.cpp
+@@ -7,6 +7,9 @@
+ #include "make_unique.h"
+ #include "string_format.h"
+ #include "WsxFrameStats.h"
++#ifdef __EMSCRIPTEN__
++#include "WsxJitCache.h"
++#endif
+ #include "PS2VM.h"
+ #include "PS2VM_Preferences.h"
+ #include "ee/PS2OS.h"
+@@ -917,6 +920,10 @@ void CPS2VM::EmuThread()
+ 	CProfilerZone profilerZone(m_otherProfilerZone);
+ #endif
+ 	static_cast<CEeExecutor*>(m_ee->m_EE.m_executor.get())->AddExceptionHandler();
++#ifdef __EMSCRIPTEN__
++	//Time the limiter would otherwise sleep goes to instantiating cached code ahead of use.
++	m_frameLimiter.SetIdleWork([](double budgetUs) { return WsxJitCache::Precompile(budgetUs); });
++#endif
+ 	m_frameLimiter.BeginFrame();
+ 	while(1)
+ 	{
+@@ -927,6 +934,10 @@ void CPS2VM::EmuThread()
+ 		if(m_nEnd) break;
+ 		if(m_nStatus == PAUSED)
+ 		{
++#ifdef __EMSCRIPTEN__
++			//Paused (menus, loading a state): precompile in short slices so calls still get answered quickly.
++			if(!WsxJitCache::Precompile(20000.0))
++#endif
+ 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+ 		}
+ 		if(m_nStatus == RUNNING)
+diff --git a/Source/WsxJitCache.h b/Source/WsxJitCache.h
+index 4c5f3510..d1488343 100644
+--- a/Source/WsxJitCache.h
++++ b/Source/WsxJitCache.h
+@@ -1,10 +1,14 @@
+ #pragma once
+ 
+ #include <cstring>
++#include <deque>
++#include <memory>
+ #include <mutex>
+ #include <unordered_map>
+ #include <vector>
+ #include "Types.h"
++#include "MemoryFunction.h"
++#include "WsxFrameStats.h"
+ 
+ //Persistent cache of compiled guest code (WebStationX). Compiling a block is mostly the Jitter front end
+ //(~2/3 of the cost) and V8 compiling the resulting wasm module (~1/3). The page keeps what the Jitter
+@@ -12,6 +16,11 @@
+ //skips the Jitter. The key covers everything that shapes a block's code: its instructions, address
+ //range, category, compile hints and the block type's own inputs (CBasicBlock::GetCompileSalt).
+ //
++//A hit still costs V8 a WebAssembly.Module and Instance (~100 us), which is what's left of the hitch when
++//the game reaches code for the first time in a session. So the VM thread also precompiles cached entries
++//ahead of use, in time it would otherwise sleep (frame limiter, pause): each gets its function instance
++//with its own link slots, and the block that later hits the entry adopts both (CBasicBlock::Compile).
++//
+ //Blob format (the page stores and returns it verbatim): entries of
+ //  KEY (16 bytes) | uint32 size | uint32 linkOffsets[2] | size bytes of wasm | padding to 4 bytes
+ namespace WsxJitCache
+@@ -39,6 +48,20 @@ namespace WsxJitCache
+ 		const uint8* code = nullptr;
+ 		uint32 size = 0;
+ 		uint32 linkOffsets[2] = {};
++		bool used = false;       //a block hit this entry (precompiling it is pointless now)
++		int32 precompiled = -1; //index in g_precompiled, while not adopted by a block
++	};
++
++	struct PRECOMPILED
++	{
++		//Built in place (CMemoryFunction has no move constructor), emptied by move assignment.
++		PRECOMPILED(const void* code, uint32 size, uint32* slots)
++		    : function(code, size)
++		    , linkSlots(slots)
++		{
++		}
++		CMemoryFunction function;
++		uint32* linkSlots = nullptr; //what the instance's linkBase points at (in a never freed arena)
+ 	};
+ 
+ 	struct STATS
+@@ -47,6 +70,9 @@ namespace WsxJitCache
+ 		uint32 misses = 0;
+ 		uint32 mismatches = 0; //verify mode: the cached code differs from a fresh compile
+ 		uint32 loaded = 0;
++		uint32 precompiled = 0;    //entries instantiated ahead of use
++		uint32 precompiledHits = 0; //hits that adopted a precompiled instance
++		double precompileMs = 0;
+ 	};
+ 
+ 	//Loaded entries: filled and read on the VM thread only.
+@@ -54,6 +80,16 @@ namespace WsxJitCache
+ 	inline STATS g_stats;
+ 	inline bool g_verify = false;
+ 
++	//Precompiling (VM thread): entries in the order they were first compiled (boot and menus come first),
++	//and the precompiled count to stop at (the page sets how many from the device's preset; 0 = off).
++	inline std::vector<KEY> g_order;
++	inline size_t g_orderPos = 0;
++	inline uint32 g_precompileEnd = 0;
++	inline std::deque<PRECOMPILED> g_precompiled;
++	inline std::unique_ptr<uint32[]> g_linkArena;
++	inline uint32 g_linkArenaUsed = 0;
++	inline uint32 g_linkArenaSize = 0;
++
+ 	//New entries since the page last took them (VM thread appends, main thread takes).
+ 	inline std::vector<uint8> g_pending;
+ 	inline std::mutex g_pendingMutex;
+@@ -66,6 +102,14 @@ namespace WsxJitCache
+ 	//VM thread. The blob must outlive the cache (it's never freed).
+ 	inline void Load(const uint8* blob, uint32 size)
+ 	{
++		//A new game: drop what was precompiled for the previous one and not used, start on this one's entries.
++		for(auto& [key, entry] : g_entries)
++		{
++			if(entry.precompiled < 0) continue;
++			g_precompiled[entry.precompiled].function = CMemoryFunction();
++			entry.precompiled = -1;
++		}
++		g_orderPos = g_order.size();
+ 		uint32 pos = 0;
+ 		while((pos + HEADER_SIZE) <= size)
+ 		{
+@@ -78,17 +122,69 @@ namespace WsxJitCache
+ 			if((pos + entry.size) > size) break;
+ 			entry.code = blob + pos;
+ 			pos += (entry.size + 3) & ~3;
+-			g_entries[key] = entry;
++			if(g_entries.emplace(key, entry).second) g_order.push_back(key);
+ 		}
+ 		g_stats.loaded = static_cast<uint32>(g_entries.size());
+ 	}
+ 
+-	inline const ENTRY* Find(const KEY& key)
++	inline ENTRY* Find(const KEY& key)
+ 	{
+ 		auto it = g_entries.find(key);
+ 		return (it == g_entries.end()) ? nullptr : &it->second;
+ 	}
+ 
++	//Precompile up to `limit` of the entries loaded last.
++	inline void SetPrecompileLimit(uint32 limit)
++	{
++		g_precompileEnd = g_stats.precompiled + limit;
++	}
++
++	//Hands a block the entry's precompiled instance, if there is one. linkSlots receives the slot pair the
++	//instance reads its links from; the caller must reset them to its trampolines.
++	inline bool TakePrecompiled(ENTRY& entry, CMemoryFunction& function, uint32*& linkSlots)
++	{
++		entry.used = true;
++		if(entry.precompiled < 0) return false;
++		auto& precompiled = g_precompiled[entry.precompiled];
++		entry.precompiled = -1;
++		function = std::move(precompiled.function);
++		linkSlots = precompiled.linkSlots;
++		g_stats.precompiledHits++;
++		return true;
++	}
++
++	//Instantiates cached entries until `budgetUs` is spent. Returns false when there is nothing (left) to do.
++	inline bool Precompile(double budgetUs)
++	{
++		if(g_verify) return false;
++		double start = WsxFrameStats::Now();
++		double end = start + (budgetUs / 1000.0);
++		bool worked = false;
++		while((g_orderPos < g_order.size()) && (g_stats.precompiled < g_precompileEnd))
++		{
++			if(worked && (WsxFrameStats::Now() >= end)) break;
++			auto& entry = g_entries[g_order[g_orderPos++]];
++			if(entry.used || (entry.precompiled >= 0)) continue;
++			if(g_linkArenaUsed == g_linkArenaSize)
++			{
++				//Instances keep pointing into an arena, so a full one is never resized, just replaced.
++				g_linkArenaSize = 2 * 4096;
++				g_linkArena.release(); //intentionally leaked: live instances still read it
++				g_linkArena.reset(new uint32[g_linkArenaSize]());
++				g_linkArenaUsed = 0;
++			}
++			uint32* slots = g_linkArena.get() + g_linkArenaUsed;
++			g_linkArenaUsed += 2;
++			CMemoryFunction::SetNextWasmLinkBase(reinterpret_cast<uintptr_t>(slots));
++			entry.precompiled = static_cast<int32>(g_precompiled.size());
++			g_precompiled.emplace_back(entry.code, entry.size, slots);
++			g_stats.precompiled++;
++			worked = true;
++		}
++		if(worked) g_stats.precompileMs += WsxFrameStats::Now() - start;
++		return worked;
++	}
++
+ 	inline void Record(const KEY& key, const void* code, uint32 size, const uint32* linkOffsets)
+ 	{
+ 		std::lock_guard lock(g_pendingMutex);
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 9ebf115e..75956f1d 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -326,11 +326,18 @@ emscripten::val jitCacheTakeNew()
+ std::string jitCacheStats()
+ {
+ 	auto& stats = WsxJitCache::g_stats;
+-	char text[160];
+-	snprintf(text, sizeof(text), "{\"loaded\":%u,\"hits\":%u,\"misses\":%u,\"mismatches\":%u}", stats.loaded, stats.hits, stats.misses, stats.mismatches);
++	char text[256];
++	snprintf(text, sizeof(text), "{\"loaded\":%u,\"hits\":%u,\"misses\":%u,\"mismatches\":%u,\"precompiled\":%u,\"precompiledHits\":%u,\"precompileMs\":%.0f}",
++	         stats.loaded, stats.hits, stats.misses, stats.mismatches, stats.precompiled, stats.precompiledHits, stats.precompileMs);
+ 	return text;
+ }
+ 
++// Instantiate up to maxEntries of the loaded cache ahead of use, in VM idle time (0 = off).
++void jitCacheSetPrecompile(uint32 maxEntries)
++{
++	g_virtualMachine->SendVmCall([maxEntries]() { WsxJitCache::SetPrecompileLimit(maxEntries); });
++}
++
+ // Verify mode: compile anyway and compare with the cached code (counts mismatches).
+ void jitCacheSetVerify(bool verify)
+ {
+@@ -361,6 +368,7 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("jitCacheTakeNew", &jitCacheTakeNew);
+ 	function("jitCacheStats", &jitCacheStats);
+ 	function("jitCacheSetVerify", &jitCacheSetVerify);
++	function("jitCacheSetPrecompile", &jitCacheSetPrecompile);
+ 	function("debugLoseGsContext", &debugLoseGsContext);
+ 	function("pauseVm", &pauseVm);
+ 	function("resumeVm", &resumeVm);
+-- 
+2.51.0.windows.1
+

@@ -1,0 +1,251 @@
+From b8f88c5aa87be4985fae8519de7d352a04f4357b Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 16:02:32 -0400
+Subject: [PATCH 24/43] Debug: GS thread work counters per frame (getGsStats):
+ transfers and how many changed memory, texture and palette uploads, CLUT
+ reads, draws, vertices, texture rebinds, register writes, mailbox calls
+
+---
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp         |  8 ++++++
+ Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp |  5 ++++
+ Source/gs/GSHandler.cpp                     |  9 +++++++
+ Source/gs/WsxGsStats.h                      | 26 ++++++++++++++++++++
+ Source/ui_js/Main.cpp                       | 27 +++++++++++++++++++++
+ 5 files changed, 75 insertions(+)
+ create mode 100644 Source/gs/WsxGsStats.h
+
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 5f05a2f7..7ea3ba9f 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -7,6 +7,7 @@
+ #include "../GsPixelFormats.h"
+ #include "../GsTransferRange.h"
+ #include "GSH_OpenGL.h"
++#include "../WsxGsStats.h"
+ #include <atomic>
+ 
+ // Debug: frames left to trace GS draws/transfers for (set from the page with gsTrace()).
+@@ -1758,6 +1759,8 @@ void CGSH_OpenGL::FlushVertexBuffer()
+ 
+ void CGSH_OpenGL::DoRenderPass()
+ {
++	g_wsxGsStats.draws.fetch_add(1, std::memory_order_relaxed);
++	g_wsxGsStats.verts.fetch_add(m_vertexBuffer.size(), std::memory_order_relaxed);
+ 	if((m_validGlState & GLSTATE_VERTEX_PARAMS) == 0)
+ 	{
+ 		glBindBuffer(GL_UNIFORM_BUFFER, m_vertexParamsBuffer);
+@@ -1776,6 +1779,7 @@ void CGSH_OpenGL::DoRenderPass()
+ 
+ 	if((m_validGlState & GLSTATE_PROGRAM) == 0)
+ 	{
++		g_wsxGsStats.shaderSwitches.fetch_add(1, std::memory_order_relaxed);
+ 		glUseProgram(m_renderState.shaderHandle);
+ 		m_validGlState |= GLSTATE_PROGRAM;
+ 	}
+@@ -1822,6 +1826,7 @@ void CGSH_OpenGL::DoRenderPass()
+ 
+ 	if((m_validGlState & GLSTATE_TEXTURE) == 0)
+ 	{
++		g_wsxGsStats.texSetups.fetch_add(1, std::memory_order_relaxed);
+ 		glActiveTexture(GL_TEXTURE0);
+ 		glBindTexture(GL_TEXTURE_2D, m_renderState.texture0Handle);
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, m_renderState.texture0MinFilter);
+@@ -1842,6 +1847,7 @@ void CGSH_OpenGL::DoRenderPass()
+ 
+ 	if((m_validGlState & GLSTATE_FRAMEBUFFER) == 0)
+ 	{
++		g_wsxGsStats.fbSetups.fetch_add(1, std::memory_order_relaxed);
+ 		glBindFramebuffer(GL_FRAMEBUFFER, m_renderState.framebufferHandle);
+ 		m_validGlState |= GLSTATE_FRAMEBUFFER;
+ 	}
+@@ -2144,8 +2150,10 @@ void CGSH_OpenGL::ProcessHostToLocalTransfer()
+ 		printf("GST h2l bitblt=%llx trxpos=%llx trxreg=%llx dirty=%d\n", (unsigned long long)m_nReg[GS_REG_BITBLTBUF], (unsigned long long)m_nReg[GS_REG_TRXPOS],
+ 		       (unsigned long long)m_nReg[GS_REG_TRXREG], (int)m_trxCtx.nDirty);
+ 	}
++	g_wsxGsStats.transfers.fetch_add(1, std::memory_order_relaxed);
+ 	if(m_trxCtx.nDirty)
+ 	{
++		g_wsxGsStats.transfersDirty.fetch_add(1, std::memory_order_relaxed);
+ 		FlushVertexBuffer();
+ 		m_renderState.isTextureStateValid = false;
+ 		m_renderState.isFramebufferStateValid = false;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+index b315073f..f0df20b5 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+@@ -8,6 +8,7 @@
+ #endif
+ #include "SimdDefs.h"
+ #include "GSH_OpenGL.h"
++#include "../WsxGsStats.h"
+ #include "StdStream.h"
+ #include "bitmap/BMP.h"
+ #include "../GsPixelFormats.h"
+@@ -204,6 +205,7 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
+ 		auto texFormat = GetTextureFormatInfo(tex0.nPsm);
+ 
+ 		{
++			g_wsxGsStats.texMisses.fetch_add(1, std::memory_order_relaxed);
+ 			auto textureHandle = Framework::OpenGl::CTexture::Create();
+ 			glBindTexture(GL_TEXTURE_2D, textureHandle);
+ 			glTexStorage2D(GL_TEXTURE_2D, 1, texFormat.internalFormat, texWidth, texHeight);
+@@ -244,6 +246,8 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
+ 		{
+ 			texHeight = tex0.GetHeight() - texY;
+ 		}
++		g_wsxGsStats.texUploads.fetch_add(1, std::memory_order_relaxed);
++		g_wsxGsStats.texUploadPx.fetch_add(texWidth * texHeight, std::memory_order_relaxed);
+ 		((this)->*(m_textureUpdater[tex0.nPsm]))(tex0.GetBufPtr(), tex0.nBufWidth, texX, texY, texWidth, texHeight);
+ 	}
+ 
+@@ -270,6 +274,7 @@ GLuint CGSH_OpenGL::PreparePalette(const TEX0& tex0)
+ 		return textureHandle;
+ 	}
+ 
++	g_wsxGsStats.palMisses.fetch_add(1, std::memory_order_relaxed);
+ 	glGenTextures(1, &textureHandle);
+ 	glBindTexture(GL_TEXTURE_2D, textureHandle);
+ 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, entryCount, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, convertedClut.data());
+diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
+index 40eab8d5..d7bbf870 100644
+--- a/Source/gs/GSHandler.cpp
++++ b/Source/gs/GSHandler.cpp
+@@ -35,6 +35,9 @@ EM_JS(void, wsx_gs_yield, (uintptr_t fn, void* arg), {
+ #include "../FrameDump.h"
+ #include "../ee/INTC.h"
+ #include "GSHandler.h"
++#include "WsxGsStats.h"
++
++WSX_GS_STATS g_wsxGsStats;
+ #include "GsTransferFast.h"
+ #include "GsPixelFormats.h"
+ #include "string_format.h"
+@@ -633,6 +636,7 @@ void CGSHandler::Flip(uint32 flags)
+ 
+ void CGSHandler::FlipImpl(const DISPLAY_INFO&)
+ {
++	g_wsxGsStats.frames.fetch_add(1, std::memory_order_relaxed);
+ 	OnFlipComplete();
+ 	m_flipped = true;
+ }
+@@ -809,6 +813,7 @@ void CGSHandler::FlushWriteBuffer()
+ 
+ void CGSHandler::WriteRegisterImpl(uint8 nRegister, uint64 nData)
+ {
++	g_wsxGsStats.regWrites.fetch_add(1, std::memory_order_relaxed);
+ 	nRegister &= REGISTER_MAX - 1;
+ 	m_nReg[nRegister] = nData;
+ 	m_regsDirty = true;
+@@ -896,6 +901,7 @@ void CGSHandler::FeedImageDataImpl(const uint8* imageData, uint32 length)
+ 			length = m_trxCtx.nSize;
+ 		}
+ 
++		g_wsxGsStats.transferBytes.fetch_add(length, std::memory_order_relaxed);
+ 		TransferWrite(imageData, length);
+ 		m_trxCtx.nSize -= length;
+ 
+@@ -1485,6 +1491,7 @@ CGSHandler::DISPLAY_INFO CGSHandler::GetCurrentDisplayInfo()
+ void CGSHandler::SyncCLUT(const TEX0& tex0)
+ {
+ 	if(!ProcessCLD(tex0)) return;
++	g_wsxGsStats.clutReads.fetch_add(1, std::memory_order_relaxed);
+ 
+ 	//assert(IsPsmIDTEX(tex0.nPsm));
+ 	switch(tex0.nPsm)
+@@ -2224,6 +2231,7 @@ void CGSHandler::ThreadSlice(void* param)
+ 
+ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitForCompletion, bool forceWaitForCompletion)
+ {
++	g_wsxGsStats.gsCalls.fetch_add(1, std::memory_order_relaxed);
+ 	if(!m_gsThreaded)
+ 	{
+ 		waitForCompletion = false;
+@@ -2241,6 +2249,7 @@ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitFor
+ 
+ void CGSHandler::SendGSCall(CMailBox::FunctionType&& function)
+ {
++	g_wsxGsStats.gsCalls.fetch_add(1, std::memory_order_relaxed);
+ 	m_mailBox.SendCall(std::move(function));
+ }
+ 
+diff --git a/Source/gs/WsxGsStats.h b/Source/gs/WsxGsStats.h
+new file mode 100644
+index 00000000..c8aa9407
+--- /dev/null
++++ b/Source/gs/WsxGsStats.h
+@@ -0,0 +1,26 @@
++#pragma once
++#include <atomic>
++#include "Types.h"
++
++//Debug counters for the GS thread: what a frame costs in transfers, texture and palette uploads, draws
++//and register writes (the bench prints them per frame). Relaxed atomics: written by the GS thread, read by the page.
++struct WSX_GS_STATS
++{
++	std::atomic<uint64> frames = 0;         //Flips
++	std::atomic<uint64> regWrites = 0;      //WriteRegisterImpl calls
++	std::atomic<uint64> gsCalls = 0;        //SendGSCall (mailbox) calls
++	std::atomic<uint64> transfers = 0;      //host->local transfers completed
++	std::atomic<uint64> transfersDirty = 0; //...that changed GS memory
++	std::atomic<uint64> transferBytes = 0;  //image data fed
++	std::atomic<uint64> texMisses = 0;      //GL textures created (cache miss)
++	std::atomic<uint64> texUploads = 0;     //texture updater calls (glTexSubImage2D)
++	std::atomic<uint64> texUploadPx = 0;    //pixels they uploaded
++	std::atomic<uint64> palMisses = 0;      //palette textures created
++	std::atomic<uint64> clutReads = 0;      //CLUT loads into the local CLUT
++	std::atomic<uint64> draws = 0;          //render passes (glDrawArrays + glBufferData)
++	std::atomic<uint64> verts = 0;          //vertices in them
++	std::atomic<uint64> texSetups = 0;      //texture state rebinds (glTexParameteri x9)
++	std::atomic<uint64> fbSetups = 0;       //framebuffer rebinds
++	std::atomic<uint64> shaderSwitches = 0; //glUseProgram
++};
++extern WSX_GS_STATS g_wsxGsStats;
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 72e05240..3ad9326b 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -502,6 +502,32 @@ void setVpu1ThreadMode(int mode)
+ 	CVpu1Thread::g_mode = static_cast<uint32>(mode);
+ }
+ 
++#include "../gs/WsxGsStats.h"
++// Debug: GS thread work counters since boot (see WsxGsStats.h); the bench divides them by frames.
++std::string getGsStats()
++{
++	auto& s = g_wsxGsStats;
++	char text[1024];
++	snprintf(text, sizeof(text), "{\"frames\":%llu,\"regWrites\":%llu,\"gsCalls\":%llu,\"transfers\":%llu,\"transfersDirty\":%llu,\"transferBytes\":%llu,\"texMisses\":%llu,\"texUploads\":%llu,\"texUploadPx\":%llu,\"palMisses\":%llu,\"clutReads\":%llu,\"draws\":%llu,\"verts\":%llu,\"texSetups\":%llu,\"fbSetups\":%llu,\"shaderSwitches\":%llu}",
++	         (unsigned long long)s.frames.load(),
++	         (unsigned long long)s.regWrites.load(),
++	         (unsigned long long)s.gsCalls.load(),
++	         (unsigned long long)s.transfers.load(),
++	         (unsigned long long)s.transfersDirty.load(),
++	         (unsigned long long)s.transferBytes.load(),
++	         (unsigned long long)s.texMisses.load(),
++	         (unsigned long long)s.texUploads.load(),
++	         (unsigned long long)s.texUploadPx.load(),
++	         (unsigned long long)s.palMisses.load(),
++	         (unsigned long long)s.clutReads.load(),
++	         (unsigned long long)s.draws.load(),
++	         (unsigned long long)s.verts.load(),
++	         (unsigned long long)s.texSetups.load(),
++	         (unsigned long long)s.fbSetups.load(),
++	         (unsigned long long)s.shaderSwitches.load());
++	return text;
++}
++
+ std::string getVpu1Stats()
+ {
+ 	auto& stats = CVpu1Thread::g_stats;
+@@ -546,6 +572,7 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("getVpu1ZoneAddress", &getVpu1ZoneAddress);
+ 	function("setVpu1ThreadMode", &setVpu1ThreadMode);
+ 	function("getVpu1Stats", &getVpu1Stats);
++	function("getGsStats", &getGsStats);
+ 	function("debugRequestEeBlockDump", &debugRequestEeBlockDump);
+ 	function("debugTakeEeBlockDump", &debugTakeEeBlockDump);
+ 	function("debugSetLocalsAsRegisters", &debugSetLocalsAsRegisters);
+-- 
+2.51.0.windows.1
+

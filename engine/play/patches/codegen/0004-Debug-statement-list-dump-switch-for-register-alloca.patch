@@ -1,0 +1,84 @@
+From 655fe9651f3c261ed7805ed895b55262e3e17184 Mon Sep 17 00:00:00 2001
+From: wsx <wsx@localhost>
+Date: Wed, 30 Sep 2026 00:05:42 -0400
+Subject: [PATCH 4/6] Debug: statement list dump; switch for register
+ allocation onto wasm locals
+
+---
+ include/Jitter.h              | 3 +++
+ include/Jitter_CodeGen_Wasm.h | 3 +++
+ src/Jitter_CodeGen_Wasm.cpp   | 2 +-
+ src/Jitter_Optimize.cpp       | 9 +++++++++
+ 4 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/include/Jitter.h b/include/Jitter.h
+index 38733c1..cf9f7a3 100644
+--- a/include/Jitter.h
++++ b/include/Jitter.h
+@@ -22,6 +22,9 @@
+ namespace Jitter
+ {
+ 
++	//Debug: when set, the next Compile on this thread writes its final statement list here and clears it.
++	inline thread_local std::string* g_statementDump = nullptr;
++
+ 	class CJitter
+ 	{
+ 	public:
+diff --git a/include/Jitter_CodeGen_Wasm.h b/include/Jitter_CodeGen_Wasm.h
+index adde5e2..b112068 100644
+--- a/include/Jitter_CodeGen_Wasm.h
++++ b/include/Jitter_CodeGen_Wasm.h
+@@ -28,6 +28,9 @@ namespace Jitter
+ 		static std::map<uintptr_t, WASM_FUNCTION_INFO> m_functions;
+ 	};
+ 
++	//Debug: register allocation onto locals (UsesLocalsAsRegisters), for A/B measurements.
++	inline bool g_wasmLocalsAsRegisters = true;
++
+ 	class CCodeGen_Wasm : public CCodeGen
+ 	{
+ 	public:
+diff --git a/src/Jitter_CodeGen_Wasm.cpp b/src/Jitter_CodeGen_Wasm.cpp
+index 03edb42..cfc5e57 100644
+--- a/src/Jitter_CodeGen_Wasm.cpp
++++ b/src/Jitter_CodeGen_Wasm.cpp
+@@ -398,7 +398,7 @@ bool CCodeGen_Wasm::SupportsCmpSelect() const
+ 
+ bool CCodeGen_Wasm::UsesLocalsAsRegisters() const
+ {
+-	return true;
++	return g_wasmLocalsAsRegisters;
+ }
+ 
+ uint32 CCodeGen_Wasm::GetPointerSize() const
+diff --git a/src/Jitter_Optimize.cpp b/src/Jitter_Optimize.cpp
+index 3c33fae..79c66fb 100644
+--- a/src/Jitter_Optimize.cpp
++++ b/src/Jitter_Optimize.cpp
+@@ -1,6 +1,7 @@
+ #include <assert.h>
+ #include <vector>
+ #include <algorithm>
++#include <sstream>
+ #include "Jitter.h"
+ #include "BitManip.h"
+ 
+@@ -209,6 +210,14 @@ void CJitter::Compile()
+ 	std::cout << std::endl;
+ #endif
+ 
++	if(g_statementDump)
++	{
++		std::ostringstream dump;
++		DumpStatementList(dump, result.statements);
++		*g_statementDump = dump.str();
++		g_statementDump = nullptr;
++	}
++
+ 	m_codeGen->GenerateCode(result.statements, stackSize);
+ 
+ 	m_labels.clear();
+-- 
+2.51.0.windows.1
+

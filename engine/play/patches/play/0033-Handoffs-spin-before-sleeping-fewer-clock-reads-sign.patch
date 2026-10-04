@@ -1,0 +1,1429 @@
+From 3ddf936fbe1a33337d24bda7a6bcf209c2553024 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 13:08:15 -0400
+Subject: [PATCH 33/43] Handoffs: spin before sleeping, fewer clock reads,
+ signal only waiting receivers; VU1: skip MAC/sticky flags nothing reads; SW
+ raster: row tables, lazy texel decode; catch-up at frame end only
+
+---
+ Source/FrameLimiter.cpp             |   2 +-
+ Source/MailBox.cpp                  |  12 +-
+ Source/MailBox.h                    |   2 +
+ Source/PS2VM.cpp                    |  17 +-
+ Source/ee/VUShared.cpp              |   7 +-
+ Source/ee/VUShared.h                |   2 +
+ Source/ee/Vpu1Thread.cpp            |  55 +++-
+ Source/ee/Vpu1Thread.h              |  13 +-
+ Source/ee/VuExecutor.cpp            |  63 +++-
+ Source/ee/VuExecutor.h              |  17 ++
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp |  16 +-
+ Source/gs/GSH_OpenGL/GSH_OpenGL.h   |   1 +
+ Source/gs/GSHandler.cpp             |   7 +-
+ Source/gs/GsSwRaster.h              | 457 +++++++++++++++++-----------
+ Source/gs/WsxGsStats.h              |   3 +-
+ Source/ui_js/Main.cpp               |  65 +++-
+ 16 files changed, 523 insertions(+), 216 deletions(-)
+
+diff --git a/Source/FrameLimiter.cpp b/Source/FrameLimiter.cpp
+index f767ba09..486c0be5 100644
+--- a/Source/FrameLimiter.cpp
++++ b/Source/FrameLimiter.cpp
+@@ -83,7 +83,7 @@ void CFrameLimiter::EndFrame()
+ 		//A real hitch (work, compilation or an oversleep) must not become several
+ 		//unthrottled catch-up frames. Rebase after the late frame, including late
+ 		//wakeups inside the loop. Keep sub-ms timer noise on the running cadence.
+-		if((now - m_nextDeadline) > std::chrono::milliseconds(1)) m_nextDeadline = now;
++		if((now - m_nextDeadline) > std::chrono::milliseconds(3)) m_nextDeadline = now;
+ 		//Decay slowly (halves in ~45 s): a machine whose timer got finer goes back to sleeping.
+ 		m_sleepSlack -= m_sleepSlack / 4096;
+ 	}
+diff --git a/Source/MailBox.cpp b/Source/MailBox.cpp
+index b9c9498b..65f659c3 100644
+--- a/Source/MailBox.cpp
++++ b/Source/MailBox.cpp
+@@ -8,17 +8,21 @@ bool CMailBox::IsPending() const
+ void CMailBox::WaitForCall()
+ {
+ 	std::unique_lock callLock(m_callMutex);
++	m_receiverWaiting = true;
+ 	while(!IsPending())
+ 	{
+ 		m_waitCondition.wait(callLock);
+ 	}
++	m_receiverWaiting = false;
+ }
+ 
+ void CMailBox::WaitForCall(unsigned int timeOut)
+ {
+ 	std::unique_lock callLock(m_callMutex);
+ 	if(IsPending()) return;
++	m_receiverWaiting = true;
+ 	m_waitCondition.wait_for(callLock, std::chrono::milliseconds(timeOut));
++	m_receiverWaiting = false;
+ }
+ 
+ void CMailBox::FlushCalls()
+@@ -29,6 +33,7 @@ void CMailBox::FlushCalls()
+ void CMailBox::SendCall(const FunctionType& function, bool waitForCompletion)
+ {
+ 	std::future<void> future;
++	bool receiverWaiting = false;
+ 
+ 	{
+ 		MESSAGE message;
+@@ -42,9 +47,10 @@ void CMailBox::SendCall(const FunctionType& function, bool waitForCompletion)
+ 
+ 		std::lock_guard callLock(m_callMutex);
+ 		m_calls.push_back(std::move(message));
++		receiverWaiting = m_receiverWaiting;
+ 	}
+ 
+-	m_waitCondition.notify_all();
++	if(receiverWaiting) m_waitCondition.notify_all();
+ 
+ 	if(waitForCompletion)
+ 	{
+@@ -54,15 +60,17 @@ void CMailBox::SendCall(const FunctionType& function, bool waitForCompletion)
+ 
+ void CMailBox::SendCall(FunctionType&& function)
+ {
++	bool receiverWaiting = false;
+ 	{
+ 		MESSAGE message;
+ 		message.function = std::move(function);
+ 
+ 		std::lock_guard callLock(m_callMutex);
+ 		m_calls.push_back(std::move(message));
++		receiverWaiting = m_receiverWaiting;
+ 	}
+ 
+-	m_waitCondition.notify_all();
++	if(receiverWaiting) m_waitCondition.notify_all();
+ }
+ 
+ void CMailBox::ReceiveCall()
+diff --git a/Source/MailBox.h b/Source/MailBox.h
+index 7c2057f0..5a295f9a 100644
+--- a/Source/MailBox.h
++++ b/Source/MailBox.h
+@@ -42,4 +42,6 @@ private:
+ 	FunctionCallQueue m_calls;
+ 	std::mutex m_callMutex;
+ 	std::condition_variable m_waitCondition;
++	//Under m_callMutex: the receiver is in WaitForCall
++	bool m_receiverWaiting = false;
+ };
+diff --git a/Source/PS2VM.cpp b/Source/PS2VM.cpp
+index d3bcbef4..911b071a 100644
+--- a/Source/PS2VM.cpp
++++ b/Source/PS2VM.cpp
+@@ -255,8 +255,10 @@ void CPS2VM::SetCatchUp(bool enabled)
+ //as run without running them, which to the game is what a slower EE (or a busy vector unit) would be. It
+ //misses vblanks and skips frames at full speed, with sound, timers and the IOP in real time. Bounded:
+ //time spent waiting counts in full, and on top of that at most CATCHUP_MAX_RATIO cycles per cycle run.
+-//Nothing is skipped while the emulation is on schedule, so a machine with headroom emulates exactly what
+-//it did before; there is no schedule without the frame limiter (benchmarks, determinism checks).
++//Nothing is skipped before a frame is overdue (its deadline passed and the vblank hasn't come), and what
++//is skipped then is the end of the frame, where a game that finished its work waits for the vblank: a
++//machine with headroom emulates exactly what it did before. There is no deadline without the frame
++//limiter (benchmarks, determinism checks).
+ int CPS2VM::TakeCatchUpTicks(int executed)
+ {
+ 	uint64 waitUs = WsxFrameStats::g_vpu1WaitUs.load(std::memory_order_relaxed) + WsxFrameStats::g_eeGsWaitUs.load(std::memory_order_relaxed);
+@@ -273,11 +275,11 @@ int CPS2VM::TakeCatchUpTicks(int executed)
+ 	m_catchUpCredit += static_cast<int64>((std::min<uint64>(waitedUs, 50000) * eeFreqScaled) / 1000000);
+ 	m_catchUpCredit = std::min(m_catchUpCredit, frameTicks);
+ 	//The clock is read every few slices (a slice is ~16 microseconds of emulated time)
+-	if((waitedUs == 0) && ((++m_catchUpSlice & 3) != 0)) return 0;
++	if((++m_catchUpSlice & 7) != 0) return 0;
+ 
+ 	int64 remaining = m_inVblank ? (static_cast<int64>(m_vblankTicks) + m_onScreenTicksTotal) : static_cast<int64>(m_vblankTicks);
+ 	double fraction = 1.0 - (static_cast<double>(remaining) / static_cast<double>(frameTicks));
+-	double lateUs = m_frameLimiter.GetLatenessUs(fraction);
++	double lateUs = m_frameLimiter.GetLatenessUs(1.0);
+ 	if(lateUs > 100000.0)
+ 	{
+ 		//Not something to play back (the tab was suspended, a long compile or disc stall)
+@@ -285,9 +287,10 @@ int CPS2VM::TakeCatchUpTicks(int executed)
+ 		m_catchUpCredit = 0;
+ 		return 0;
+ 	}
+-	if(lateUs < 250.0) return 0;
+-	int64 lateTicks = static_cast<int64>(lateUs * static_cast<double>(eeFreqScaled) / 1000000.0);
+-	int64 skipped = std::min(lateTicks, m_catchUpCredit);
++	//(remaining isn't positive when the vblank is due: the main loop takes it once this slice returns)
++	if((lateUs <= 0) || (remaining <= 0)) return 0;
++	//Overdue: get to the vblank as fast as the bound allows
++	int64 skipped = std::max<int64>(std::min(remaining, m_catchUpCredit), 0);
+ 	m_catchUpCredit -= skipped;
+ 	return static_cast<int>(skipped);
+ }
+diff --git a/Source/ee/VUShared.cpp b/Source/ee/VUShared.cpp
+index 52360ebf..e9c6a061 100644
+--- a/Source/ee/VUShared.cpp
++++ b/Source/ee/VUShared.cpp
+@@ -254,6 +254,10 @@ void VUShared::MakeComparableFromFloat(CMipsJitter* codeGen)
+ 
+ void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, uint32 relativePipeTime, uint32 compileHints)
+ {
++	bool skipMac = (compileHints & COMPILEHINT_SKIP_FMAC_UPDATE) != 0;
++	bool skipSticky = (compileHints & COMPILEHINT_SKIP_STICKY_UPDATE) != 0;
++	if(skipMac && skipSticky) return;
++
+ 	codeGen->MD_PushRel(regOffset);
+ 	codeGen->MD_MakeSignZero();
+ 
+@@ -265,6 +269,7 @@ void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, u
+ 	}
+ 
+ 	//Update sticky flags
++	if(!skipSticky)
+ 	{
+ 		codeGen->PushTop();
+ 
+@@ -285,7 +290,7 @@ void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, u
+ 		QueueInFlagPipeline(g_pipeInfoSticky, codeGen, LATENCY_MAC, relativePipeTime);
+ 	}
+ 
+-	if((compileHints & COMPILEHINT_SKIP_FMAC_UPDATE) == 0)
++	if(!skipMac)
+ 	{
+ 		QueueInFlagPipeline(g_pipeInfoMac, codeGen, LATENCY_MAC, relativePipeTime);
+ 	}
+diff --git a/Source/ee/VUShared.h b/Source/ee/VUShared.h
+index a2991f10..314d0c61 100644
+--- a/Source/ee/VUShared.h
++++ b/Source/ee/VUShared.h
+@@ -98,6 +98,8 @@ namespace VUShared
+ 		COMPILEHINT_SKIP_FMAC_UPDATE = (1 << 0),
+ 		COMPILEHINT_USE_ACCURATE_ADDI = (1 << 1), //For decompression in Tri-Ace games
+ 		COMPILEHINT_NO_CLAMPING = (1 << 2),
++		//Nothing in micro memory reads the status flags (see CVuExecutor::UpdateFlagUse)
++		COMPILEHINT_SKIP_STICKY_UPDATE = (1 << 3),
+ 	};
+ 
+ 	static bool UseClamping(uint32 compileHints)
+diff --git a/Source/ee/Vpu1Thread.cpp b/Source/ee/Vpu1Thread.cpp
+index b1540598..d78b0f2b 100644
+--- a/Source/ee/Vpu1Thread.cpp
++++ b/Source/ee/Vpu1Thread.cpp
+@@ -201,7 +201,7 @@ void CVpu1Thread::Publish(CRing& ring, RECORD* record)
+ 	if(m_parked.load(std::memory_order_seq_cst))
+ 	{
+ 		std::lock_guard lock(m_mutex);
+-		m_workCondition.notify_all();
++		if(m_sleeping) m_workCondition.notify_all();
+ 	}
+ }
+ 
+@@ -308,9 +308,11 @@ void CVpu1Thread::SendVBlank(std::function<void()> finish)
+ 		std::unique_lock lock(m_mutex);
+ 		uint64 target = m_vblanksSent.load() - MAX_VBLANKS_BEHIND + 1;
+ 		double start = WsxFrameStats::Now();
++		m_waitingForIdle = true;
+ 		m_idleCondition.wait(lock, [&]() {
+ 			return (m_vblanksDone.load() >= target) || IsQuiescent();
+ 		});
++		m_waitingForIdle = false;
+ 		g_stats.vblankWaitUs += static_cast<uint64>((WsxFrameStats::Now() - start) * 1000.0);
+ 	}
+ 	RECORD* record = nullptr;
+@@ -325,12 +327,22 @@ void CVpu1Thread::SendVBlank(std::function<void()> finish)
+ 	AfterSend();
+ }
+ 
+-//Caller holds m_mutex.
++//The thread did everything it was sent, or went to wait for the EE having seen everything the EE sent and
++//kicked (what it parked at is written before the parked flag).
+ bool CVpu1Thread::IsQuiescent() const
+ {
+ 	uint64 sent = m_sent.load();
+ 	if(m_completed.load() == sent) return true;
+-	return m_parked.load() && (m_parkedSent == sent) && (m_parkedKicks == m_kicks.load());
++	return m_parked.load() && (m_parkedSent.load() == sent) && (m_parkedKicks.load() == m_kicks.load());
++}
++
++void CVpu1Thread::SpinPause()
++{
++#ifdef __EMSCRIPTEN__
++	//No pause instruction in WebAssembly: a few loads another thread can't see through
++	static std::atomic<uint32> g_sink = 0;
++	(void)g_sink.load(std::memory_order_relaxed);
++#endif
+ }
+ 
+ void CVpu1Thread::Drain(DRAIN_REASON reason)
+@@ -342,23 +354,31 @@ void CVpu1Thread::Drain(DRAIN_REASON reason)
+ 	//The previous drain already acquired the worker's writes; don't spin, lock or read clocks again.
+ 	if((sent == m_drainedSent) && (kicks == m_drainedKicks)) return;
+ 	if(m_completed.load(std::memory_order_acquire) == m_sent.load(std::memory_order_relaxed)) return;
+-	WsxFrameStats::CScope waitScope(WsxFrameStats::g_vpu1WaitUs);
+ 	WsxProfile::CZone zone(WsxProfile::ZONE_WAIT);
+ 	double start = WsxFrameStats::Now();
+-	//Short waits are the common case: spin a little before sleeping.
+-	for(unsigned int i = 0; i < 2000; i++)
++	//Short waits are the common case: look for the thread to finish before sleeping.
++	bool quiescent = false;
++	//(Longer than the thread does: a batch of drawing takes it 100-200 microseconds, and the EE has nothing else to do.)
++	for(uint32 i = 0, spinCount = g_spinCount.load(std::memory_order_relaxed) * 10; i < spinCount; i++)
+ 	{
+-		if(m_completed.load(std::memory_order_acquire) == m_sent.load(std::memory_order_relaxed)) break;
+-		if(m_parked.load() && (i > 100)) break;
++		if(IsQuiescent())
++		{
++			quiescent = true;
++			break;
++		}
++		SpinPause();
+ 	}
+-
++	if(!quiescent)
+ 	{
+ 		std::unique_lock lock(m_mutex);
++		m_waitingForIdle = true;
+ 		m_idleCondition.wait(lock, [&]() { return IsQuiescent(); });
++		m_waitingForIdle = false;
+ 	}
+ 	m_drainedSent = sent;
+ 	m_drainedKicks = kicks;
+ 	uint64 waitedUs = static_cast<uint64>((WsxFrameStats::Now() - start) * 1000.0);
++	WsxFrameStats::g_vpu1WaitUs += waitedUs;
+ 	g_stats.drains++;
+ 	g_stats.drainWaitUs += waitedUs;
+ 	g_stats.waitsByReason[reason]++;
+@@ -486,11 +506,24 @@ void CVpu1Thread::ThreadProc()
+ 		m_parkedSent = sent;
+ 		m_parkedKicks = kicks;
+ 		m_parked.store(true, std::memory_order_seq_cst);
+-		m_idleCondition.notify_all();
++		if(m_waitingForIdle) m_idleCondition.notify_all();
++		//The EE usually answers a stall (an interrupt to serve, more data) within a few tens of microseconds
++		if(uint32 spinCount = g_spinCount.load(std::memory_order_relaxed); spinCount != 0)
++		{
++			lock.unlock();
++			for(uint32 i = 0; i < spinCount; i++)
++			{
++				if((m_sent.load(std::memory_order_seq_cst) != sent) || (m_kicks.load() != kicks)) break;
++				SpinPause();
++			}
++			lock.lock();
++		}
++		m_sleeping = true;
+ 		m_workCondition.wait(lock, [&]() {
+ 			return m_quit || m_discard || (m_syncCall && !m_syncCallDone) ||
+-			       (m_sent.load(std::memory_order_seq_cst) != m_parkedSent) || (m_kicks.load() != m_parkedKicks);
++			       (m_sent.load(std::memory_order_seq_cst) != m_parkedSent.load()) || (m_kicks.load() != m_parkedKicks.load());
+ 		});
++		m_sleeping = false;
+ 		m_parked.store(false);
+ 	}
+ }
+diff --git a/Source/ee/Vpu1Thread.h b/Source/ee/Vpu1Thread.h
+index 49bd4bcf..2de45f29 100644
+--- a/Source/ee/Vpu1Thread.h
++++ b/Source/ee/Vpu1Thread.h
+@@ -77,6 +77,11 @@ public:
+ 
+ 	static inline VPU1_THREAD_STATS g_stats;
+ 
++	//Both sides of a hand-over look for the other's answer this many times before sleeping (a sleeping
++	//thread takes tens of microseconds to wake up, and some games hand over hundreds of times a frame:
++	//ATV Offroad Fury 2 stalls VIF1 on an interrupt before every batch of textures). 0: sleep at once.
++	static inline std::atomic<uint32> g_spinCount = 30000;
++
+ 	typedef std::function<void(uint32)> InterruptHandler;
+ 
+ 	CVpu1Thread(CVpu&, CGIF&, uint8* ram, uint8* spr);
+@@ -149,6 +154,7 @@ private:
+ 	void Publish(CRing&, RECORD*);
+ 	void AfterSend();
+ 	bool IsQuiescent() const;
++	static void SpinPause();
+ 	void DeliverInterrupts();
+ 
+ 	CVpu& m_vpu1;
+@@ -177,8 +183,11 @@ private:
+ 	std::condition_variable m_workCondition; //thread waits for work or a kick
+ 	std::condition_variable m_idleCondition; //EE waits for the thread
+ 	std::atomic<bool> m_parked = false;
+-	uint64 m_parkedSent = 0;
+-	uint64 m_parkedKicks = 0;
++	//Under m_mutex: the thread is in its condition wait (not spinning), the EE in Drain's
++	bool m_sleeping = false;
++	bool m_waitingForIdle = false;
++	std::atomic<uint64> m_parkedSent = 0;
++	std::atomic<uint64> m_parkedKicks = 0;
+ 	std::atomic<uint64> m_kicks = 0;
+ 	std::function<void()> m_syncCall;
+ 	bool m_syncCallDone = false;
+diff --git a/Source/ee/VuExecutor.cpp b/Source/ee/VuExecutor.cpp
+index 69ea310e..48fb3b1c 100644
+--- a/Source/ee/VuExecutor.cpp
++++ b/Source/ee/VuExecutor.cpp
+@@ -2,6 +2,7 @@
+ #include "VuBasicBlock.h"
+ #include "VUShared.h"
+ #include "xxhash.h"
++#include "../Ps2Const.h"
+ 
+ // clang-format off
+ const CVuExecutor::BLOCK_COMPILE_HINTS CVuExecutor::g_blockCompileHints[] =
+@@ -13,9 +14,55 @@ const CVuExecutor::BLOCK_COMPILE_HINTS CVuExecutor::g_blockCompileHints[] =
+ 
+ CVuExecutor::CVuExecutor(CMIPS& context, uint32 maxAddress)
+     : CGenericMipsExecutor(context, maxAddress, BLOCK_CATEGORY_PS2_VU)
++    , m_flagAnalysis(maxAddress == PS2::MICROMEM1SIZE)
+ {
+ }
+ 
++int CVuExecutor::Execute(int cycles)
++{
++	//Micro memory is only written while the VU is stopped: look at what it holds before running it again
++	if(m_flagUseDirty) UpdateFlagUse();
++	return CGenericMipsExecutor::Execute(cycles);
++}
++
++void CVuExecutor::ClearActiveBlocksInRange(uint32 start, uint32 end, bool executing)
++{
++	m_flagUseDirty = true;
++	CGenericMipsExecutor::ClearActiveBlocksInRange(start, end, executing);
++}
++
++void CVuExecutor::UpdateFlagUse()
++{
++	m_flagUseDirty = false;
++	if(!m_flagAnalysis) return;
++	uint32 flagUse = 0;
++	for(uint32 address = 0; address < m_maxAddress; address += 8)
++	{
++		uint32 lowerOp = m_context.m_pMemoryMap->GetInstruction(address);
++		//Data and unused memory count too: anything that decodes as a flag read keeps the flags
++		switch(lowerOp >> 25)
++		{
++		case 0x14: //FSEQ
++		case 0x16: //FSAND
++		case 0x17: //FSOR
++			//The status register's current bits come from the MAC flags
++			flagUse |= FLAG_USE_STICKY | FLAG_USE_MAC;
++			break;
++		case 0x18: //FMEQ
++		case 0x1A: //FMAND
++		case 0x1B: //FMOR
++			flagUse |= FLAG_USE_MAC;
++			break;
++		}
++	}
++	if((flagUse & ~m_flagUse) != 0)
++	{
++		//Blocks compiled when nothing read these flags don't compute them
++		ClearActiveBlocksInRangeInternal(0, m_maxAddress, nullptr);
++	}
++	m_flagUse = flagUse;
++}
++
+ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
+ {
+ 	m_blockNoClamping = std::move(blockNoClamping);
+@@ -42,6 +89,8 @@ void CVuExecutor::Reset()
+ 		m_cachedBlocks.clear();
+ 	}
+ 	m_blockNoClamping.clear();
++	m_flagUseDirty = true;
++	m_flagUse = FLAG_USE_ALL;
+ 	CGenericMipsExecutor::Reset();
+ }
+ 
+@@ -60,13 +109,17 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+ 	memcpy(&hash, &xxHash, sizeof(xxHash));
+ 	static_assert(sizeof(hash) == sizeof(xxHash));
+ 	auto blockKey = std::make_pair(hash, blockSizeByte);
++	//Compiled blocks are kept per flag use: the same code computes more or fewer flags
++	if(m_flagUseDirty) UpdateFlagUse();
++	uint32 flagUse = m_flagAnalysis ? m_flagUse : FLAG_USE_ALL;
++	auto cacheKey = std::make_pair(hash, blockSizeByte | (flagUse << 28));
+ 
+ 	//Don't use the cached blocks of we have a breakpoint in our block range.
+ 	bool hasBreakpoint = m_context.HasBreakpointInRange(begin, end);
+ 	if(!hasBreakpoint)
+ 	{
+-		auto beginBlockIterator = m_cachedBlocks.lower_bound(blockKey);
+-		auto endBlockIterator = m_cachedBlocks.upper_bound(blockKey);
++		auto beginBlockIterator = m_cachedBlocks.lower_bound(cacheKey);
++		auto endBlockIterator = m_cachedBlocks.upper_bound(cacheKey);
+ 		//Check if we have a block that has the same contents and the same range.
+ 		for(auto blockIterator = beginBlockIterator; blockIterator != endBlockIterator; blockIterator++)
+ 		{
+@@ -81,7 +134,7 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+ 		{
+ 			auto result = std::make_shared<CVuBasicBlock>(context, begin, end, m_blockCategory);
+ 			result->CopyFunctionFrom(beginBlockIterator->second);
+-			m_cachedBlocks.insert(std::make_pair(blockKey, result));
++			m_cachedBlocks.insert(std::make_pair(cacheKey, result));
+ 			return result;
+ 		}
+ 	}
+@@ -101,10 +154,12 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+ 		result->AddBlockCompileHints(VUShared::COMPILEHINT_NO_CLAMPING);
+ 	}
+ 
++	if((flagUse & FLAG_USE_MAC) == 0) result->AddBlockCompileHints(VUShared::COMPILEHINT_SKIP_FMAC_UPDATE);
++	if((flagUse & FLAG_USE_STICKY) == 0) result->AddBlockCompileHints(VUShared::COMPILEHINT_SKIP_STICKY_UPDATE);
+ 	result->Compile();
+ 	if(!hasBreakpoint)
+ 	{
+-		m_cachedBlocks.insert(std::make_pair(blockKey, result));
++		m_cachedBlocks.insert(std::make_pair(cacheKey, result));
+ 	}
+ 	return result;
+ }
+diff --git a/Source/ee/VuExecutor.h b/Source/ee/VuExecutor.h
+index 34531347..f11ffafa 100644
+--- a/Source/ee/VuExecutor.h
++++ b/Source/ee/VuExecutor.h
+@@ -15,6 +15,8 @@ public:
+ 	void SetBlockNoClamping(BlockNoClampingSet);
+ 
+ 	void Reset() override;
++	int Execute(int) override;
++	void ClearActiveBlocksInRange(uint32, uint32, bool) override;
+ 
+ 	//Rebooting the same game: keep compiled blocks (compiling is the slow part of warming up on WebAssembly).
+ 	static void SetKeepCachedBlocksOnReset(bool);
+@@ -36,4 +38,19 @@ protected:
+ 	static bool m_keepCachedBlocksOnReset;
+ 
+ 	BlockNoClampingSet m_blockNoClamping;
++
++	//Which flags the code in micro memory can read (VU1 only: the EE reads VU0's through COP2).
++	//Every FMAC instruction otherwise computes the sign and zero bits of its result and queues them in the
++	//MAC and sticky status pipelines, which is most of what a vertex loop compiles to, and most
++	//microprograms never look at them (clipping uses the clip flags).
++	enum FLAG_USE : uint32
++	{
++		FLAG_USE_MAC = 1,
++		FLAG_USE_STICKY = 2,
++		FLAG_USE_ALL = 3,
++	};
++	void UpdateFlagUse();
++	bool m_flagAnalysis = false;
++	bool m_flagUseDirty = true;
++	uint32 m_flagUse = FLAG_USE_ALL;
+ };
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index d0880428..195780af 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -165,10 +165,20 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 
+ 	SwFlushDirty();
+ 	m_swFlipCount++;
+-	if(dispInfo.layers[0].enabled && (dispInfo.layers[0].bufPtr != m_swLastDisplayedPtr))
+ 	{
+-		m_swLastDisplayedPtr = dispInfo.layers[0].bufPtr;
+-		g_wsxGsStats.newFrames.fetch_add(1, std::memory_order_relaxed);
++		//A frame of the game: something was drawn since the last flip
++		uint64 draws = g_wsxGsStats.draws.load(std::memory_order_relaxed);
++		if(draws != m_swLastFlipDraws)
++		{
++			m_swLastFlipDraws = draws;
++			g_wsxGsStats.newFrames.fetch_add(1, std::memory_order_relaxed);
++		}
++		//Or, for games that flip between buffers: another buffer than at the last flip
++		if(dispInfo.layers[0].enabled && (dispInfo.layers[0].bufPtr != m_swLastDisplayedPtr))
++		{
++			m_swLastDisplayedPtr = dispInfo.layers[0].bufPtr;
++			g_wsxGsStats.bufferFlips.fetch_add(1, std::memory_order_relaxed);
++		}
+ 	}
+ 	for(const auto& layer : dispInfo.layers)
+ 	{
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index c3030059..8190f8f8 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -489,6 +489,7 @@ private:
+ 	std::vector<SWCOPY> m_swCopies; //Recent copies out of our buffers into GS memory
+ 	uint32 m_swFlipCount = 0;
+ 	uint32 m_swLastFbPtr = ~0U;
++	uint64 m_swLastFlipDraws = 0;
+ 	uint32 m_swLastDisplayedPtr = ~0U;
+ 	bool m_swDirtyPending = false;
+ 
+diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
+index d7bbf870..f190a53d 100644
+--- a/Source/gs/GSHandler.cpp
++++ b/Source/gs/GSHandler.cpp
+@@ -2209,17 +2209,22 @@ void CGSHandler::ThreadSlice(void* param)
+ 	auto self = reinterpret_cast<CGSHandler*>(param);
+ 	double start = WsxFrameStats::Now();
+ 	uint32 presents = WsxFrameStats::g_state.gsCount.load();
++	uint32 turns = 0;
+ 	while(!self->m_threadDone)
+ 	{
++		bool waited = false;
++		if(!self->m_mailBox.IsPending())
+ 		{
+ 			WsxFrameStats::CScope idleScope(WsxFrameStats::g_gsIdleUs);
+ 			self->m_mailBox.WaitForCall(10);
++			waited = true;
+ 		}
+ 		while(self->m_mailBox.IsPending())
+ 		{
+ 			self->m_mailBox.ReceiveCall();
+ 		}
+-		if((WsxFrameStats::g_state.gsCount.load() != presents) || ((WsxFrameStats::Now() - start) > 50.0))
++		bool checkClock = waited || ((++turns & 0x3F) == 0);
++		if((WsxFrameStats::g_state.gsCount.load() != presents) || (checkClock && ((WsxFrameStats::Now() - start) > 50.0)))
+ 		{
+ 			wsx_gs_yield(reinterpret_cast<uintptr_t>(&CGSHandler::ThreadSlice), self);
+ 			return;
+diff --git a/Source/gs/GsSwRaster.h b/Source/gs/GsSwRaster.h
+index db3ce477..8095fd8a 100644
+--- a/Source/gs/GsSwRaster.h
++++ b/Source/gs/GsSwRaster.h
+@@ -78,23 +78,17 @@ public:
+ 		auto scissor = make_convertible<CGSHandler::SCISSOR>(regs[GS_REG_SCISSOR_1 + ctx]);
+ 		auto fogCol = make_convertible<CGSHandler::FOGCOL>(regs[GS_REG_FOGCOL]);
+ 
+-		m_fbPtr = frame.GetBasePtr();
+-		m_fbBw = frame.nWidth;
+-		m_fbPsm = frame.nPsm;
+ 		m_fbMask = frame.nMask;
+-		m_fbBits = PsmBits(m_fbPsm);
+-
+-		m_zPtr = zbuf.GetBasePtr();
+-		m_zPsm = zbuf.nPsm | 0x30;
++		m_fb = MakeSurface(frame.GetBasePtr(), frame.nWidth, frame.nPsm);
++		m_z = MakeSurface(zbuf.GetBasePtr(), frame.nWidth, zbuf.nPsm | 0x30);
+ 		m_zMask = zbuf.nMask != 0;
+-		m_zBits = PsmBits(m_zPsm);
+-		m_zMax = (m_zBits == 32) ? 0xFFFFFFFFU : ((1U << m_zBits) - 1);
++		m_zMax = (m_z.bits == 32) ? 0xFFFFFFFFU : ((1U << m_z.bits) - 1);
+ 
+ 		m_ate = test.nAlphaEnabled != 0;
+ 		m_atst = test.nAlphaMethod;
+ 		m_aref = test.nAlphaRef;
+ 		m_afail = test.nAlphaFail;
+-		m_date = (test.nDestAlphaEnabled != 0) && (m_fbBits != 24);
++		m_date = (test.nDestAlphaEnabled != 0) && (m_fb.bits != 24);
+ 		m_datm = test.nDestAlphaMode;
+ 		//ZTE = 0 is not allowed on the GS; it behaves like ALWAYS
+ 		m_ztst = test.nDepthEnabled ? test.nDepthMethod : 1;
+@@ -108,7 +102,7 @@ public:
+ 		m_pabe = (regs[GS_REG_PABE] & 1) != 0;
+ 		m_fba = (regs[GS_REG_FBA_1 + ctx] & 1) != 0;
+ 		m_colClamp = (regs[GS_REG_COLCLAMP] & 1) != 0;
+-		m_dthe = ((regs[REG_DTHE] & 1) != 0) && (m_fbBits == 16);
++		m_dthe = ((regs[REG_DTHE] & 1) != 0) && (m_fb.bits == 16);
+ 		if(m_dthe)
+ 		{
+ 			uint64 dimx = regs[REG_DIMX];
+@@ -150,6 +144,7 @@ public:
+ 			TexCoords(v, v.q, tu, tv);
+ 			lod = ComputeLod(v.q);
+ 		}
++		BeginRow(py);
+ 		Pixel(px, py, v.z, v.rgba, tu, tv, lod, v.fog);
+ 		NoteDirty(py);
+ 	}
+@@ -200,6 +195,7 @@ public:
+ 
+ 		for(int32 py = pyStart; py <= pyEnd; py++)
+ 		{
++			BeginRow(py);
+ 			float tv = vStart + dvdy * static_cast<float>(py - pyStart);
+ 			for(int32 px = pxStart; px <= pxEnd; px++)
+ 			{
+@@ -296,7 +292,6 @@ public:
+ 		PLANE ps = {}, pt = {}, pq = {};
+ 		bool constQ = true;
+ 		int32 constLod = 0;
+-		float texScaleU = 0, texScaleV = 0;
+ 		if(m_tme)
+ 		{
+ 			if(m_fst)
+@@ -307,76 +302,92 @@ public:
+ 			}
+ 			else
+ 			{
+-				ps = makePlane(v0->s, v1->s, v2->s);
+-				pt = makePlane(v0->t, v1->t, v2->t);
+-				pq = makePlane(v0->q, v1->q, v2->q);
+ 				constQ = (v0->q == v1->q) && (v0->q == v2->q);
+-				texScaleU = static_cast<float>(m_texWidth);
+-				texScaleV = static_cast<float>(m_texHeight);
+-				if(constQ) constLod = ComputeLod(v0->q);
++				double scaleU = static_cast<double>(m_texWidth);
++				double scaleV = static_cast<double>(m_texHeight);
++				if(constQ)
++				{
++					//Affine: fold the division and the texture size into the planes
++					double invQ = (v0->q != 0) ? (1.0 / v0->q) : 1.0;
++					scaleU *= invQ;
++					scaleV *= invQ;
++					constLod = ComputeLod(v0->q);
++				}
++				ps = makePlane(v0->s * scaleU, v1->s * scaleU, v2->s * scaleU);
++				pt = makePlane(v0->t * scaleV, v1->t * scaleV, v2->t * scaleV);
++				pq = makePlane(v0->q, v1->q, v2->q);
+ 			}
+ 		}
++		bool affine = m_fst || constQ;
+ 
+ 		for(int32 py = pyStart; py <= pyEnd; py++)
+ 		{
+ 			int64 w0 = e0.value, w1 = e1.value, w2 = e2.value;
++			e0.value += e0.stepY;
++			e1.value += e1.stepY;
++			e2.value += e2.stepY;
++			//First and last covered pixels of the row
++			int32 px = pxStart;
++			while((px <= pxEnd) && ((w0 | w1 | w2) < 0))
++			{
++				w0 += e0.stepX;
++				w1 += e1.stepX;
++				w2 += e2.stepX;
++				px++;
++			}
++			if(px > pxEnd) continue;
++			BeginRow(py);
+ 			int32 row = py - pyStart;
+-			for(int32 px = pxStart; px <= pxEnd; px++)
++			for(; (px <= pxEnd) && ((w0 | w1 | w2) >= 0); px++)
+ 			{
+-				if((w0 | w1 | w2) >= 0)
++				int32 col = px - pxStart;
++				uint32 z = v0->z;
++				if(!flatZ)
+ 				{
+-					int32 col = px - pxStart;
+-					uint32 z = v0->z;
+-					if(!flatZ)
+-					{
+-						double zf = pz.start + (pz.dx * col) + (pz.dy * row);
+-						z = (zf <= 0) ? 0 : ((zf >= 4294967295.0) ? 0xFFFFFFFFU : static_cast<uint32>(zf));
+-					}
+-					uint32 rgba = flatColor;
+-					if(gouraud)
++					double zf = pz.start + (pz.dx * col) + (pz.dy * row);
++					z = (zf <= 0) ? 0 : ((zf >= 4294967295.0) ? 0xFFFFFFFFU : static_cast<uint32>(zf));
++				}
++				uint32 rgba = flatColor;
++				if(gouraud)
++				{
++					rgba = 0;
++					for(unsigned int i = 0; i < 4; i++)
+ 					{
+-						rgba = 0;
+-						for(unsigned int i = 0; i < 4; i++)
+-						{
+-							double value = pc[i].start + (pc[i].dx * col) + (pc[i].dy * row);
+-							int32 channel = std::clamp(static_cast<int32>(value), 0, 255);
+-							rgba |= static_cast<uint32>(channel) << (i * 8);
+-						}
++						double value = pc[i].start + (pc[i].dx * col) + (pc[i].dy * row);
++						int32 channel = std::clamp(static_cast<int32>(value), 0, 255);
++						rgba |= static_cast<uint32>(channel) << (i * 8);
+ 					}
+-					uint32 fog = v0->fog;
+-					if(fogVaries)
++				}
++				uint32 fog = v0->fog;
++				if(fogVaries)
++				{
++					fog = static_cast<uint32>(std::clamp(static_cast<int32>(pf.start + (pf.dx * col) + (pf.dy * row)), 0, 255));
++				}
++				float tu = 0, tv = 0;
++				int32 lod = constLod;
++				if(m_tme)
++				{
++					double s = ps.start + (ps.dx * col) + (ps.dy * row);
++					double t = pt.start + (pt.dx * col) + (pt.dy * row);
++					if(affine)
+ 					{
+-						fog = static_cast<uint32>(std::clamp(static_cast<int32>(pf.start + (pf.dx * col) + (pf.dy * row)), 0, 255));
++						tu = static_cast<float>(s);
++						tv = static_cast<float>(t);
+ 					}
+-					float tu = 0, tv = 0;
+-					int32 lod = constLod;
+-					if(m_tme)
++					else
+ 					{
+-						double s = ps.start + (ps.dx * col) + (ps.dy * row);
+-						double t = pt.start + (pt.dx * col) + (pt.dy * row);
+-						if(m_fst)
+-						{
+-							tu = static_cast<float>(s);
+-							tv = static_cast<float>(t);
+-						}
+-						else
+-						{
+-							double q = constQ ? v0->q : (pq.start + (pq.dx * col) + (pq.dy * row));
+-							double invQ = (q != 0) ? (1.0 / q) : 1.0;
+-							tu = static_cast<float>(s * invQ) * texScaleU;
+-							tv = static_cast<float>(t * invQ) * texScaleV;
+-							if(!constQ) lod = ComputeLod(static_cast<float>(q));
+-						}
++						double q = pq.start + (pq.dx * col) + (pq.dy * row);
++						double invQ = (q != 0) ? (1.0 / q) : 1.0;
++						tu = static_cast<float>(s * invQ);
++						tv = static_cast<float>(t * invQ);
++						lod = ComputeLod(static_cast<float>(q));
+ 					}
+-					Pixel(px, py, z, rgba, tu, tv, lod, fog);
+ 				}
++				Pixel(px, py, z, rgba, tu, tv, lod, fog);
+ 				w0 += e0.stepX;
+ 				w1 += e1.stepX;
+ 				w2 += e2.stepX;
+ 			}
+-			e0.value += e0.stepY;
+-			e1.value += e1.stepY;
+-			e2.value += e2.stepY;
+ 		}
+ 		NoteDirty(pyEnd);
+ 	}
+@@ -384,11 +395,29 @@ public:
+ private:
+ 	enum
+ 	{
++		RAMMASK = CGSHandler::RAMSIZE - 1,
+ 		MAX_LEVELS = 7,
+ 		REG_DIMX = 0x44,
+ 		REG_DTHE = 0x45,
+ 	};
+ 
++	//A frame or depth buffer: pages are 64 pixels wide in every format they can have
++	struct SURFACE
++	{
++		uint32 ptr = 0;
++		uint32 bw = 0;
++		uint32 psm = 0;
++		uint32 bits = 32;
++		uint32 pageHeightShift = 5;
++		const uint32* pageOffsets = nullptr;
++	};
++
++	struct ROW
++	{
++		uint32 base = 0;
++		const uint32* offsets = nullptr;
++	};
++
+ 	struct TEXLEVEL
+ 	{
+ 		uint32 ptr = 0;
+@@ -396,7 +425,10 @@ private:
+ 		uint32 width = 1;
+ 		uint32 height = 1;
+ 		bool ready = false;
++		//Decoded texels, filled in as they are sampled (most draws touch a corner of a texture the game
++		//uploads again before the next one). `decoded` has a bit per texel.
+ 		std::vector<uint32> pixels;
++		std::vector<uint32> decoded;
+ 	};
+ 
+ 	static uint32 PsmBits(uint32 psm)
+@@ -423,6 +455,63 @@ private:
+ 
+ 	//---- Memory access, by storage format
+ 
++	static SURFACE MakeSurface(uint32 ptr, uint32 bw, uint32 psm)
++	{
++		SURFACE surface;
++		surface.ptr = ptr;
++		surface.bw = bw;
++		surface.psm = psm;
++		surface.bits = PsmBits(psm);
++		switch(psm)
++		{
++		case CGSHandler::PSMCT16:
++			surface.pageOffsets = CGsPixelFormats::CPixelIndexorPSMCT16::GetPageOffsets();
++			surface.pageHeightShift = 6;
++			break;
++		case CGSHandler::PSMCT16S:
++			surface.pageOffsets = CGsPixelFormats::CPixelIndexorPSMCT16S::GetPageOffsets();
++			surface.pageHeightShift = 6;
++			break;
++		case CGSHandler::PSMZ16:
++			surface.pageOffsets = CGsPixelFormats::CPixelIndexor<CGsPixelFormats::STORAGEPSMZ16>::GetPageOffsets();
++			surface.pageHeightShift = 6;
++			break;
++		case CGSHandler::PSMZ16S:
++			surface.pageOffsets = CGsPixelFormats::CPixelIndexorPSMZ16S::GetPageOffsets();
++			surface.pageHeightShift = 6;
++			break;
++		case CGSHandler::PSMZ32:
++		case CGSHandler::PSMZ24:
++			surface.pageOffsets = CGsPixelFormats::CPixelIndexorPSMZ32::GetPageOffsets();
++			surface.pageHeightShift = 5;
++			break;
++		default:
++			surface.pageOffsets = CGsPixelFormats::CPixelIndexorPSMCT32::GetPageOffsets();
++			surface.pageHeightShift = 5;
++			break;
++		}
++		return surface;
++	}
++
++	static ROW MakeRow(const SURFACE& surface, uint32 y)
++	{
++		ROW row;
++		row.base = surface.ptr + ((y >> surface.pageHeightShift) * surface.bw * CGsPixelFormats::PAGESIZE);
++		row.offsets = surface.pageOffsets + ((y & ((1U << surface.pageHeightShift) - 1)) << 6);
++		return row;
++	}
++
++	uint8* Address(const ROW& row, uint32 x) const
++	{
++		return m_ram + ((row.base + ((x >> 6) * CGsPixelFormats::PAGESIZE) + row.offsets[x & 63]) & RAMMASK);
++	}
++
++	void BeginRow(int32 y)
++	{
++		m_fbRow = MakeRow(m_fb, y);
++		m_zRow = MakeRow(m_z, y);
++	}
++
+ 	uint32* Address32(uint32 ptr, uint32 bw, uint32 psm, uint32 x, uint32 y) const
+ 	{
+ 		if(psm & 0x30)
+@@ -456,11 +545,11 @@ private:
+ 	{
+ 		if(maxY < 0) return;
+ 		m_dirty.any = true;
+-		m_dirty.fbPtr = m_fbPtr;
+-		m_dirty.fbWidth = m_fbBw;
+-		m_dirty.fbPsm = m_fbPsm;
+-		m_dirty.zPtr = m_zPtr;
+-		m_dirty.zPsm = m_zPsm;
++		m_dirty.fbPtr = m_fb.ptr;
++		m_dirty.fbWidth = m_fb.bw;
++		m_dirty.fbPsm = m_fb.psm;
++		m_dirty.zPtr = m_z.ptr;
++		m_dirty.zPsm = m_z.psm;
+ 		m_dirty.maxY = std::max<uint32>(m_dirty.maxY, maxY);
+ 		if(!m_zMask) m_dirty.zWritten = true;
+ 	}
+@@ -576,71 +665,44 @@ private:
+ 	{
+ 		if(!m_clutReady) PrepareClut();
+ 		level.ready = true;
+-		level.pixels.resize(level.width * level.height);
+-		uint32* dst = level.pixels.data();
+-		uint32 w = level.width, h = level.height;
++		uint32 count = level.width * level.height;
++		if(level.pixels.size() < count) level.pixels.resize(count);
++		level.decoded.assign((count + 31) / 32, 0);
++	}
++
++	uint32 DecodeTexel(const TEXLEVEL& level, uint32 x, uint32 y) const
++	{
+ 		switch(m_texPsm)
+ 		{
+ 		case CGSHandler::PSMCT32:
+ 		case CGSHandler::PSMZ32:
+-			for(uint32 y = 0; y < h; y++)
+-				for(uint32 x = 0; x < w; x++)
+-					(*dst++) = *Address32(level.ptr, level.bw, m_texPsm, x, y);
+-			break;
++			return *Address32(level.ptr, level.bw, m_texPsm, x, y);
+ 		case CGSHandler::PSMCT24:
+ 		case CGSHandler::PSMZ24:
+-			for(uint32 y = 0; y < h; y++)
+-				for(uint32 x = 0; x < w; x++)
+-				{
+-					uint32 color = (*Address32(level.ptr, level.bw, m_texPsm, x, y)) & 0x00FFFFFF;
+-					(*dst++) = color | ((m_texAem && (color == 0)) ? 0 : (m_texA0 << 24));
+-				}
+-			break;
++		{
++			uint32 color = (*Address32(level.ptr, level.bw, m_texPsm, x, y)) & 0x00FFFFFF;
++			return color | ((m_texAem && (color == 0)) ? 0 : (m_texA0 << 24));
++		}
+ 		case CGSHandler::PSMCT16:
+ 		case CGSHandler::PSMCT16S:
+ 		case CGSHandler::PSMZ16:
+ 		case CGSHandler::PSMZ16S:
+-			for(uint32 y = 0; y < h; y++)
+-				for(uint32 x = 0; x < w; x++)
+-				{
+-					uint32 color = *Address16(level.ptr, level.bw, m_texPsm, x, y);
+-					(*dst++) = (Expand16(color) & 0x00FFFFFF) | (Alpha16(color) << 24);
+-				}
+-			break;
+-		case CGSHandler::PSMT8:
+ 		{
+-			CGsPixelFormats::CPixelIndexorPSMT8 indexor(m_ram, level.ptr, level.bw);
+-			for(uint32 y = 0; y < h; y++)
+-				for(uint32 x = 0; x < w; x++)
+-					(*dst++) = m_clutColors[indexor.GetPixel(x, y)];
++			uint32 color = *Address16(level.ptr, level.bw, m_texPsm, x, y);
++			return (Expand16(color) & 0x00FFFFFF) | (Alpha16(color) << 24);
+ 		}
+-		break;
++		case CGSHandler::PSMT8:
++			return m_clutColors[CGsPixelFormats::CPixelIndexorPSMT8(m_ram, level.ptr, level.bw).GetPixel(x, y)];
+ 		case CGSHandler::PSMT4:
+-		{
+-			CGsPixelFormats::CPixelIndexorPSMT4 indexor(m_ram, level.ptr, level.bw);
+-			for(uint32 y = 0; y < h; y++)
+-				for(uint32 x = 0; x < w; x++)
+-					(*dst++) = m_clutColors[indexor.GetPixel(x, y) & 0x0F];
+-		}
+-		break;
++			return m_clutColors[CGsPixelFormats::CPixelIndexorPSMT4(m_ram, level.ptr, level.bw).GetPixel(x, y) & 0x0F];
+ 		case CGSHandler::PSMT8H:
+-			for(uint32 y = 0; y < h; y++)
+-				for(uint32 x = 0; x < w; x++)
+-					(*dst++) = m_clutColors[(*Address32(level.ptr, level.bw, 0, x, y)) >> 24];
+-			break;
++			return m_clutColors[(*Address32(level.ptr, level.bw, 0, x, y)) >> 24];
+ 		case CGSHandler::PSMT4HL:
+-			for(uint32 y = 0; y < h; y++)
+-				for(uint32 x = 0; x < w; x++)
+-					(*dst++) = m_clutColors[((*Address32(level.ptr, level.bw, 0, x, y)) >> 24) & 0x0F];
+-			break;
++			return m_clutColors[((*Address32(level.ptr, level.bw, 0, x, y)) >> 24) & 0x0F];
+ 		case CGSHandler::PSMT4HH:
+-			for(uint32 y = 0; y < h; y++)
+-				for(uint32 x = 0; x < w; x++)
+-					(*dst++) = m_clutColors[(*Address32(level.ptr, level.bw, 0, x, y)) >> 28];
+-			break;
++			return m_clutColors[(*Address32(level.ptr, level.bw, 0, x, y)) >> 28];
+ 		default:
+-			std::fill(level.pixels.begin(), level.pixels.end(), 0x80808080U);
+-			break;
++			return 0x80808080U;
+ 		}
+ 	}
+ 
+@@ -682,19 +744,29 @@ private:
+ 		case 1: //Clamp
+ 			return std::clamp<int32>(coord, 0, size - 1);
+ 		case 2: //Region clamp
+-			return std::clamp<int32>(coord, minValue >> lod, maxValue >> lod);
++			return std::clamp<int32>(std::clamp<int32>(coord, minValue >> lod, maxValue >> lod), 0, size - 1);
+ 		case 3: //Region repeat
+-			return (coord & (minValue >> lod)) | (maxValue >> lod);
++			return std::clamp<int32>((coord & (minValue >> lod)) | (maxValue >> lod), 0, size - 1);
++		}
++	}
++
++	uint32 Texel(TEXLEVEL& level, uint32 u, uint32 v)
++	{
++		uint32 index = u + (v * level.width);
++		uint32 bit = 1U << (index & 31);
++		uint32& word = level.decoded[index >> 5];
++		if(!(word & bit))
++		{
++			word |= bit;
++			level.pixels[index] = DecodeTexel(level, u, v);
+ 		}
++		return level.pixels[index];
+ 	}
+ 
+-	uint32 Texel(TEXLEVEL& level, uint32 lod, int32 u, int32 v)
++	//Two 8 bit channels at a time (0x00FF00FF), weight 0..16: a + (((b - a) * weight) >> 4)
++	static uint32 Lerp4(uint32 a, uint32 b, uint32 weight)
+ 	{
+-		u = Wrap(u, m_wms, m_minU, m_maxU, level.width, lod);
+-		v = Wrap(v, m_wmt, m_minV, m_maxV, level.height, lod);
+-		u = std::clamp<int32>(u, 0, level.width - 1);
+-		v = std::clamp<int32>(v, 0, level.height - 1);
+-		return level.pixels[u + (v * level.width)];
++		return (((a * (16 - weight)) + (b * weight)) >> 4) & 0x00FF00FF;
+ 	}
+ 
+ 	//u and v: 16.16 at level 0
+@@ -706,28 +778,28 @@ private:
+ 		v >>= lod;
+ 		if(!linear)
+ 		{
+-			return Texel(level, lod, u >> 16, v >> 16);
++			return Texel(level, Wrap(u >> 16, m_wms, m_minU, m_maxU, level.width, lod), Wrap(v >> 16, m_wmt, m_minV, m_maxV, level.height, lod));
+ 		}
+ 		u -= 0x8000;
+ 		v -= 0x8000;
+-		int32 uf = (u >> 12) & 0xF;
+-		int32 vf = (v >> 12) & 0xF;
+-		int32 u0 = u >> 16;
+-		int32 v0 = v >> 16;
+-		uint32 c00 = Texel(level, lod, u0, v0);
+-		uint32 c01 = Texel(level, lod, u0 + 1, v0);
+-		uint32 c10 = Texel(level, lod, u0, v0 + 1);
+-		uint32 c11 = Texel(level, lod, u0 + 1, v0 + 1);
+-		uint32 result = 0;
+-		for(unsigned int i = 0; i < 32; i += 8)
+-		{
+-			int32 a = (c00 >> i) & 0xFF, b = (c01 >> i) & 0xFF, c = (c10 >> i) & 0xFF, d = (c11 >> i) & 0xFF;
+-			int32 top = a + (((b - a) * uf) >> 4);
+-			int32 bottom = c + (((d - c) * uf) >> 4);
+-			int32 value = top + (((bottom - top) * vf) >> 4);
+-			result |= static_cast<uint32>(value & 0xFF) << i;
+-		}
+-		return result;
++		uint32 uf = (u >> 12) & 0xF;
++		uint32 vf = (v >> 12) & 0xF;
++		int32 iu = u >> 16;
++		int32 iv = v >> 16;
++		uint32 u0 = Wrap(iu, m_wms, m_minU, m_maxU, level.width, lod);
++		uint32 u1 = Wrap(iu + 1, m_wms, m_minU, m_maxU, level.width, lod);
++		uint32 v0 = Wrap(iv, m_wmt, m_minV, m_maxV, level.height, lod);
++		uint32 v1 = Wrap(iv + 1, m_wmt, m_minV, m_maxV, level.height, lod);
++		uint32 c00 = Texel(level, u0, v0);
++		uint32 c01 = Texel(level, u1, v0);
++		uint32 c10 = Texel(level, u0, v1);
++		uint32 c11 = Texel(level, u1, v1);
++		//a + (((b - a) * f) >> 4) is ((a * (16 - f)) + (b * f)) >> 4: no negative values, two channels per multiply
++		uint32 topRb = Lerp4(c00 & 0x00FF00FF, c01 & 0x00FF00FF, uf);
++		uint32 topGa = Lerp4((c00 >> 8) & 0x00FF00FF, (c01 >> 8) & 0x00FF00FF, uf);
++		uint32 bottomRb = Lerp4(c10 & 0x00FF00FF, c11 & 0x00FF00FF, uf);
++		uint32 bottomGa = Lerp4((c10 >> 8) & 0x00FF00FF, (c11 >> 8) & 0x00FF00FF, uf);
++		return Lerp4(topRb, bottomRb, vf) | (Lerp4(topGa, bottomGa, vf) << 8);
+ 	}
+ 
+ 	uint32 Sample(float tu, float tv, int32 lod)
+@@ -793,65 +865,65 @@ private:
+ 		}
+ 	}
+ 
+-	uint32 ReadFrame(int32 x, int32 y) const
++	uint32 ReadFrame(const uint8* address) const
+ 	{
+-		switch(m_fbBits)
++		switch(m_fb.bits)
+ 		{
+ 		case 16:
+-			return Expand16(*Address16(m_fbPtr, m_fbBw, m_fbPsm, x, y));
++			return Expand16(*reinterpret_cast<const uint16*>(address));
+ 		case 24:
+-			return ((*Address32(m_fbPtr, m_fbBw, m_fbPsm, x, y)) & 0x00FFFFFF) | 0x80000000U;
++			return ((*reinterpret_cast<const uint32*>(address)) & 0x00FFFFFF) | 0x80000000U;
+ 		default:
+-			return *Address32(m_fbPtr, m_fbBw, m_fbPsm, x, y);
++			return *reinterpret_cast<const uint32*>(address);
+ 		}
+ 	}
+ 
+ 	//mask: bits that keep their value
+-	void WriteFrame(int32 x, int32 y, uint32 color, uint32 mask) const
++	void WriteFrame(uint8* address, uint32 color, uint32 mask) const
+ 	{
+-		if(m_fbBits == 16)
++		if(m_fb.bits == 16)
+ 		{
+-			auto address = Address16(m_fbPtr, m_fbBw, m_fbPsm, x, y);
++			auto pixel = reinterpret_cast<uint16*>(address);
+ 			uint32 color16 = ((color >> 3) & 0x001F) | ((color >> 6) & 0x03E0) | ((color >> 9) & 0x7C00) | ((color >> 16) & 0x8000);
+ 			uint32 mask16 = ((mask >> 3) & 0x001F) | ((mask >> 6) & 0x03E0) | ((mask >> 9) & 0x7C00) | ((mask >> 16) & 0x8000);
+-			(*address) = static_cast<uint16>((color16 & ~mask16) | ((*address) & mask16));
++			(*pixel) = static_cast<uint16>((color16 & ~mask16) | ((*pixel) & mask16));
+ 		}
+ 		else
+ 		{
+-			if(m_fbBits == 24) mask |= 0xFF000000U;
+-			auto address = Address32(m_fbPtr, m_fbBw, m_fbPsm, x, y);
+-			(*address) = (color & ~mask) | ((*address) & mask);
++			if(m_fb.bits == 24) mask |= 0xFF000000U;
++			auto pixel = reinterpret_cast<uint32*>(address);
++			(*pixel) = (color & ~mask) | ((*pixel) & mask);
+ 		}
+ 	}
+ 
+-	uint32 ReadDepth(int32 x, int32 y) const
++	uint32 ReadDepth(const uint8* address) const
+ 	{
+-		switch(m_zBits)
++		switch(m_z.bits)
+ 		{
+ 		case 16:
+-			return *Address16(m_zPtr, m_fbBw, m_zPsm, x, y);
++			return *reinterpret_cast<const uint16*>(address);
+ 		case 24:
+-			return (*Address32(m_zPtr, m_fbBw, m_zPsm, x, y)) & 0x00FFFFFF;
++			return (*reinterpret_cast<const uint32*>(address)) & 0x00FFFFFF;
+ 		default:
+-			return *Address32(m_zPtr, m_fbBw, m_zPsm, x, y);
++			return *reinterpret_cast<const uint32*>(address);
+ 		}
+ 	}
+ 
+-	void WriteDepth(int32 x, int32 y, uint32 z) const
++	void WriteDepth(uint8* address, uint32 z) const
+ 	{
+-		switch(m_zBits)
++		switch(m_z.bits)
+ 		{
+ 		case 16:
+-			(*Address16(m_zPtr, m_fbBw, m_zPsm, x, y)) = static_cast<uint16>(z);
++			(*reinterpret_cast<uint16*>(address)) = static_cast<uint16>(z);
+ 			break;
+ 		case 24:
+ 		{
+-			auto address = Address32(m_zPtr, m_fbBw, m_zPsm, x, y);
+-			(*address) = (z & 0x00FFFFFF) | ((*address) & 0xFF000000U);
++			auto pixel = reinterpret_cast<uint32*>(address);
++			(*pixel) = (z & 0x00FFFFFF) | ((*pixel) & 0xFF000000U);
+ 		}
+ 		break;
+ 		default:
+-			(*Address32(m_zPtr, m_fbBw, m_zPsm, x, y)) = z;
++			(*reinterpret_cast<uint32*>(address)) = z;
+ 			break;
+ 		}
+ 	}
+@@ -902,6 +974,7 @@ private:
+ 		return static_cast<uint32>(r) | (static_cast<uint32>(g) << 8) | (static_cast<uint32>(b) << 16) | (static_cast<uint32>(a) << 24);
+ 	}
+ 
++	//BeginRow(y) first
+ 	void Pixel(int32 x, int32 y, uint32 z, uint32 rgba, float tu, float tv, int32 lod, uint32 fog)
+ 	{
+ 		uint32 source = Shade(rgba, tu, tv, lod, fog);
+@@ -928,19 +1001,25 @@ private:
+ 			}
+ 		}
+ 
++		uint8* frameAddress = Address(m_fbRow, x);
+ 		uint32 dest = 0;
+ 		bool needDest = m_date || (m_abe && writeColor);
+-		if(needDest) dest = ReadFrame(x, y);
++		if(needDest) dest = ReadFrame(frameAddress);
+ 		if(m_date)
+ 		{
+ 			if(((dest >> 31) & 1) != m_datm) return;
+ 		}
+ 
+ 		z = std::min(z, m_zMax);
++		uint8* depthAddress = nullptr;
++		if((m_ztst != 1) || writeDepth)
++		{
++			depthAddress = Address(m_zRow, x);
++		}
+ 		if(m_ztst != 1)
+ 		{
+ 			if(m_ztst == 0) return;
+-			uint32 destZ = ReadDepth(x, y);
++			uint32 destZ = ReadDepth(depthAddress);
+ 			if((m_ztst == 2) ? (z < destZ) : (z <= destZ)) return;
+ 		}
+ 
+@@ -977,11 +1056,11 @@ private:
+ 			if(m_fba) color |= 0x80000000U;
+ 			uint32 mask = m_fbMask;
+ 			if(!writeAlpha) mask |= 0xFF000000U;
+-			WriteFrame(x, y, color, mask);
++			WriteFrame(frameAddress, color, mask);
+ 		}
+ 		if(writeDepth)
+ 		{
+-			WriteDepth(x, y, z);
++			WriteDepth(depthAddress, z);
+ 		}
+ 	}
+ 
+@@ -1039,20 +1118,43 @@ private:
+ 		uint32 mask = m_fbMask;
+ 		if(!writeAlpha) mask |= 0xFF000000U;
+ 		z = std::min(z, m_zMax);
++		bool plainColor = (m_fb.bits == 32) && (mask == 0);
++		bool plainDepth = (m_z.bits == 32);
+ 		for(int32 py = pyStart; py <= pyEnd; py++)
+ 		{
++			BeginRow(py);
+ 			if(writeColor)
+ 			{
+-				for(int32 px = pxStart; px <= pxEnd; px++)
++				if(plainColor)
+ 				{
+-					WriteFrame(px, py, color, mask);
++					for(int32 px = pxStart; px <= pxEnd; px++)
++					{
++						(*reinterpret_cast<uint32*>(Address(m_fbRow, px))) = color;
++					}
++				}
++				else
++				{
++					for(int32 px = pxStart; px <= pxEnd; px++)
++					{
++						WriteFrame(Address(m_fbRow, px), color, mask);
++					}
+ 				}
+ 			}
+ 			if(writeDepth)
+ 			{
+-				for(int32 px = pxStart; px <= pxEnd; px++)
++				if(plainDepth)
+ 				{
+-					WriteDepth(px, py, z);
++					for(int32 px = pxStart; px <= pxEnd; px++)
++					{
++						(*reinterpret_cast<uint32*>(Address(m_zRow, px))) = z;
++					}
++				}
++				else
++				{
++					for(int32 px = pxStart; px <= pxEnd; px++)
++					{
++						WriteDepth(Address(m_zRow, px), z);
++					}
+ 				}
+ 			}
+ 		}
+@@ -1064,15 +1166,12 @@ private:
+ 	DIRTY m_dirty;
+ 
+ 	//Frame and depth buffers
+-	uint32 m_fbPtr = 0;
+-	uint32 m_fbBw = 0;
+-	uint32 m_fbPsm = 0;
++	SURFACE m_fb;
++	SURFACE m_z;
++	ROW m_fbRow;
++	ROW m_zRow;
+ 	uint32 m_fbMask = 0;
+-	uint32 m_fbBits = 32;
+-	uint32 m_zPtr = 0;
+-	uint32 m_zPsm = 0;
+ 	bool m_zMask = false;
+-	uint32 m_zBits = 32;
+ 	uint32 m_zMax = 0xFFFFFFFFU;
+ 
+ 	//Tests
+diff --git a/Source/gs/WsxGsStats.h b/Source/gs/WsxGsStats.h
+index 7225a963..c1cf2292 100644
+--- a/Source/gs/WsxGsStats.h
++++ b/Source/gs/WsxGsStats.h
+@@ -23,6 +23,7 @@ struct WSX_GS_STATS
+ 	std::atomic<uint64> fbSetups = 0;       //framebuffer rebinds
+ 	std::atomic<uint64> shaderSwitches = 0; //glUseProgram
+ 	std::atomic<uint64> swPrims = 0;        //Primitives drawn by the software rasterizer
+-	std::atomic<uint64> newFrames = 0;      //Flips that showed another buffer than the one before (the game's own frame rate)
++	std::atomic<uint64> bufferFlips = 0;    //Flips that showed another buffer than the one before (frame rate of double buffered games)
++	std::atomic<uint64> newFrames = 0;      //Flips with something drawn since the one before (the game's own frame rate)
+ };
+ extern WSX_GS_STATS g_wsxGsStats;
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index b64a456e..1b647437 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -21,6 +21,8 @@
+ #include "ee/Vpu1Thread.h"
+ #include "ee/EeExecutor.h"
+ #include "ee/EeBasicBlock.h"
++#include "ee/VuExecutor.h"
++#include "ee/VuBasicBlock.h"
+ #include "Jitter.h"
+ #include "Jitter_CodeGen_Wasm.h"
+ #include "DefaultAppConfig.h"
+@@ -522,6 +524,51 @@ void debugSetLocalsAsRegisters(bool enabled)
+ 	Jitter::g_wasmLocalsAsRegisters = enabled;
+ }
+ 
++// Same for the VU1 block starting at (or containing) a microprogram address; compiled on the thread VU1 runs on.
++void debugRequestVu1BlockDump(uint32 address)
++{
++	g_virtualMachine->SendVmCall([address]() {
++		std::string result;
++		auto dump = [&]() {
++			auto& vu1 = g_virtualMachine->m_ee->m_VU1;
++			auto executor = static_cast<CVuExecutor*>(vu1.m_executor.get());
++			CBasicBlock* block = nullptr;
++			for(uint32 start = address; (start + 0x800) > address; start -= 8)
++			{
++				auto candidate = executor->FindBlockStartingAt(start);
++				if(candidate && !candidate->IsEmpty() && (candidate->GetEndAddress() >= address))
++				{
++					block = candidate;
++					break;
++				}
++				if(start == 0) break;
++			}
++			if(!block)
++			{
++				result = "no block";
++				return;
++			}
++			char header[64];
++			snprintf(header, sizeof(header), "block %04X-%04X ", block->GetBeginAddress(), block->GetEndAddress());
++			CVuBasicBlock copy(vu1, block->GetBeginAddress(), block->GetEndAddress(), BLOCK_CATEGORY_PS2_VU);
++			Jitter::g_statementDump = &result;
++			copy.Compile();
++			Jitter::g_statementDump = nullptr;
++			result = header + result;
++		};
++		if(g_virtualMachine->m_ee->m_vpu1Thread)
++		{
++			g_virtualMachine->m_ee->m_vpu1Thread->RunSync(dump);
++		}
++		else
++		{
++			dump();
++		}
++		std::lock_guard lock(g_eeBlockDumpMutex);
++		g_eeBlockDump = result;
++	});
++}
++
+ std::string debugTakeEeBlockDump()
+ {
+ 	std::lock_guard lock(g_eeBlockDumpMutex);
+@@ -549,7 +596,7 @@ std::string getGsStats()
+ {
+ 	auto& s = g_wsxGsStats;
+ 	char text[1024];
+-	snprintf(text, sizeof(text), "{\"frames\":%llu,\"regWrites\":%llu,\"gsCalls\":%llu,\"transfers\":%llu,\"transfersDirty\":%llu,\"transferBytes\":%llu,\"texMisses\":%llu,\"texUploads\":%llu,\"texUploadPx\":%llu,\"palMisses\":%llu,\"clutReads\":%llu,\"draws\":%llu,\"verts\":%llu,\"texSetups\":%llu,\"fbSetups\":%llu,\"shaderSwitches\":%llu,\"swPrims\":%llu,\"newFrames\":%llu}",
++	snprintf(text, sizeof(text), "{\"frames\":%llu,\"regWrites\":%llu,\"gsCalls\":%llu,\"transfers\":%llu,\"transfersDirty\":%llu,\"transferBytes\":%llu,\"texMisses\":%llu,\"texUploads\":%llu,\"texUploadPx\":%llu,\"palMisses\":%llu,\"clutReads\":%llu,\"draws\":%llu,\"verts\":%llu,\"texSetups\":%llu,\"fbSetups\":%llu,\"shaderSwitches\":%llu,\"swPrims\":%llu,\"newFrames\":%llu,\"bufferFlips\":%llu}",
+ 	         (unsigned long long)s.frames.load(),
+ 	         (unsigned long long)s.regWrites.load(),
+ 	         (unsigned long long)s.gsCalls.load(),
+@@ -565,7 +612,7 @@ std::string getGsStats()
+ 	         (unsigned long long)s.verts.load(),
+ 	         (unsigned long long)s.texSetups.load(),
+ 	         (unsigned long long)s.fbSetups.load(),
+-	         (unsigned long long)s.shaderSwitches.load(), (unsigned long long)s.swPrims.load(), (unsigned long long)s.newFrames.load());
++	         (unsigned long long)s.shaderSwitches.load(), (unsigned long long)s.swPrims.load(), (unsigned long long)s.newFrames.load(), (unsigned long long)s.bufferFlips.load());
+ 	return text;
+ }
+ 
+@@ -574,13 +621,21 @@ std::string getGsStats()
+ std::string getEeStats()
+ {
+ 	char text[512];
+-	snprintf(text, sizeof(text), "{\"ticks\":%llu,\"waitTicks\":%llu,\"idleTicks\":%llu,\"slices\":%llu,\"dispatches\":%llu}",
++	snprintf(text, sizeof(text), "{\"ticks\":%llu,\"waitTicks\":%llu,\"idleTicks\":%llu,\"slices\":%llu,\"dispatches\":%llu,\"gsWaitUs\":%llu,\"vpu1WaitUs\":%llu,\"sleepUs\":%llu,\"jitUs\":%llu}",
+ 	         (unsigned long long)g_virtualMachine->m_statEeTicks, (unsigned long long)g_virtualMachine->m_statWaitTicks,
+ 	         (unsigned long long)g_virtualMachine->m_statIdleTicks, (unsigned long long)g_virtualMachine->m_statEeSlices,
+-	         (unsigned long long)g_virtualMachine->m_ee->m_EE.m_executor->m_dispatchCount);
++	         (unsigned long long)g_virtualMachine->m_ee->m_EE.m_executor->m_dispatchCount,
++	         (unsigned long long)WsxFrameStats::g_eeGsWaitUs.load(), (unsigned long long)WsxFrameStats::g_vpu1WaitUs.load(),
++	         (unsigned long long)WsxFrameStats::g_vmSleepUs.load(), (unsigned long long)WsxFrameStats::g_jitUs.load());
+ 	return text;
+ }
+ 
++// How many times each side of an EE/VPU1 hand-over looks for the other's answer before sleeping (0: never spin).
++void setVpu1SpinCount(int count)
++{
++	CVpu1Thread::g_spinCount = static_cast<uint32>(std::max(count, 0));
++}
++
+ std::string getVpu1Stats()
+ {
+ 	auto& stats = CVpu1Thread::g_stats;
+@@ -625,9 +680,11 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("getVpu1ZoneAddress", &getVpu1ZoneAddress);
+ 	function("setVpu1ThreadMode", &setVpu1ThreadMode);
+ 	function("getVpu1Stats", &getVpu1Stats);
++	function("setVpu1SpinCount", &setVpu1SpinCount);
+ 	function("getGsStats", &getGsStats);
+ 	function("debugRequestEeBlockDump", &debugRequestEeBlockDump);
+ 	function("debugTakeEeBlockDump", &debugTakeEeBlockDump);
++	function("debugRequestVu1BlockDump", &debugRequestVu1BlockDump);
+ 	function("debugSetLocalsAsRegisters", &debugSetLocalsAsRegisters);
+ 	function("setStateHashFrames", &setStateHashFrames);
+ 	function("getStateHash", &getStateHash);
+-- 
+2.51.0.windows.1
+

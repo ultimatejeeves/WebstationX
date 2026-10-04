@@ -1,0 +1,228 @@
+From 64b923dbd4e12cb5b274495c73c85940f0a4a6b7 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 14:42:12 -0400
+Subject: [PATCH 36/43] VIF1 interrupts end the EE's slice in asynchronous
+ mode; VPU1 stall/idle counters; row tables in the 16/32 bit texture updaters
+
+---
+ Source/ee/Ee_SubSystem.cpp                  |  6 ++++--
+ Source/ee/Vif.cpp                           |  4 ++--
+ Source/ee/Vif.h                             |  2 +-
+ Source/ee/Vpu1Thread.cpp                    |  9 +++++++++
+ Source/ee/Vpu1Thread.h                      | 10 ++++++++++
+ Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp | 22 ++++++++++++++++-----
+ Source/gs/GsSwRaster.h                      |  1 +
+ Source/ui_js/Main.cpp                       |  4 ++--
+ 8 files changed, 46 insertions(+), 12 deletions(-)
+
+diff --git a/Source/ee/Ee_SubSystem.cpp b/Source/ee/Ee_SubSystem.cpp
+index 8323c288..f301e998 100644
+--- a/Source/ee/Ee_SubSystem.cpp
++++ b/Source/ee/Ee_SubSystem.cpp
+@@ -204,6 +204,7 @@ void CSubSystem::StartVpu1Thread()
+ 	m_vpu1Thread->RunSync([this]() { m_VU1.m_executor = std::make_unique<CVuExecutor>(m_VU1, PS2::MICROMEM1SIZE); });
+ 
+ 	m_vpu1Thread->SetInterruptHandler([this](uint32 lines) { DeliverVpu1Interrupts(lines); });
++	m_vpu1Thread->SetEeQuotaAddress(&m_EE.m_State.cycleQuota);
+ 	m_vpu1->GetVif().SetInterruptPoster([this]() { m_vpu1Thread->PostInterrupt(CINTC::INTC_LINE_VIF1); });
+ 	m_gif.SetPath3ResumeHandler([this]() { m_vpu1Thread->ResumePath3(); });
+ 	if(m_gs)
+@@ -254,8 +255,9 @@ void CSubSystem::DeliverVpu1Interrupts(uint32 lines)
+ 	if(lines) WSX_VIF_TRACE("ee irq lines=%x pc=%08x\n", lines, m_EE.m_State.nPC);
+ 	if(lines & (1 << CINTC::INTC_LINE_VIF1))
+ 	{
+-		//Raised after a delay, like the VIF does itself (CVif::CountTicks)
+-		m_vpu1->GetVif().ScheduleInterrupt();
++		//Raised after a delay, like the VIF does itself (CVif::CountTicks). The asynchronous thread already
++		//took its time getting here; a short one keeps the stalled VIF from waiting another slice.
++		m_vpu1->GetVif().ScheduleInterrupt(m_vpu1Thread->IsSynchronous() ? 0x1000 : 0x100);
+ 	}
+ 	if(lines & (1 << CINTC::INTC_LINE_VU1))
+ 	{
+diff --git a/Source/ee/Vif.cpp b/Source/ee/Vif.cpp
+index 0db4082f..1a5f47a2 100644
+--- a/Source/ee/Vif.cpp
++++ b/Source/ee/Vif.cpp
+@@ -402,9 +402,9 @@ void CVif::SetInterruptPoster(std::function<void()> poster)
+ 	m_interruptPoster = std::move(poster);
+ }
+ 
+-void CVif::ScheduleInterrupt()
++void CVif::ScheduleInterrupt(uint32 delayTicks)
+ {
+-	m_interruptDelayTicks = 0x1000;
++	m_interruptDelayTicks = delayTicks;
+ }
+ 
+ bool CVif::IsWaitingForProgramEnd() const
+diff --git a/Source/ee/Vif.h b/Source/ee/Vif.h
+index cdddbc95..2884e827 100644
+--- a/Source/ee/Vif.h
++++ b/Source/ee/Vif.h
+@@ -90,7 +90,7 @@ public:
+ 	uint32 GetThreadedAvailable() const;
+ 	uint32 ProcessThreaded();
+ 	void SetInterruptPoster(std::function<void()>);
+-	void ScheduleInterrupt();
++	void ScheduleInterrupt(uint32 delayTicks = 0x1000);
+ 	//The VIF is stalled on an interrupt that is on its way to the EE
+ 	bool IsInterruptScheduled() const
+ 	{
+diff --git a/Source/ee/Vpu1Thread.cpp b/Source/ee/Vpu1Thread.cpp
+index 703d1308..43bebb16 100644
+--- a/Source/ee/Vpu1Thread.cpp
++++ b/Source/ee/Vpu1Thread.cpp
+@@ -427,6 +427,12 @@ void CVpu1Thread::Kick()
+ void CVpu1Thread::PostInterrupt(uint32 line)
+ {
+ 	m_pendingInterrupts.fetch_or(1 << line);
++	if(m_eeQuota && !m_synchronous)
++	{
++		//Not synchronized with the compiled code that counts the quota down: a lost write only means the
++		//slice runs to its end as it used to, and one that lands ends it at the next block
++		__atomic_store_n(m_eeQuota, 0, __ATOMIC_RELAXED);
++	}
+ }
+ 
+ uint32 CVpu1Thread::TakeInterrupts()
+@@ -511,6 +517,8 @@ void CVpu1Thread::ThreadProc()
+ 		//Nothing to do, or stalled on the EE: wait for more work or a kick.
+ 		m_parkedSent = sent;
+ 		m_parkedKicks = kicks;
++		bool stalled = (m_completed.load() != sent);
++		double parkedAt = WsxFrameStats::Now();
+ 		m_parked.store(true, std::memory_order_seq_cst);
+ 		if(m_waitingForIdle) m_idleCondition.notify_all();
+ 		//The EE usually answers a stall (an interrupt to serve, more data) within a few tens of microseconds
+@@ -531,6 +539,7 @@ void CVpu1Thread::ThreadProc()
+ 		});
+ 		m_sleeping = false;
+ 		m_parked.store(false);
++		(stalled ? g_stats.stallUs : g_stats.idleUs) += static_cast<uint64>((WsxFrameStats::Now() - parkedAt) * 1000.0);
+ 	}
+ }
+ 
+diff --git a/Source/ee/Vpu1Thread.h b/Source/ee/Vpu1Thread.h
+index 39fbd5af..864dc43c 100644
+--- a/Source/ee/Vpu1Thread.h
++++ b/Source/ee/Vpu1Thread.h
+@@ -39,6 +39,8 @@ struct VPU1_THREAD_STATS
+ 	std::atomic<uint64> ringFull = 0;     //DMA transfers refused for lack of queue room
+ 	std::atomic<uint64> records = 0;      //records processed
+ 	std::atomic<uint64> busyUs = 0;       //thread time spent processing
++	std::atomic<uint64> stallUs = 0;      //thread waiting for the EE with work left (interrupt stalls, SIGNAL, masked PATH3)
++	std::atomic<uint64> idleUs = 0;       //thread waiting with nothing to do
+ 	std::atomic<uint64> waitsByReason[16] = {}; //Drain calls that had to wait, by DRAIN_REASON
+ 	std::atomic<uint64> waitUsByReason[16] = {};
+ };
+@@ -136,6 +138,13 @@ public:
+ 
+ 	//Thread side: raise an INTC line on the EE.
+ 	void PostInterrupt(uint32 line);
++	//The EE's cycle quota (asynchronous mode): an interrupt ends its current slice, so a stalled VIF isn't
++	//left waiting for the rest of it. A game that stalls VIF1 before every batch of textures (ATV Offroad
++	//Fury 2: 130 times a frame) otherwise spends more time waiting for interrupts than drawing.
++	void SetEeQuotaAddress(int32* quota)
++	{
++		m_eeQuota = quota;
++	}
+ 	//Thread side: PATH3 was unmasked by the VIF1 data being processed; go on with the PATH3 data sent
+ 	//before it (what DMA channel 2 held back).
+ 	void ResumePath3();
+@@ -210,6 +219,7 @@ private:
+ 	std::atomic<uint64> m_vblanksDone = 0;
+ 
+ 	std::atomic<uint32> m_pendingInterrupts = 0;
++	int32* m_eeQuota = nullptr;
+ 	InterruptHandler m_interruptHandler;
+ 
+ 	uint32 m_vif1FifoWrites = 0;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+index 685c9b93..88bc3900 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+@@ -316,14 +316,20 @@ void CGSH_OpenGL::TexUpdater_Invalid(uint32 bufPtr, uint32 bufWidth, unsigned in
+ 
+ void CGSH_OpenGL::TexUpdater_Psm32(uint32 bufPtr, uint32 bufWidth, unsigned int texX, unsigned int texY, unsigned int texWidth, unsigned int texHeight)
+ {
+-	CGsPixelFormats::CPixelIndexorPSMCT32 indexor(m_pRAM, bufPtr, bufWidth);
++	//Pages are 64x32 pixels: the row of a page's offset table once per texture row
++	const uint32* pageOffsets = CGsPixelFormats::CPixelIndexorPSMCT32::GetPageOffsets();
+ 
+ 	uint32* dst = reinterpret_cast<uint32*>(m_pCvtBuffer);
+ 	for(unsigned int y = 0; y < texHeight; y++)
+ 	{
++		unsigned int srcY = texY + y;
++		uint32 rowBase = bufPtr + ((srcY >> 5) * bufWidth * CGsPixelFormats::PAGESIZE);
++		const uint32* rowOffsets = pageOffsets + ((srcY & 31) << 6);
+ 		for(unsigned int x = 0; x < texWidth; x++)
+ 		{
+-			dst[x] = indexor.GetPixel(texX + x, texY + y);
++			unsigned int srcX = texX + x;
++			uint32 address = (rowBase + ((srcX >> 6) * CGsPixelFormats::PAGESIZE) + rowOffsets[srcX & 63]) & (RAMSIZE - 1);
++			dst[x] = *reinterpret_cast<const uint32*>(m_pRAM + address);
+ 		}
+ 
+ 		dst += texWidth;
+@@ -336,20 +342,26 @@ void CGSH_OpenGL::TexUpdater_Psm32(uint32 bufPtr, uint32 bufWidth, unsigned int
+ template <typename IndexorType>
+ void CGSH_OpenGL::TexUpdater_Psm16(uint32 bufPtr, uint32 bufWidth, unsigned int texX, unsigned int texY, unsigned int texWidth, unsigned int texHeight)
+ {
+-	IndexorType indexor(m_pRAM, bufPtr, bufWidth);
++	//Pages are 64x64 pixels in both 16 bit layouts: the row of a page's offset table once per texture row
++	const uint32* pageOffsets = IndexorType::GetPageOffsets();
+ 
+ 	auto dst = reinterpret_cast<uint16*>(m_pCvtBuffer);
+ 	for(unsigned int y = 0; y < texHeight; y++)
+ 	{
++		unsigned int srcY = texY + y;
++		uint32 rowBase = bufPtr + ((srcY >> 6) * bufWidth * CGsPixelFormats::PAGESIZE);
++		const uint32* rowOffsets = pageOffsets + ((srcY & 63) << 6);
+ 		for(unsigned int x = 0; x < texWidth; x++)
+ 		{
+-			auto pixel = indexor.GetPixel(texX + x, texY + y);
++			unsigned int srcX = texX + x;
++			uint32 address = (rowBase + ((srcX >> 6) * CGsPixelFormats::PAGESIZE) + rowOffsets[srcX & 63]) & (RAMSIZE - 1);
++			uint32 pixel = *reinterpret_cast<const uint16*>(m_pRAM + address);
+ 			auto cvtPixel =
+ 			    (((pixel & 0x001F) >> 0) << 11) | //R
+ 			    (((pixel & 0x03E0) >> 5) << 6) |  //G
+ 			    (((pixel & 0x7C00) >> 10) << 1) | //B
+ 			    (pixel >> 15);                    //A
+-			dst[x] = cvtPixel;
++			dst[x] = static_cast<uint16>(cvtPixel);
+ 		}
+ 
+ 		dst += texWidth;
+diff --git a/Source/gs/GsSwRaster.h b/Source/gs/GsSwRaster.h
+index 8095fd8a..58a8a57c 100644
+--- a/Source/gs/GsSwRaster.h
++++ b/Source/gs/GsSwRaster.h
+@@ -736,6 +736,7 @@ private:
+ 
+ 	static int32 Wrap(int32 coord, uint32 mode, uint32 minValue, uint32 maxValue, uint32 size, uint32 lod)
+ 	{
++		if(mode == 0) return coord & (size - 1);
+ 		switch(mode)
+ 		{
+ 		default:
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 427d0c5c..52a574ce 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -652,10 +652,10 @@ std::string getVpu1Stats()
+ 	}
+ 	reasons += "]";
+ 	char text[512];
+-	snprintf(text, sizeof(text), "{\"mode\":%u,\"drains\":%llu,\"drainWaitMs\":%.1f,\"vblankWaitMs\":%.1f,\"ringFull\":%llu,\"records\":%llu,\"busyMs\":%.1f}",
++	snprintf(text, sizeof(text), "{\"mode\":%u,\"drains\":%llu,\"drainWaitMs\":%.1f,\"vblankWaitMs\":%.1f,\"ringFull\":%llu,\"records\":%llu,\"busyMs\":%.1f,\"stallMs\":%.1f,\"idleMs\":%.1f}",
+ 	         CVpu1Thread::g_mode.load(), (unsigned long long)stats.drains.load(), stats.drainWaitUs.load() / 1000.0,
+ 	         stats.vblankWaitUs.load() / 1000.0, (unsigned long long)stats.ringFull.load(), (unsigned long long)stats.records.load(),
+-	         stats.busyUs.load() / 1000.0);
++	         stats.busyUs.load() / 1000.0, stats.stallUs.load() / 1000.0, stats.idleUs.load() / 1000.0);
+ 	std::string result = text;
+ 	result.pop_back();
+ 	return result + ",\"waitsByReason\":" + reasons + "}";
+-- 
+2.51.0.windows.1
+

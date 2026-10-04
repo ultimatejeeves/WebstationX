@@ -1,0 +1,119 @@
+From cfe78b6c25b6b6bc5d49a4733b92507d60e28fc9 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 21:03:39 -0400
+Subject: [PATCH 6/6] Wasm: extern jumps are tail calls and get their signature
+ registered; stop on unregistered functions; optimisation loop guard and
+ statement trace
+
+---
+ include/Jitter.h            |  2 ++
+ src/Jitter_CodeGen_Wasm.cpp | 11 +++++++++--
+ src/Jitter_Optimize.cpp     | 26 ++++++++++++++++++++++++++
+ 3 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/include/Jitter.h b/include/Jitter.h
+index cf9f7a3..535b888 100644
+--- a/include/Jitter.h
++++ b/include/Jitter.h
+@@ -24,6 +24,8 @@ namespace Jitter
+ 
+ 	//Debug: when set, the next Compile on this thread writes its final statement list here and clears it.
+ 	inline thread_local std::string* g_statementDump = nullptr;
++	//Debug: print every statement list before code generation, and a note when a block starts compiling.
++	inline bool g_statementTrace = false;
+ 
+ 	class CJitter
+ 	{
+diff --git a/src/Jitter_CodeGen_Wasm.cpp b/src/Jitter_CodeGen_Wasm.cpp
+index cfc5e57..80df954 100644
+--- a/src/Jitter_CodeGen_Wasm.cpp
++++ b/src/Jitter_CodeGen_Wasm.cpp
+@@ -565,13 +565,19 @@ void CCodeGen_Wasm::PrepareSignatures(CWasmModuleBuilder& moduleBuilder, const S
+ 
+ 	for(const auto& statement : statements)
+ 	{
+-		if(statement.op != OP_CALL) continue;
++		if((statement.op != OP_CALL) && (statement.op != OP_EXTERNJMP)) continue;
+ 
+ 		auto src1 = statement.src1->GetSymbol().get();
+ 		assert(src1->m_type == SYM_CONSTANTPTR);
+ 
+ 		auto fctInfo = CWasmFunctionRegistry::FindFunction(src1->m_valueLow);
+ 		assert(fctInfo);
++		if(!fctInfo)
++		{
++			//Every function recompiled code calls has to be registered (CWasmFunctionRegistry::RegisterFunction).
++			printf("Jitter (Wasm): recompiled code calls an unregistered function (%u). Stopping.\n", static_cast<unsigned int>(src1->m_valueLow));
++			abort();
++		}
+ 
+ 		assert(!fctInfo->signature.empty());
+ 
+@@ -1196,7 +1202,8 @@ void CCodeGen_Wasm::Emit_ExternJmp(const STATEMENT& statement)
+ 	m_functionStream.Write8(Wasm::INST_I32_CONST);
+ 	CWasmModuleBuilder::WriteULeb128(m_functionStream, fctInfo->id);
+ 
+-	m_functionStream.Write8(Wasm::INST_CALL_INDIRECT);
++	//A jump does not come back: tail call, so nothing after it in this function runs.
++	m_functionStream.Write8(Wasm::INST_RETURN_CALL_INDIRECT);
+ 	m_functionStream.Write8(sigIdx); //Signature index
+ 	m_functionStream.Write8(0x00);   //Table index
+ }
+diff --git a/src/Jitter_Optimize.cpp b/src/Jitter_Optimize.cpp
+index 79c66fb..b95a977 100644
+--- a/src/Jitter_Optimize.cpp
++++ b/src/Jitter_Optimize.cpp
+@@ -140,8 +140,18 @@ StatementList CJitter::CollapseVersionedStatementList(const VERSIONED_STATEMENT_
+ 
+ void CJitter::Compile()
+ {
++	if(g_statementTrace)
++	{
++		printf("JITTRACE compile begin (%d blocks)\n", static_cast<int>(m_basicBlocks.size()));
++	}
++	unsigned int outerPasses = 0;
+ 	while(1)
+ 	{
++		if(++outerPasses > 4096)
++		{
++			printf("Jitter: block optimisation did not settle after %u passes, continuing as is.\n", outerPasses);
++			break;
++		}
+ 		for(auto& basicBlock : m_basicBlocks)
+ 		{
+ 			if(!basicBlock.optimized)
+@@ -159,8 +169,17 @@ void CJitter::Compile()
+ 
+ 				auto versionedStatements = GenerateVersionedStatementList(basicBlock.statements);
+ 
++				unsigned int passes = 0;
+ 				while(1)
+ 				{
++					if(++passes > 4096)
++					{
++						//The passes keep undoing each other: the list is valid after any full pass, so stop here.
++						std::ostringstream dump;
++						DumpStatementList(dump, versionedStatements.statements);
++						printf("Jitter: statement optimisation did not settle after %u passes, continuing as is.\n%s\n", passes, dump.str().c_str());
++						break;
++					}
+ 					bool dirty = false;
+ 					dirty |= ConstantPropagation(versionedStatements.statements);
+ 					dirty |= ConstantFolding(versionedStatements.statements);
+@@ -218,6 +237,13 @@ void CJitter::Compile()
+ 		g_statementDump = nullptr;
+ 	}
+ 
++	if(g_statementTrace)
++	{
++		std::ostringstream dump;
++		DumpStatementList(dump, result.statements);
++		printf("JITTRACE generate (stack %u)\n%s\n", stackSize, dump.str().c_str());
++	}
++
+ 	m_codeGen->GenerateCode(result.statements, stackSize);
+ 
+ 	m_labels.clear();
+-- 
+2.51.0.windows.1
+

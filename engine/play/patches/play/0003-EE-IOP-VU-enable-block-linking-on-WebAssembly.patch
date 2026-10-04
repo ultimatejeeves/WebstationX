@@ -1,0 +1,145 @@
+From 948fe7bff3114ea4c50d552db6037826504c0518 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 02:25:10 -0400
+Subject: [PATCH 03/43] EE/IOP/VU: enable block linking on WebAssembly
+
+---
+ Source/BasicBlock.cpp | 50 +++++++++++++++++++++++++++++++++++++++++--
+ Source/BasicBlock.h   |  5 +++++
+ 2 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/Source/BasicBlock.cpp b/Source/BasicBlock.cpp
+index 4c460e64..f18cb6a8 100644
+--- a/Source/BasicBlock.cpp
++++ b/Source/BasicBlock.cpp
+@@ -58,9 +58,20 @@ CBasicBlock::CBasicBlock(CMIPS& context, uint32 begin, uint32 end, BLOCK_CATEGOR
+ 		m_linkBlock[i] = nullptr;
+ #endif
+ 		m_linkBlockTrampolineOffset[i] = INVALID_LINK_SLOT;
++#ifdef __EMSCRIPTEN__
++		ResetWasmLinkSlot(static_cast<LINK_SLOT>(i));
++#endif
+ 	}
+ }
+ 
++#ifdef __EMSCRIPTEN__
++void CBasicBlock::ResetWasmLinkSlot(LINK_SLOT linkSlot)
++{
++	//Function pointers are table indices on WebAssembly.
++	m_wasmLinkSlots[linkSlot] = (linkSlot == LINK_SLOT_NEXT) ? reinterpret_cast<uintptr_t>(&NextBlockTrampoline) : reinterpret_cast<uintptr_t>(&BranchBlockTrampoline);
++}
++#endif
++
+ #ifdef AOT_BUILD_CACHE
+ 
+ Framework::CStdStream* CBasicBlock::m_aotBlockOutputStream(nullptr);
+@@ -98,6 +109,9 @@ void CBasicBlock::Compile()
+ 		jitter->End();
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	CMemoryFunction::SetNextWasmLinkBase(reinterpret_cast<uintptr_t>(m_wasmLinkSlots));
++#endif
+ 	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
+ 
+ #ifdef VTUNE_ENABLED
+@@ -297,12 +311,17 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
+ 		}
+ 		else
+ 		{
+-#if !defined(AOT_BUILD_CACHE) && !defined(__EMSCRIPTEN__)
++#if !defined(AOT_BUILD_CACHE)
+ 			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+ 			jitter->PushCst(0);
+ 			jitter->BeginIf(Jitter::CONDITION_EQ);
+ 			{
++#ifdef __EMSCRIPTEN__
++				jitter->JumpToDynamic(reinterpret_cast<void*>(static_cast<uintptr_t>(LINK_SLOT_BRANCH)));
++				m_linkBlockTrampolineOffset[LINK_SLOT_BRANCH] = 0;
++#else
+ 				jitter->JumpToDynamic(reinterpret_cast<void*>(&BranchBlockTrampoline));
++#endif
+ 			}
+ 			jitter->EndIf();
+ #endif
+@@ -315,12 +334,17 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
+ 		jitter->Add();
+ 		jitter->PullRel(offsetof(CMIPS, m_State.nPC));
+ 
+-#if !defined(AOT_BUILD_CACHE) && !defined(__EMSCRIPTEN__)
++#if !defined(AOT_BUILD_CACHE)
+ 		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+ 		jitter->PushCst(0);
+ 		jitter->BeginIf(Jitter::CONDITION_EQ);
+ 		{
++#ifdef __EMSCRIPTEN__
++			jitter->JumpToDynamic(reinterpret_cast<void*>(static_cast<uintptr_t>(LINK_SLOT_NEXT)));
++			m_linkBlockTrampolineOffset[LINK_SLOT_NEXT] = 0;
++#else
+ 			jitter->JumpToDynamic(reinterpret_cast<void*>(&NextBlockTrampoline));
++#endif
+ 		}
+ 		jitter->EndIf();
+ #endif
+@@ -398,6 +422,16 @@ void CBasicBlock::SetOutLink(LINK_SLOT linkSlot, BlockOutLinkPointer link)
+ 
+ void CBasicBlock::LinkBlock(LINK_SLOT linkSlot, CBasicBlock* otherBlock)
+ {
++#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
++	assert(!IsEmpty());
++	assert(!otherBlock->IsEmpty());
++	assert(m_linkBlockTrampolineOffset[linkSlot] != INVALID_LINK_SLOT);
++#ifdef _DEBUG
++	assert(m_linkBlock[linkSlot] == nullptr);
++	m_linkBlock[linkSlot] = otherBlock;
++#endif
++	m_wasmLinkSlots[linkSlot] = reinterpret_cast<uintptr_t>(otherBlock->m_function.GetCode());
++#endif
+ #if !defined(AOT_ENABLED) && !defined(__EMSCRIPTEN__)
+ 	assert(!IsEmpty());
+ 	assert(!otherBlock->IsEmpty());
+@@ -417,6 +451,15 @@ void CBasicBlock::LinkBlock(LINK_SLOT linkSlot, CBasicBlock* otherBlock)
+ 
+ void CBasicBlock::UnlinkBlock(LINK_SLOT linkSlot)
+ {
++#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
++	assert(!IsEmpty());
++	assert(m_linkBlockTrampolineOffset[linkSlot] != INVALID_LINK_SLOT);
++#ifdef _DEBUG
++	assert(m_linkBlock[linkSlot] != nullptr);
++	m_linkBlock[linkSlot] = nullptr;
++#endif
++	ResetWasmLinkSlot(linkSlot);
++#endif
+ #if !defined(AOT_ENABLED) && !defined(__EMSCRIPTEN__)
+ 	assert(!IsEmpty());
+ 	assert(linkSlot < LINK_SLOT_MAX);
+@@ -452,6 +495,9 @@ void CBasicBlock::HandleExternalFunctionReference(uintptr_t symbol, uint32 offse
+ void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
+ {
+ #ifndef AOT_USE_CACHE
++#ifdef __EMSCRIPTEN__
++	CMemoryFunction::SetNextWasmLinkBase(reinterpret_cast<uintptr_t>(m_wasmLinkSlots));
++#endif
+ 	m_function = other->m_function.CreateInstance();
+ 	std::copy(std::begin(other->m_linkBlockTrampolineOffset), std::end(other->m_linkBlockTrampolineOffset), m_linkBlockTrampolineOffset);
+ #ifdef _DEBUG
+diff --git a/Source/BasicBlock.h b/Source/BasicBlock.h
+index 56ef0adc..c72ed40a 100644
+--- a/Source/BasicBlock.h
++++ b/Source/BasicBlock.h
+@@ -132,6 +132,11 @@ private:
+ 	uint32 m_recycleCount = 0;
+ 	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];
+ 	uint32 m_linkBlockTrampolineOffset[LINK_SLOT_MAX];
++#ifdef __EMSCRIPTEN__
++	//Table index of the function each link slot tail calls into (a trampoline when unlinked).
++	uint32 m_wasmLinkSlots[LINK_SLOT_MAX];
++	void ResetWasmLinkSlot(LINK_SLOT);
++#endif
+ #ifdef _DEBUG
+ 	CBasicBlock* m_linkBlock[LINK_SLOT_MAX];
+ #endif
+-- 
+2.51.0.windows.1
+

@@ -1,0 +1,40 @@
+name: Checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  application:
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+      - run: docker build -t webstationx:ci .
+      - name: Container smoke test
+        run: |
+          docker run -d --name wsx-ci -p 8090:8090 webstationx:ci
+          for attempt in $(seq 1 30); do
+            if curl --fail http://localhost:8090/api/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs wsx-ci
+          exit 1
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan history
+        run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 git --redact --no-banner /repo

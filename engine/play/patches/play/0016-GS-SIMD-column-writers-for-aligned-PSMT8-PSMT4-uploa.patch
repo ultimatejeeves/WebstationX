@@ -1,0 +1,265 @@
+From eb7c4ede335b63bad3191f118c4fe98691a0042a Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 15:19:03 -0400
+Subject: [PATCH 16/43] GS: SIMD column writers for aligned PSMT8/PSMT4 uploads
+
+Nearly every texture upload is column aligned (THPS4: all PSMT8, 99% of PSMT4, each transfer in one
+piece). A column is 4 rows of 16/32 pixels stored as 64 contiguous bytes in one of two orders, so
+four source rows become the column through wasm i8x16 swizzles. The swizzle tables are derived from
+CPixelIndexor's page offsets and checked when built (the fast path stays off on any surprise).
+Bit-identical to the reference (transfer-test); 256x256 upload vs reference: PSMT8 9.8x, PSMT4 19x
+(the page-run writers were 2x). GS thread busy per frame in THPS4: 11.5 -> 7.3 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/gs/GsTransferFast.h | 203 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 203 insertions(+)
+
+diff --git a/Source/gs/GsTransferFast.h b/Source/gs/GsTransferFast.h
+index 0ad83ba3..32074205 100644
+--- a/Source/gs/GsTransferFast.h
++++ b/Source/gs/GsTransferFast.h
+@@ -9,8 +9,13 @@
+ // (see tools/ps2/transfer-test.cpp in WebStationX).
+ 
+ #include <algorithm>
++#include <cstring>
++#include <type_traits>
+ #include "Types.h"
+ #include "GsPixelFormats.h"
++#ifdef __wasm_simd128__
++#include <wasm_simd128.h>
++#endif
+ 
+ namespace GsTransferFast
+ {
+@@ -23,6 +28,179 @@ namespace GsTransferFast
+ 		uint32 rrw;
+ 	};
+ 
++#ifdef __wasm_simd128__
++	// Column-at-a-time writers (wasm SIMD) for column aligned uploads, which is nearly every texture upload
++	// (THPS4: all PSMT8, 99% of PSMT4, each transfer in one piece). A PSMT8/PSMT4 column is 4 rows of 16/32
++	// pixels stored as 64 contiguous bytes in one of two fixed orders (alternating by column row), so four
++	// source rows become the column's 64 bytes through byte swizzles. The swizzle tables are derived from
++	// CPixelIndexor's page offsets and checked while being built (any surprise leaves the fast path off),
++	// which keeps the result bit-identical to the per-pixel path.
++	struct ColumnSource
++	{
++		v128_t lanes;  // swizzle indices into the source vector, 0x80 = lane not from it
++		uint32 vector; // PSMT8: source row; PSMT4: row * 2 + 1 for odd pixels
++	};
++
++	template <typename Storage, bool Nibbles>
++	struct ColumnTables
++	{
++		enum
++		{
++			PW = Storage::PAGEWIDTH,
++			PH = Storage::PAGEHEIGHT,
++			CW = Storage::COLUMNWIDTH,
++			CH = 4,
++			UNITS = Nibbles ? 2 : 1, // stored units per byte
++			VECTORS = Nibbles ? 8 : 4,
++		};
++
++		bool valid = false;
++		uint32 columnBase[PH / CH][PW / CW]; // byte offset of each column in its page
++		// Per column parity, 16 byte output vector and half (PSMT4: low/high nibble).
++		ColumnSource sources[2][4][UNITS][VECTORS];
++		uint32 sourceCount[2][4][UNITS] = {};
++
++		ColumnTables()
++		{
++			const uint32* offsets = reinterpret_cast<const uint32*>(CGsPixelFormats::CPixelIndexor<Storage>::GetPageOffsets());
++			// Where each stored unit of a column comes from (row * CW + x), per parity.
++			int32 from[2][64 * UNITS];
++			bool seen[2] = {};
++			std::fill(&from[0][0], &from[0][0] + (2 * 64 * UNITS), -1);
++			for(uint32 cy = 0; cy < PH / CH; cy++)
++			{
++				for(uint32 cx = 0; cx < PW / CW; cx++)
++				{
++					uint32 base = ~0U;
++					for(uint32 r = 0; r < CH; r++)
++					{
++						for(uint32 c = 0; c < CW; c++)
++						{
++							base = std::min(base, offsets[(cy * CH + r) * PW + cx * CW + c]);
++						}
++					}
++					if(base % (64 * UNITS)) return;
++					columnBase[cy][cx] = base / UNITS;
++					auto& map = from[cy & 1];
++					for(uint32 r = 0; r < CH; r++)
++					{
++						for(uint32 c = 0; c < CW; c++)
++						{
++							uint32 unit = offsets[(cy * CH + r) * PW + cx * CW + c] - base;
++							if(unit >= (64 * UNITS)) return;
++							int32 source = r * CW + c;
++							if(!seen[cy & 1])
++							{
++								if(map[unit] != -1) return;
++								map[unit] = source;
++							}
++							else if(map[unit] != source)
++							{
++								return;
++							}
++						}
++					}
++					seen[cy & 1] = true;
++				}
++			}
++			for(uint32 parity = 0; parity < 2; parity++)
++			{
++				for(uint32 v = 0; v < 4; v++)
++				{
++					for(uint32 h = 0; h < UNITS; h++)
++					{
++						uint8 lanes[VECTORS][16];
++						bool used[VECTORS] = {};
++						memset(lanes, 0x80, sizeof(lanes));
++						for(uint32 j = 0; j < 16; j++)
++						{
++							int32 source = from[parity][(v * 16 + j) * UNITS + h];
++							if(source < 0) return;
++							uint32 r = source / CW;
++							uint32 c = source % CW;
++							uint32 vector = Nibbles ? (r * 2 + (c & 1)) : r;
++							lanes[vector][j] = static_cast<uint8>(Nibbles ? (c / 2) : c);
++							used[vector] = true;
++						}
++						uint32& count = sourceCount[parity][v][h];
++						for(uint32 vector = 0; vector < VECTORS; vector++)
++						{
++							if(!used[vector]) continue;
++							sources[parity][v][h][count].lanes = wasm_v128_load(lanes[vector]);
++							sources[parity][v][h][count].vector = vector;
++							count++;
++						}
++					}
++				}
++			}
++			valid = true;
++		}
++
++		v128_t Gather(const v128_t* vectors, uint32 parity, uint32 v, uint32 h) const
++		{
++			const ColumnSource* source = sources[parity][v][h];
++			v128_t result = wasm_i8x16_swizzle(vectors[source[0].vector], source[0].lanes);
++			for(uint32 i = 1; i < sourceCount[parity][v][h]; i++)
++			{
++				result = wasm_v128_or(result, wasm_i8x16_swizzle(vectors[source[i].vector], source[i].lanes));
++			}
++			return result;
++		}
++
++		// Writes 4 rows of `width` pixels (a multiple of CW) to the columns starting at (x, y), x % CW == 0 and
++		// y % 4 == 0, from rows `rowBytes` apart. Returns whether GS memory changed.
++		bool WriteColumnRow(uint8* ram, const Rect& rect, uint32 x, uint32 y, uint32 width, const uint8* src, uint32 rowBytes) const
++		{
++			const uint32 ramMask = CGSHandler::RAMSIZE - 1;
++			const uint32 parity = (y / CH) & 1;
++			const uint32 columnRow = (y % PH) / CH;
++			const v128_t lowNibbles = wasm_i8x16_splat(0x0F);
++			v128_t diff = wasm_i8x16_splat(0);
++			for(uint32 cx = 0; cx < width; cx += CW)
++			{
++				uint32 px = x + cx;
++				// Same evaluation order as CPixelIndexor (matters for odd buffer widths).
++				uint32 pageNum = (px / PW) + ((y / PH) * (rect.dstWidth * 64)) / PW;
++				uint8* column = ram + ((rect.dstPtr + pageNum * CGsPixelFormats::PAGESIZE + columnBase[columnRow][(px % PW) / CW]) & ramMask);
++				const uint8* in = src + (cx / UNITS);
++				v128_t vectors[VECTORS];
++				for(uint32 r = 0; r < CH; r++)
++				{
++					v128_t row = wasm_v128_load(in + r * rowBytes);
++					if(Nibbles)
++					{
++						vectors[r * 2] = wasm_v128_and(row, lowNibbles);
++						vectors[r * 2 + 1] = wasm_u8x16_shr(row, 4);
++					}
++					else
++					{
++						vectors[r] = row;
++					}
++				}
++				for(uint32 v = 0; v < 4; v++)
++				{
++					v128_t out = Gather(vectors, parity, v, 0);
++					if(Nibbles)
++					{
++						out = wasm_v128_or(out, wasm_i8x16_shl(Gather(vectors, parity, v, 1), 4));
++					}
++					uint8* dst = column + v * 16;
++					diff = wasm_v128_or(diff, wasm_v128_xor(out, wasm_v128_load(dst)));
++					wasm_v128_store(dst, out);
++				}
++			}
++			return wasm_v128_any_true(diff);
++		}
++	};
++
++	template <typename Storage, bool Nibbles>
++	const ColumnTables<Storage, Nibbles>& GetColumnTables()
++	{
++		static const ColumnTables<Storage, Nibbles> tables;
++		return tables;
++	}
++#endif
++
+ 	// Writes `count` pixels. rrx/rry is the transfer cursor (TRXCONTEXT) and is advanced.
+ 	template <typename Storage>
+ 	bool WriteGeneric(uint8* ram, const Rect& rect, uint32& rrx, uint32& rry, const typename Storage::Unit* src, uint32 count)
+@@ -37,10 +215,23 @@ namespace GsTransferFast
+ 		const uint32 ramMask = CGSHandler::RAMSIZE - 1;
+ 		uint32 dirty = 0;
+ 		uint32 i = 0;
++#ifdef __wasm_simd128__
++		constexpr bool columns = std::is_same<Storage, CGsPixelFormats::STORAGEPSMT8>::value;
++		const auto& tables = GetColumnTables<CGsPixelFormats::STORAGEPSMT8, false>();
++#endif
+ 		while(i < count)
+ 		{
+ 			uint32 x = (rrx + rect.dsax) % 2048;
+ 			uint32 y = (rry + rect.dsay) % 2048;
++#ifdef __wasm_simd128__
++			if(columns && (rrx == 0) && ((count - i) >= (4 * rect.rrw)) && ((x % 16) == 0) && ((rect.rrw % 16) == 0) && ((y % 4) == 0) && ((x + rect.rrw) <= 2048) && tables.valid)
++			{
++				dirty |= tables.WriteColumnRow(ram, rect, x, y, rect.rrw, reinterpret_cast<const uint8*>(src + i), rect.rrw);
++				i += 4 * rect.rrw;
++				rry += 4;
++				continue;
++			}
++#endif
+ 			uint32 rowLeft = (rrx < rect.rrw) ? (rect.rrw - rrx) : ~0U;
+ 			uint32 run = std::min<uint32>(count - i, rowLeft);
+ 			run = std::min<uint32>(run, PW - (x % PW));
+@@ -83,10 +274,22 @@ namespace GsTransferFast
+ 		const uint32 count = byteCount * 2;
+ 		uint32 dirty = 0;
+ 		uint32 i = 0;
++#ifdef __wasm_simd128__
++		const auto& tables = GetColumnTables<Storage, true>();
++#endif
+ 		while(i < count)
+ 		{
+ 			uint32 x = (rrx + rect.dsax) % 2048;
+ 			uint32 y = (rry + rect.dsay) % 2048;
++#ifdef __wasm_simd128__
++			if((rrx == 0) && ((i % 2) == 0) && ((count - i) >= (4 * rect.rrw)) && ((x % 32) == 0) && ((rect.rrw % 32) == 0) && ((y % 4) == 0) && ((x + rect.rrw) <= 2048) && tables.valid)
++			{
++				dirty |= tables.WriteColumnRow(ram, rect, x, y, rect.rrw, src + (i / 2), rect.rrw / 2);
++				i += 4 * rect.rrw;
++				rry += 4;
++				continue;
++			}
++#endif
+ 			uint32 rowLeft = (rrx < rect.rrw) ? (rect.rrw - rrx) : ~0U;
+ 			uint32 run = std::min<uint32>(count - i, rowLeft);
+ 			run = std::min<uint32>(run, PW - (x % PW));
+-- 
+2.51.0.windows.1
+

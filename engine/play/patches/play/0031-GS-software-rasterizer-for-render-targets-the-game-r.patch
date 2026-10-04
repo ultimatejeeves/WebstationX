@@ -1,0 +1,1482 @@
+From d450b2a9e13ca4fa2b6a59f5cf1f0250f6423e31 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 12:38:19 -0400
+Subject: [PATCH 31/43] GS: software rasterizer for render targets the game
+ reads back
+
+Targets a game downloads (directly, or after copying them elsewhere) are drawn by CGsSwRaster straight
+into GS memory, following the GS rules: top-left fill, 4 bit bilinear weights, mip level from Q/L/K,
+integer blending and tests, destination formats. ATV Offroad Fury 2 computes its near terrain on the
+GS (VIF codes as flat sprites, noise textures blended per mip level, heights from interpolated Z) and
+downloads the result as VIF packets: the GL renderer can't give those bits back.
+---
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp |  197 +++++
+ Source/gs/GSH_OpenGL/GSH_OpenGL.h   |   30 +
+ Source/gs/GsSwRaster.h              | 1132 +++++++++++++++++++++++++++
+ Source/gs/WsxGsStats.h              |    2 +
+ 4 files changed, 1361 insertions(+)
+ create mode 100644 Source/gs/GsSwRaster.h
+
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 2b118a8d..d0880428 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -131,6 +131,13 @@ void CGSH_OpenGL::ResetImpl()
+ 	m_validGlState = 0;
+ 	m_nVtxCount = 0;
+ 	m_drawingToDepth = false;
++	m_swRaster.reset();
++	m_swTargets.clear();
++	m_swDepthPtrs.clear();
++	m_swDisplayedPtrs.clear();
++	m_swCopies.clear();
++	m_swLastFbPtr = ~0U;
++	m_swDirtyPending = false;
+ 	m_primitiveType = PRIM_INVALID;
+ 	m_pendingPrim = false;
+ 	m_pendingPrimValue = 0;
+@@ -156,6 +163,32 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 	m_renderState.isValid = false;
+ 	m_validGlState = 0;
+ 
++	SwFlushDirty();
++	m_swFlipCount++;
++	if(dispInfo.layers[0].enabled && (dispInfo.layers[0].bufPtr != m_swLastDisplayedPtr))
++	{
++		m_swLastDisplayedPtr = dispInfo.layers[0].bufPtr;
++		g_wsxGsStats.newFrames.fetch_add(1, std::memory_order_relaxed);
++	}
++	for(const auto& layer : dispInfo.layers)
++	{
++		if(!layer.enabled) continue;
++		m_swDisplayedPtrs.insert(layer.bufPtr);
++		m_swTargets.erase(layer.bufPtr);
++	}
++	for(auto targetIterator = m_swTargets.begin(); targetIterator != m_swTargets.end();)
++	{
++		if((m_swFlipCount - targetIterator->second) > SW_TARGET_LIFETIME)
++		{
++			targetIterator = m_swTargets.erase(targetIterator);
++		}
++		else
++		{
++			targetIterator++;
++		}
++	}
++	if(m_swTargets.empty()) m_swDepthPtrs.clear();
++
+ 	const auto& dispLayer = dispInfo.layers[0];
+ 
+ 	FramebufferPtr framebuffer;
+@@ -2070,8 +2103,20 @@ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
+ 			m_PrimitiveMode <<= m_nReg[GS_REG_PRMODE];
+ 		}
+ 
++		if(nDrawingKick && !m_swTargets.empty())
++		{
++			auto frame = make_convertible<FRAME>(m_nReg[GS_REG_FRAME_1 + m_PrimitiveMode.nContext]);
++			if(m_swTargets.find(frame.GetBasePtr()) != m_swTargets.end())
++			{
++				SwDrawPrimitive();
++				nDrawingKick = false;
++			}
++		}
++
+ 		if(nDrawingKick)
+ 		{
++			if(m_swDirtyPending) SwFlushDirty();
++
+ 			// Fast skip if nothing relevant changed since last draw
+ 			bool needCtx = true;
+ 			if(m_renderState.isValid && m_renderState.isTextureStateValid && m_renderState.isFramebufferStateValid)
+@@ -2162,6 +2207,7 @@ void CGSH_OpenGL::ProcessHostToLocalTransfer()
+ 	{
+ 		g_wsxGsStats.transfersDirty.fetch_add(1, std::memory_order_relaxed);
+ 		FlushVertexBuffer();
++		if(m_swRaster) m_swRaster->InvalidateTextures();
+ 		m_renderState.isTextureStateValid = false;
+ 		m_renderState.isFramebufferStateValid = false;
+ 
+@@ -2190,6 +2236,14 @@ void CGSH_OpenGL::ProcessLocalToHostTransfer()
+ 	auto trxPos = make_convertible<TRXPOS>(m_nReg[GS_REG_TRXPOS]);
+ 	auto trxReg = make_convertible<TRXREG>(m_nReg[GS_REG_TRXREG]);
+ 
++	if(g_wsxGsTrace.load(std::memory_order_relaxed) > 0)
++	{
++		printf("GST l2h bitblt=%llx trxpos=%llx trxreg=%llx\n", (unsigned long long)m_nReg[GS_REG_BITBLTBUF], (unsigned long long)m_nReg[GS_REG_TRXPOS],
++		       (unsigned long long)m_nReg[GS_REG_TRXREG]);
++	}
++	SwFlushDirty();
++	SwNoteReadback(bltBuf.GetSrcPtr());
++
+ 	if(bltBuf.nSrcPsm != PSMCT32) return;
+ 
+ 	uint32 transferAddress = bltBuf.GetSrcPtr();
+@@ -2317,6 +2371,20 @@ void CGSH_OpenGL::ProcessLocalToLocalTransfer()
+ 	bool foundSrc = srcFramebufferIterator != std::end(m_framebuffers);
+ 	bool foundDest = dstFramebufferIterator != std::end(m_framebuffers);
+ 
++	SwFlushDirty();
++	if(m_swRaster) m_swRaster->InvalidateTextures();
++	if(IsSwSurface(bltBuf.GetSrcPtr()) || IsSwSurface(bltBuf.GetDstPtr()))
++	{
++		//GS memory has these
++		foundSrc = false;
++		foundDest = false;
++	}
++	if(!foundDest)
++	{
++		//A download of the destination will tell that the source is used as data
++		SwNoteCopy(bltBuf.GetDstPtr(), bltBuf.GetSrcPtr());
++	}
++
+ 	//A framebuffer blit preserves pixels only when both storage formats agree. Partial copies,
+ 	//format reinterpretation and self-copies use the format-aware memory path below.
+ 	bool fullCopy = foundSrc && foundDest && (srcFramebufferIterator != dstFramebufferIterator) &&
+@@ -2421,6 +2489,7 @@ void CGSH_OpenGL::ProcessLocalToLocalTransfer()
+ bool CGSH_OpenGL::ReadGlPixels(uint32 bufPtr, uint32 bufWidth, uint32 psm, uint32 x, uint32 y, uint32 width, uint32 height, std::vector<uint32>& pixels)
+ {
+ 	if(m_multisampleEnabled) return false;
++	if(IsSwSurface(bufPtr)) return false;
+ 
+ 	bool isColor = (psm == PSMCT32) || (psm == PSMCT24);
+ 	bool isDepth = (psm == PSMZ32) || (psm == PSMZ24);
+@@ -2572,9 +2641,137 @@ bool CGSH_OpenGL::ReadDepthPixels(const DepthbufferPtr& depthbuffer, uint32 x, u
+ 	return true;
+ }
+ 
++bool CGSH_OpenGL::IsSwSurface(uint32 ptr) const
++{
++	if(m_swTargets.empty()) return false;
++	return (m_swTargets.find(ptr) != m_swTargets.end()) || (m_swDepthPtrs.find(ptr) != m_swDepthPtrs.end());
++}
++
++void CGSH_OpenGL::SwNoteCopy(uint32 dstPtr, uint32 srcPtr)
++{
++	for(const auto& copy : m_swCopies)
++	{
++		if((copy.dstPtr == dstPtr) && (copy.srcPtr == srcPtr)) return;
++	}
++	if(m_swCopies.size() >= SW_COPY_MAX) m_swCopies.erase(m_swCopies.begin());
++	SWCOPY copy;
++	copy.dstPtr = dstPtr;
++	copy.srcPtr = srcPtr;
++	m_swCopies.push_back(copy);
++}
++
++//The game downloads pixels from srcPtr: what was drawn there (or copied there from a buffer we draw) is data
++//to it. Those targets are drawn in software from now on, where every bit is what the GS would have produced.
++void CGSH_OpenGL::SwNoteReadback(uint32 srcPtr)
++{
++	auto mark = [&](uint32 ptr) {
++		if(m_swDisplayedPtrs.find(ptr) != m_swDisplayedPtrs.end()) return;
++		bool isTarget = (m_swTargets.find(ptr) != m_swTargets.end());
++		if(!isTarget)
++		{
++			bool isFramebuffer = std::any_of(m_framebuffers.begin(), m_framebuffers.end(),
++			                                 [&](const FramebufferPtr& framebuffer) { return framebuffer->m_basePtr == ptr; });
++			if(!isFramebuffer) return;
++			FlushVertexBuffer();
++			m_renderState.isValid = false;
++		}
++		m_swTargets[ptr] = m_swFlipCount;
++	};
++	mark(srcPtr);
++	for(const auto& copy : m_swCopies)
++	{
++		if(copy.dstPtr == srcPtr) mark(copy.srcPtr);
++	}
++}
++
++void CGSH_OpenGL::SwDrawPrimitive()
++{
++	unsigned int context = m_PrimitiveMode.nContext;
++	auto frame = make_convertible<FRAME>(m_nReg[GS_REG_FRAME_1 + context]);
++	auto zbuf = make_convertible<ZBUF>(m_nReg[GS_REG_ZBUF_1 + context]);
++	auto offset = make_convertible<XYOFFSET>(m_nReg[GS_REG_XYOFFSET_1 + context]);
++
++	if(!m_swRaster) m_swRaster = std::make_unique<CGsSwRaster>(m_pRAM, m_pCLUT);
++	if(frame.GetBasePtr() != m_swLastFbPtr)
++	{
++		SwFlushDirty();
++		m_swLastFbPtr = frame.GetBasePtr();
++	}
++	if(!zbuf.nMask) m_swDepthPtrs.insert(zbuf.GetBasePtr());
++
++	m_swRaster->SetContext(m_nReg, m_PrimitiveMode);
++
++	auto makeVertex = [&](const VERTEX& source) {
++		auto xyz = make_convertible<XYZ>(source.position);
++		auto rgbaq = make_convertible<RGBAQ>(source.rgbaq);
++		auto st = make_convertible<ST>(source.st);
++		auto uv = make_convertible<UV>(source.uv);
++		CGsSwRaster::VERTEX vertex;
++		vertex.x = static_cast<int32>(xyz.nX) - static_cast<int32>(offset.nOffsetX);
++		vertex.y = static_cast<int32>(xyz.nY) - static_cast<int32>(offset.nOffsetY);
++		vertex.z = xyz.nZ;
++		vertex.rgba = static_cast<uint32>(source.rgbaq);
++		vertex.s = st.nS;
++		vertex.t = st.nT;
++		vertex.q = rgbaq.nQ;
++		vertex.u = uv.nU & 0x3FFF;
++		vertex.v = uv.nV & 0x3FFF;
++		vertex.fog = source.fog;
++		return vertex;
++	};
++
++	switch(m_primitiveType)
++	{
++	case PRIM_POINT:
++		m_swRaster->DrawPoint(makeVertex(m_VtxBuffer[0]));
++		break;
++	case PRIM_TRIANGLE:
++	case PRIM_TRIANGLESTRIP:
++	case PRIM_TRIANGLEFAN:
++		m_swRaster->DrawTriangle(makeVertex(m_VtxBuffer[2]), makeVertex(m_VtxBuffer[1]), makeVertex(m_VtxBuffer[0]));
++		break;
++	case PRIM_SPRITE:
++		m_swRaster->DrawSprite(makeVertex(m_VtxBuffer[1]), makeVertex(m_VtxBuffer[0]));
++		break;
++	default:
++		//Lines aren't drawn
++		break;
++	}
++	m_swDirtyPending = true;
++	g_wsxGsStats.swPrims.fetch_add(1, std::memory_order_relaxed);
++}
++
++//What the software rasterizer wrote may be a texture (or under a buffer) of ours
++void CGSH_OpenGL::SwFlushDirty()
++{
++	if(!m_swDirtyPending) return;
++	m_swDirtyPending = false;
++	auto dirty = m_swRaster->TakeDirty();
++	if(!dirty.any) return;
++	m_swRaster->InvalidateTextures();
++
++	auto invalidate = [&](uint32 ptr, uint32 psm) {
++		bool is16 = (psm == PSMCT16) || (psm == PSMCT16S) || (psm == PSMZ16) || (psm == PSMZ16S);
++		uint32 size = (dirty.maxY + 1) * (dirty.fbWidth * 64) * (is16 ? 2 : 4);
++		//Up to the end of the page the last row is in
++		size = (size + (CGsPixelFormats::PAGESIZE * dirty.fbWidth) + CGsPixelFormats::PAGESIZE - 1) & ~(CGsPixelFormats::PAGESIZE - 1);
++		m_textureCache.InvalidateRange(ptr, size);
++		for(const auto& framebuffer : m_framebuffers)
++		{
++			if(IsSwSurface(framebuffer->m_basePtr)) continue;
++			framebuffer->m_cachedArea.Invalidate(ptr, size);
++		}
++	};
++	invalidate(dirty.fbPtr, dirty.fbPsm);
++	if(dirty.zWritten) invalidate(dirty.zPtr, dirty.zPsm);
++	m_renderState.isTextureStateValid = false;
++	m_renderState.isFramebufferStateValid = false;
++}
++
+ void CGSH_OpenGL::ProcessClutTransfer(uint32 csa, uint32)
+ {
+ 	FlushVertexBuffer();
++	if(m_swRaster) m_swRaster->InvalidateTextures();
+ 	m_renderState.isTextureStateValid = false;
+ 	PalCache_Invalidate(csa);
+ }
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index 97805ca6..c3030059 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -6,6 +6,9 @@
+ #include "../GsDebuggerInterface.h"
+ #include "../GsCachedArea.h"
+ #include "../GsTextureCache.h"
++#include "../GsSwRaster.h"
++#include <map>
++#include <set>
+ #include "opengl/OpenGlDef.h"
+ #include "opengl/Program.h"
+ #include "opengl/Shader.h"
+@@ -462,6 +465,33 @@ private:
+ 	unsigned int m_primitiveType;
+ 	bool m_drawingToDepth = false;
+ 
++	//Render targets the game downloads are drawn in software, straight into GS memory (GsSwRaster.h)
++	struct SWCOPY
++	{
++		uint32 dstPtr = 0;
++		uint32 srcPtr = 0;
++	};
++	enum
++	{
++		SW_TARGET_LIFETIME = 600, //Flips a target stays in software without being read back
++		SW_COPY_MAX = 32,
++	};
++	bool IsSwSurface(uint32) const;
++	void SwNoteCopy(uint32, uint32);
++	void SwNoteReadback(uint32);
++	void SwDrawPrimitive();
++	void SwFlushDirty();
++
++	std::unique_ptr<CGsSwRaster> m_swRaster;
++	std::map<uint32, uint32> m_swTargets; //Frame buffer pointer -> flip it was last read back at
++	std::set<uint32> m_swDepthPtrs;
++	std::set<uint32> m_swDisplayedPtrs;
++	std::vector<SWCOPY> m_swCopies; //Recent copies out of our buffers into GS memory
++	uint32 m_swFlipCount = 0;
++	uint32 m_swLastFbPtr = ~0U;
++	uint32 m_swLastDisplayedPtr = ~0U;
++	bool m_swDirtyPending = false;
++
+ 	static const GLenum g_nativeClampModes[CGSHandler::CLAMP_MODE_MAX];
+ 	static const unsigned int g_shaderClampModes[CGSHandler::CLAMP_MODE_MAX];
+ 	static const unsigned int g_alphaTestInverse[CGSHandler::ALPHA_TEST_MAX];
+diff --git a/Source/gs/GsSwRaster.h b/Source/gs/GsSwRaster.h
+new file mode 100644
+index 00000000..db3ce477
+--- /dev/null
++++ b/Source/gs/GsSwRaster.h
+@@ -0,0 +1,1132 @@
++#pragma once
++
++//Software rasterizer for render targets a game reads back (WebStationX).
++//
++//Some games use the GS as a calculator: they draw into an offscreen buffer, copy it around and download
++//the pixels as data (ATV Offroad Fury 2 builds its near terrain's VIF packets this way: VIF codes drawn
++//as flat sprites, vertex bytes from noise textures blended with mip levels chosen through Q, heights from
++//interpolated Z). Every bit of those pixels matters, and a GPU can't give them back: alpha is kept at twice
++//its value, mip levels are picked from derivatives, depth is a float. Such targets are drawn here instead,
++//straight into GS memory, following the GS rules (top-left fill, 4 bit bilinear weights, LOD from Q, L and K,
++//integer blending, destination formats).
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <vector>
++#include "GSHandler.h"
++#include "GsPixelFormats.h"
++
++class CGsSwRaster
++{
++public:
++	struct VERTEX
++	{
++		int32 x = 0; //12.4, drawing offset removed
++		int32 y = 0;
++		uint32 z = 0;
++		uint32 rgba = 0;
++		float s = 0;
++		float t = 0;
++		float q = 1;
++		uint32 u = 0; //12.4
++		uint32 v = 0;
++		uint32 fog = 0;
++	};
++
++	//Memory written since the last TakeDirty (rows of the color and depth buffers)
++	struct DIRTY
++	{
++		bool any = false;
++		uint32 fbPtr = 0;
++		uint32 fbWidth = 0;
++		uint32 fbPsm = 0;
++		bool zWritten = false;
++		uint32 zPtr = 0;
++		uint32 zPsm = 0;
++		uint32 maxY = 0;
++	};
++
++	CGsSwRaster(uint8* ram, uint16* clut)
++	    : m_ram(ram)
++	    , m_clut(clut)
++	{
++	}
++
++	//Texture memory or the CLUT changed
++	void InvalidateTextures()
++	{
++		m_memGeneration++;
++	}
++
++	DIRTY TakeDirty()
++	{
++		auto result = m_dirty;
++		m_dirty = DIRTY();
++		return result;
++	}
++
++	void SetContext(const uint64* regs, uint64 primReg)
++	{
++		auto prim = make_convertible<CGSHandler::PRMODE>(primReg);
++		unsigned int ctx = prim.nContext;
++
++		auto frame = make_convertible<CGSHandler::FRAME>(regs[GS_REG_FRAME_1 + ctx]);
++		auto zbuf = make_convertible<CGSHandler::ZBUF>(regs[GS_REG_ZBUF_1 + ctx]);
++		auto test = make_convertible<CGSHandler::TEST>(regs[GS_REG_TEST_1 + ctx]);
++		auto alpha = make_convertible<CGSHandler::ALPHA>(regs[GS_REG_ALPHA_1 + ctx]);
++		auto scissor = make_convertible<CGSHandler::SCISSOR>(regs[GS_REG_SCISSOR_1 + ctx]);
++		auto fogCol = make_convertible<CGSHandler::FOGCOL>(regs[GS_REG_FOGCOL]);
++
++		m_fbPtr = frame.GetBasePtr();
++		m_fbBw = frame.nWidth;
++		m_fbPsm = frame.nPsm;
++		m_fbMask = frame.nMask;
++		m_fbBits = PsmBits(m_fbPsm);
++
++		m_zPtr = zbuf.GetBasePtr();
++		m_zPsm = zbuf.nPsm | 0x30;
++		m_zMask = zbuf.nMask != 0;
++		m_zBits = PsmBits(m_zPsm);
++		m_zMax = (m_zBits == 32) ? 0xFFFFFFFFU : ((1U << m_zBits) - 1);
++
++		m_ate = test.nAlphaEnabled != 0;
++		m_atst = test.nAlphaMethod;
++		m_aref = test.nAlphaRef;
++		m_afail = test.nAlphaFail;
++		m_date = (test.nDestAlphaEnabled != 0) && (m_fbBits != 24);
++		m_datm = test.nDestAlphaMode;
++		//ZTE = 0 is not allowed on the GS; it behaves like ALWAYS
++		m_ztst = test.nDepthEnabled ? test.nDepthMethod : 1;
++
++		m_scX0 = scissor.scax0;
++		m_scX1 = scissor.scax1;
++		m_scY0 = scissor.scay0;
++		m_scY1 = scissor.scay1;
++
++		m_abe = prim.nAlpha != 0;
++		m_pabe = (regs[GS_REG_PABE] & 1) != 0;
++		m_fba = (regs[GS_REG_FBA_1 + ctx] & 1) != 0;
++		m_colClamp = (regs[GS_REG_COLCLAMP] & 1) != 0;
++		m_dthe = ((regs[REG_DTHE] & 1) != 0) && (m_fbBits == 16);
++		if(m_dthe)
++		{
++			uint64 dimx = regs[REG_DIMX];
++			for(unsigned int i = 0; i < 16; i++)
++			{
++				int32 value = static_cast<int32>((dimx >> (i * 4)) & 7);
++				if(value & 4) value -= 8;
++				m_dimx[i / 4][i % 4] = value;
++			}
++		}
++		m_blendA = alpha.nA;
++		m_blendB = alpha.nB;
++		m_blendC = alpha.nC;
++		m_blendD = alpha.nD;
++		m_blendFix = alpha.nFix;
++
++		m_iip = prim.nShading != 0;
++		m_fge = prim.nFog != 0;
++		m_fst = prim.nUseUV != 0;
++		m_tme = prim.nTexture != 0;
++		m_fogColor = (fogCol.nFCR) | (fogCol.nFCG << 8) | (fogCol.nFCB << 16);
++
++		if(m_tme)
++		{
++			SetTexture(regs, ctx);
++		}
++	}
++
++	void DrawPoint(const VERTEX& v)
++	{
++		//A point covers the pixel its center falls in
++		int32 px = (v.x + 8) >> 4;
++		int32 py = (v.y + 8) >> 4;
++		if((px < m_scX0) || (px > m_scX1) || (py < m_scY0) || (py > m_scY1)) return;
++		float tu = 0, tv = 0;
++		int32 lod = 0;
++		if(m_tme)
++		{
++			TexCoords(v, v.q, tu, tv);
++			lod = ComputeLod(v.q);
++		}
++		Pixel(px, py, v.z, v.rgba, tu, tv, lod, v.fog);
++		NoteDirty(py);
++	}
++
++	void DrawSprite(const VERTEX& va, const VERTEX& vb)
++	{
++		//Color, Z, fog and Q come from the second vertex
++		uint32 rgba = vb.rgba;
++		uint32 z = vb.z;
++		uint32 fog = vb.fog;
++
++		int32 x0 = va.x, x1 = vb.x, y0 = va.y, y1 = vb.y;
++		float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
++		int32 lod = 0;
++		if(m_tme)
++		{
++			TexCoords(va, vb.q, u0, v0);
++			TexCoords(vb, vb.q, u1, v1);
++			lod = ComputeLod(vb.q);
++		}
++		if(x0 > x1)
++		{
++			std::swap(x0, x1);
++			std::swap(u0, u1);
++		}
++		if(y0 > y1)
++		{
++			std::swap(y0, y1);
++			std::swap(v0, v1);
++		}
++
++		int32 pxStart = std::max<int32>((x0 + 15) >> 4, m_scX0);
++		int32 pxEnd = std::min<int32>(((x1 + 15) >> 4) - 1, m_scX1);
++		int32 pyStart = std::max<int32>((y0 + 15) >> 4, m_scY0);
++		int32 pyEnd = std::min<int32>(((y1 + 15) >> 4) - 1, m_scY1);
++		if((pxStart > pxEnd) || (pyStart > pyEnd)) return;
++
++		if(!m_tme && TryFill(pxStart, pxEnd, pyStart, pyEnd, z, rgba, fog))
++		{
++			NoteDirty(pyEnd);
++			return;
++		}
++
++		float dudx = (x1 != x0) ? ((u1 - u0) * 16.0f / static_cast<float>(x1 - x0)) : 0;
++		float dvdy = (y1 != y0) ? ((v1 - v0) * 16.0f / static_cast<float>(y1 - y0)) : 0;
++		float uStart = u0 + dudx * (static_cast<float>((pxStart << 4) - x0) / 16.0f);
++		float vStart = v0 + dvdy * (static_cast<float>((pyStart << 4) - y0) / 16.0f);
++
++		for(int32 py = pyStart; py <= pyEnd; py++)
++		{
++			float tv = vStart + dvdy * static_cast<float>(py - pyStart);
++			for(int32 px = pxStart; px <= pxEnd; px++)
++			{
++				float tu = uStart + dudx * static_cast<float>(px - pxStart);
++				Pixel(px, py, z, rgba, tu, tv, lod, fog);
++			}
++		}
++		NoteDirty(pyEnd);
++	}
++
++	void DrawTriangle(const VERTEX& a, const VERTEX& b0, const VERTEX& c0)
++	{
++		const VERTEX* v0 = &a;
++		const VERTEX* v1 = &b0;
++		const VERTEX* v2 = &c0;
++		int64 area = Orient(v0->x, v0->y, v1->x, v1->y, v2->x, v2->y);
++		if(area == 0) return;
++		if(area < 0)
++		{
++			std::swap(v1, v2);
++			area = -area;
++		}
++
++		int32 minX = std::min({v0->x, v1->x, v2->x});
++		int32 maxX = std::max({v0->x, v1->x, v2->x});
++		int32 minY = std::min({v0->y, v1->y, v2->y});
++		int32 maxY = std::max({v0->y, v1->y, v2->y});
++		int32 pxStart = std::max<int32>((minX + 15) >> 4, m_scX0);
++		int32 pxEnd = std::min<int32>(maxX >> 4, m_scX1);
++		int32 pyStart = std::max<int32>((minY + 15) >> 4, m_scY0);
++		int32 pyEnd = std::min<int32>(maxY >> 4, m_scY1);
++		if((pxStart > pxEnd) || (pyStart > pyEnd)) return;
++
++		//Edge functions, positive inside. A pixel on an edge belongs to the triangle when the edge is a top or left one.
++		struct EDGE
++		{
++			int64 value;
++			int64 stepX;
++			int64 stepY;
++		};
++		auto makeEdge = [&](const VERTEX* p, const VERTEX* q) {
++			int64 dx = q->x - p->x;
++			int64 dy = q->y - p->y;
++			bool topLeft = (dy < 0) || ((dy == 0) && (dx > 0));
++			EDGE edge;
++			edge.value = (dx * ((static_cast<int64>(pyStart) << 4) - p->y)) - (dy * ((static_cast<int64>(pxStart) << 4) - p->x)) - (topLeft ? 0 : 1);
++			edge.stepX = -dy * 16;
++			edge.stepY = dx * 16;
++			return edge;
++		};
++		EDGE e0 = makeEdge(v1, v2);
++		EDGE e1 = makeEdge(v2, v0);
++		EDGE e2 = makeEdge(v0, v1);
++
++		//Plane equations (per pixel steps) from the first vertex
++		double fx0 = v0->x / 16.0, fy0 = v0->y / 16.0;
++		double dx1 = (v1->x - v0->x) / 16.0, dy1 = (v1->y - v0->y) / 16.0;
++		double dx2 = (v2->x - v0->x) / 16.0, dy2 = (v2->y - v0->y) / 16.0;
++		double invDet = 1.0 / ((dx1 * dy2) - (dx2 * dy1));
++		struct PLANE
++		{
++			double start;
++			double dx;
++			double dy;
++		};
++		auto makePlane = [&](double f0, double f1, double f2) {
++			PLANE plane;
++			plane.dx = (((f1 - f0) * dy2) - ((f2 - f0) * dy1)) * invDet;
++			plane.dy = (((f2 - f0) * dx1) - ((f1 - f0) * dx2)) * invDet;
++			plane.start = f0 + (plane.dx * (pxStart - fx0)) + (plane.dy * (pyStart - fy0));
++			return plane;
++		};
++
++		PLANE pz = makePlane(v0->z, v1->z, v2->z);
++		bool flatZ = (v0->z == v1->z) && (v0->z == v2->z);
++
++		//Flat shading uses the color of the last vertex kicked (passed as c0)
++		bool gouraud = m_iip && ((v0->rgba != v1->rgba) || (v0->rgba != v2->rgba));
++		PLANE pc[4] = {};
++		if(gouraud)
++		{
++			for(unsigned int i = 0; i < 4; i++)
++			{
++				pc[i] = makePlane((v0->rgba >> (i * 8)) & 0xFF, (v1->rgba >> (i * 8)) & 0xFF, (v2->rgba >> (i * 8)) & 0xFF);
++			}
++		}
++		uint32 flatColor = m_iip ? v0->rgba : c0.rgba;
++
++		bool fogVaries = m_fge && ((v0->fog != v1->fog) || (v0->fog != v2->fog));
++		PLANE pf = {};
++		if(fogVaries) pf = makePlane(v0->fog, v1->fog, v2->fog);
++
++		//Texture coordinates: S, T and Q are linear in screen space, U = S / Q
++		PLANE ps = {}, pt = {}, pq = {};
++		bool constQ = true;
++		int32 constLod = 0;
++		float texScaleU = 0, texScaleV = 0;
++		if(m_tme)
++		{
++			if(m_fst)
++			{
++				ps = makePlane(v0->u / 16.0, v1->u / 16.0, v2->u / 16.0);
++				pt = makePlane(v0->v / 16.0, v1->v / 16.0, v2->v / 16.0);
++				constLod = ComputeLod(1.0f);
++			}
++			else
++			{
++				ps = makePlane(v0->s, v1->s, v2->s);
++				pt = makePlane(v0->t, v1->t, v2->t);
++				pq = makePlane(v0->q, v1->q, v2->q);
++				constQ = (v0->q == v1->q) && (v0->q == v2->q);
++				texScaleU = static_cast<float>(m_texWidth);
++				texScaleV = static_cast<float>(m_texHeight);
++				if(constQ) constLod = ComputeLod(v0->q);
++			}
++		}
++
++		for(int32 py = pyStart; py <= pyEnd; py++)
++		{
++			int64 w0 = e0.value, w1 = e1.value, w2 = e2.value;
++			int32 row = py - pyStart;
++			for(int32 px = pxStart; px <= pxEnd; px++)
++			{
++				if((w0 | w1 | w2) >= 0)
++				{
++					int32 col = px - pxStart;
++					uint32 z = v0->z;
++					if(!flatZ)
++					{
++						double zf = pz.start + (pz.dx * col) + (pz.dy * row);
++						z = (zf <= 0) ? 0 : ((zf >= 4294967295.0) ? 0xFFFFFFFFU : static_cast<uint32>(zf));
++					}
++					uint32 rgba = flatColor;
++					if(gouraud)
++					{
++						rgba = 0;
++						for(unsigned int i = 0; i < 4; i++)
++						{
++							double value = pc[i].start + (pc[i].dx * col) + (pc[i].dy * row);
++							int32 channel = std::clamp(static_cast<int32>(value), 0, 255);
++							rgba |= static_cast<uint32>(channel) << (i * 8);
++						}
++					}
++					uint32 fog = v0->fog;
++					if(fogVaries)
++					{
++						fog = static_cast<uint32>(std::clamp(static_cast<int32>(pf.start + (pf.dx * col) + (pf.dy * row)), 0, 255));
++					}
++					float tu = 0, tv = 0;
++					int32 lod = constLod;
++					if(m_tme)
++					{
++						double s = ps.start + (ps.dx * col) + (ps.dy * row);
++						double t = pt.start + (pt.dx * col) + (pt.dy * row);
++						if(m_fst)
++						{
++							tu = static_cast<float>(s);
++							tv = static_cast<float>(t);
++						}
++						else
++						{
++							double q = constQ ? v0->q : (pq.start + (pq.dx * col) + (pq.dy * row));
++							double invQ = (q != 0) ? (1.0 / q) : 1.0;
++							tu = static_cast<float>(s * invQ) * texScaleU;
++							tv = static_cast<float>(t * invQ) * texScaleV;
++							if(!constQ) lod = ComputeLod(static_cast<float>(q));
++						}
++					}
++					Pixel(px, py, z, rgba, tu, tv, lod, fog);
++				}
++				w0 += e0.stepX;
++				w1 += e1.stepX;
++				w2 += e2.stepX;
++			}
++			e0.value += e0.stepY;
++			e1.value += e1.stepY;
++			e2.value += e2.stepY;
++		}
++		NoteDirty(pyEnd);
++	}
++
++private:
++	enum
++	{
++		MAX_LEVELS = 7,
++		REG_DIMX = 0x44,
++		REG_DTHE = 0x45,
++	};
++
++	struct TEXLEVEL
++	{
++		uint32 ptr = 0;
++		uint32 bw = 0;
++		uint32 width = 1;
++		uint32 height = 1;
++		bool ready = false;
++		std::vector<uint32> pixels;
++	};
++
++	static uint32 PsmBits(uint32 psm)
++	{
++		switch(psm)
++		{
++		case CGSHandler::PSMCT24:
++		case CGSHandler::PSMZ24:
++			return 24;
++		case CGSHandler::PSMCT16:
++		case CGSHandler::PSMCT16S:
++		case CGSHandler::PSMZ16:
++		case CGSHandler::PSMZ16S:
++			return 16;
++		default:
++			return 32;
++		}
++	}
++
++	static int64 Orient(int32 ax, int32 ay, int32 bx, int32 by, int32 cx, int32 cy)
++	{
++		return (static_cast<int64>(bx - ax) * (cy - ay)) - (static_cast<int64>(by - ay) * (cx - ax));
++	}
++
++	//---- Memory access, by storage format
++
++	uint32* Address32(uint32 ptr, uint32 bw, uint32 psm, uint32 x, uint32 y) const
++	{
++		if(psm & 0x30)
++		{
++			return CGsPixelFormats::CPixelIndexorPSMZ32(m_ram, ptr, bw).GetPixelAddress(x, y);
++		}
++		return CGsPixelFormats::CPixelIndexorPSMCT32(m_ram, ptr, bw).GetPixelAddress(x, y);
++	}
++
++	uint16* Address16(uint32 ptr, uint32 bw, uint32 psm, uint32 x, uint32 y) const
++	{
++		switch(psm)
++		{
++		case CGSHandler::PSMCT16S:
++			return CGsPixelFormats::CPixelIndexorPSMCT16S(m_ram, ptr, bw).GetPixelAddress(x, y);
++		case CGSHandler::PSMZ16:
++			return CGsPixelFormats::CPixelIndexor<CGsPixelFormats::STORAGEPSMZ16>(m_ram, ptr, bw).GetPixelAddress(x, y);
++		case CGSHandler::PSMZ16S:
++			return CGsPixelFormats::CPixelIndexorPSMZ16S(m_ram, ptr, bw).GetPixelAddress(x, y);
++		default:
++			return CGsPixelFormats::CPixelIndexorPSMCT16(m_ram, ptr, bw).GetPixelAddress(x, y);
++		}
++	}
++
++	static uint32 Expand16(uint32 pixel)
++	{
++		return ((pixel & 0x001F) << 3) | ((pixel & 0x03E0) << 6) | ((pixel & 0x7C00) << 9) | ((pixel & 0x8000) ? 0x80000000U : 0);
++	}
++
++	void NoteDirty(int32 maxY)
++	{
++		if(maxY < 0) return;
++		m_dirty.any = true;
++		m_dirty.fbPtr = m_fbPtr;
++		m_dirty.fbWidth = m_fbBw;
++		m_dirty.fbPsm = m_fbPsm;
++		m_dirty.zPtr = m_zPtr;
++		m_dirty.zPsm = m_zPsm;
++		m_dirty.maxY = std::max<uint32>(m_dirty.maxY, maxY);
++		if(!m_zMask) m_dirty.zWritten = true;
++	}
++
++	//---- Texturing
++
++	void SetTexture(const uint64* regs, unsigned int ctx)
++	{
++		uint64 tex0Reg = regs[GS_REG_TEX0_1 + ctx];
++		uint64 tex1Reg = regs[GS_REG_TEX1_1 + ctx];
++		uint64 clampReg = regs[GS_REG_CLAMP_1 + ctx];
++		uint64 texAReg = regs[GS_REG_TEXA];
++		uint64 mip1Reg = regs[GS_REG_MIPTBP1_1 + ctx];
++		uint64 mip2Reg = regs[GS_REG_MIPTBP2_1 + ctx];
++
++		auto tex0 = make_convertible<CGSHandler::TEX0>(tex0Reg);
++		auto tex1 = make_convertible<CGSHandler::TEX1>(tex1Reg);
++		auto clamp = make_convertible<CGSHandler::CLAMP>(clampReg);
++
++		m_tfx = tex0.nFunction;
++		m_tcc = tex0.nColorComp != 0;
++		m_texWidth = tex0.GetWidth();
++		m_texHeight = tex0.GetHeight();
++		m_wms = clamp.nWMS;
++		m_wmt = clamp.nWMT;
++		m_minU = clamp.GetMinU();
++		m_maxU = clamp.GetMaxU();
++		m_minV = clamp.GetMinV();
++		m_maxV = clamp.GetMaxV();
++
++		m_lcm = tex1.nLODMethod != 0;
++		m_mxl = std::min<uint32>(tex1.nMaxMip, MAX_LEVELS - 1);
++		m_mmag = tex1.nMagFilter;
++		m_mmin = tex1.nMinFilter;
++		m_lodL = tex1.nLODL;
++		{
++			int32 k = tex1.nLODK;
++			if(k & 0x800) k -= 0x1000;
++			//K has 4 fractional bits; LOD is kept with 16
++			m_lodK = k * 4096;
++		}
++		//Without mip levels the minifying filter still applies when the texture gets smaller
++		if(m_mmin < 2) m_mxl = 0;
++
++		bool same = (m_texTex0 == tex0Reg) && (m_texTexA == texAReg) && (m_texMip1 == mip1Reg) && (m_texMip2 == mip2Reg) &&
++		            (m_texGeneration == m_memGeneration);
++		if(same) return;
++		m_texTex0 = tex0Reg;
++		m_texTexA = texAReg;
++		m_texMip1 = mip1Reg;
++		m_texMip2 = mip2Reg;
++		m_texGeneration = m_memGeneration;
++		m_texPsm = tex0.nPsm;
++		m_texCpsm = tex0.nCPSM;
++		m_texCsa = tex0.nCSA;
++		m_clutReady = false;
++
++		auto mip1 = make_convertible<CGSHandler::MIPTBP1>(mip1Reg);
++		auto mip2 = make_convertible<CGSHandler::MIPTBP2>(mip2Reg);
++		uint32 ptrs[MAX_LEVELS] = {tex0.GetBufPtr(), mip1.GetTbp1(), mip1.GetTbp2(), mip1.GetTbp3(), mip2.GetTbp4(), mip2.GetTbp5(), mip2.GetTbp6()};
++		uint32 widths[MAX_LEVELS] = {tex0.nBufWidth, mip1.tbw1, mip1.tbw2, mip1.tbw3, mip2.tbw4, mip2.tbw5, mip2.tbw6};
++		for(unsigned int i = 0; i < MAX_LEVELS; i++)
++		{
++			auto& level = m_levels[i];
++			level.ptr = ptrs[i];
++			level.bw = widths[i];
++			level.width = std::max<uint32>(m_texWidth >> i, 1);
++			level.height = std::max<uint32>(m_texHeight >> i, 1);
++			level.ready = false;
++		}
++	}
++
++	uint32 Alpha16(uint32 pixel) const
++	{
++		if(pixel & 0x8000) return m_texA1;
++		if(m_texAem && ((pixel & 0x7FFF) == 0)) return 0;
++		return m_texA0;
++	}
++
++	void PrepareClut()
++	{
++		auto texA = make_convertible<CGSHandler::TEXA>(m_texTexA);
++		m_texA0 = texA.nTA0;
++		m_texA1 = texA.nTA1;
++		m_texAem = texA.nAEM != 0;
++		m_clutReady = true;
++		if(!CGsPixelFormats::IsPsmIDTEX(m_texPsm)) return;
++		bool is4 = CGsPixelFormats::IsPsmIDTEX4(m_texPsm);
++		unsigned int count = is4 ? 16 : 256;
++		bool clut32 = (m_texCpsm == CGSHandler::PSMCT32) || (m_texCpsm == CGSHandler::PSMCT24);
++		for(unsigned int i = 0; i < count; i++)
++		{
++			if(clut32)
++			{
++				uint32 offset = is4 ? (i + ((m_texCsa & 0xF) * 16)) : (((m_texCsa * 16) + i) & 0xFF);
++				uint32 color = static_cast<uint32>(m_clut[offset]) | (static_cast<uint32>(m_clut[offset + 0x100]) << 16);
++				if(m_texCpsm == CGSHandler::PSMCT24)
++				{
++					color = (color & 0x00FFFFFF) | ((m_texAem && ((color & 0x00FFFFFF) == 0)) ? 0 : (m_texA0 << 24));
++				}
++				m_clutColors[i] = color;
++			}
++			else
++			{
++				uint32 offset = is4 ? (i + (m_texCsa * 16)) : i;
++				uint32 color = m_clut[offset & 0x1FF];
++				m_clutColors[i] = (Expand16(color) & 0x00FFFFFF) | (Alpha16(color) << 24);
++			}
++		}
++	}
++
++	void PrepareLevel(TEXLEVEL& level)
++	{
++		if(!m_clutReady) PrepareClut();
++		level.ready = true;
++		level.pixels.resize(level.width * level.height);
++		uint32* dst = level.pixels.data();
++		uint32 w = level.width, h = level.height;
++		switch(m_texPsm)
++		{
++		case CGSHandler::PSMCT32:
++		case CGSHandler::PSMZ32:
++			for(uint32 y = 0; y < h; y++)
++				for(uint32 x = 0; x < w; x++)
++					(*dst++) = *Address32(level.ptr, level.bw, m_texPsm, x, y);
++			break;
++		case CGSHandler::PSMCT24:
++		case CGSHandler::PSMZ24:
++			for(uint32 y = 0; y < h; y++)
++				for(uint32 x = 0; x < w; x++)
++				{
++					uint32 color = (*Address32(level.ptr, level.bw, m_texPsm, x, y)) & 0x00FFFFFF;
++					(*dst++) = color | ((m_texAem && (color == 0)) ? 0 : (m_texA0 << 24));
++				}
++			break;
++		case CGSHandler::PSMCT16:
++		case CGSHandler::PSMCT16S:
++		case CGSHandler::PSMZ16:
++		case CGSHandler::PSMZ16S:
++			for(uint32 y = 0; y < h; y++)
++				for(uint32 x = 0; x < w; x++)
++				{
++					uint32 color = *Address16(level.ptr, level.bw, m_texPsm, x, y);
++					(*dst++) = (Expand16(color) & 0x00FFFFFF) | (Alpha16(color) << 24);
++				}
++			break;
++		case CGSHandler::PSMT8:
++		{
++			CGsPixelFormats::CPixelIndexorPSMT8 indexor(m_ram, level.ptr, level.bw);
++			for(uint32 y = 0; y < h; y++)
++				for(uint32 x = 0; x < w; x++)
++					(*dst++) = m_clutColors[indexor.GetPixel(x, y)];
++		}
++		break;
++		case CGSHandler::PSMT4:
++		{
++			CGsPixelFormats::CPixelIndexorPSMT4 indexor(m_ram, level.ptr, level.bw);
++			for(uint32 y = 0; y < h; y++)
++				for(uint32 x = 0; x < w; x++)
++					(*dst++) = m_clutColors[indexor.GetPixel(x, y) & 0x0F];
++		}
++		break;
++		case CGSHandler::PSMT8H:
++			for(uint32 y = 0; y < h; y++)
++				for(uint32 x = 0; x < w; x++)
++					(*dst++) = m_clutColors[(*Address32(level.ptr, level.bw, 0, x, y)) >> 24];
++			break;
++		case CGSHandler::PSMT4HL:
++			for(uint32 y = 0; y < h; y++)
++				for(uint32 x = 0; x < w; x++)
++					(*dst++) = m_clutColors[((*Address32(level.ptr, level.bw, 0, x, y)) >> 24) & 0x0F];
++			break;
++		case CGSHandler::PSMT4HH:
++			for(uint32 y = 0; y < h; y++)
++				for(uint32 x = 0; x < w; x++)
++					(*dst++) = m_clutColors[(*Address32(level.ptr, level.bw, 0, x, y)) >> 28];
++			break;
++		default:
++			std::fill(level.pixels.begin(), level.pixels.end(), 0x80808080U);
++			break;
++		}
++	}
++
++	//Texel coordinates (level 0, in texels) of a vertex
++	void TexCoords(const VERTEX& v, float q, float& tu, float& tv) const
++	{
++		if(m_fst)
++		{
++			tu = static_cast<float>(v.u) / 16.0f;
++			tv = static_cast<float>(v.v) / 16.0f;
++		}
++		else
++		{
++			float invQ = (q != 0) ? (1.0f / q) : 1.0f;
++			tu = v.s * invQ * static_cast<float>(m_texWidth);
++			tv = v.t * invQ * static_cast<float>(m_texHeight);
++		}
++	}
++
++	//LOD = (log2(1 / |Q|) << L) + K, with 16 fractional bits
++	int32 ComputeLod(float q) const
++	{
++		if(m_lcm) return m_lodK;
++		float absQ = std::fabs(q);
++		if(absQ == 0) return m_lodK;
++		float lod = -std::log2(absQ) * static_cast<float>(65536 << m_lodL);
++		lod = std::clamp(lod, -2.0e9f, 2.0e9f);
++		int64 result = static_cast<int64>(lod) + m_lodK;
++		return static_cast<int32>(std::clamp<int64>(result, -0x40000000, 0x40000000));
++	}
++
++	static int32 Wrap(int32 coord, uint32 mode, uint32 minValue, uint32 maxValue, uint32 size, uint32 lod)
++	{
++		switch(mode)
++		{
++		default:
++		case 0: //Repeat
++			return coord & (size - 1);
++		case 1: //Clamp
++			return std::clamp<int32>(coord, 0, size - 1);
++		case 2: //Region clamp
++			return std::clamp<int32>(coord, minValue >> lod, maxValue >> lod);
++		case 3: //Region repeat
++			return (coord & (minValue >> lod)) | (maxValue >> lod);
++		}
++	}
++
++	uint32 Texel(TEXLEVEL& level, uint32 lod, int32 u, int32 v)
++	{
++		u = Wrap(u, m_wms, m_minU, m_maxU, level.width, lod);
++		v = Wrap(v, m_wmt, m_minV, m_maxV, level.height, lod);
++		u = std::clamp<int32>(u, 0, level.width - 1);
++		v = std::clamp<int32>(v, 0, level.height - 1);
++		return level.pixels[u + (v * level.width)];
++	}
++
++	//u and v: 16.16 at level 0
++	uint32 SampleLevel(uint32 lod, int32 u, int32 v, bool linear)
++	{
++		auto& level = m_levels[lod];
++		if(!level.ready) PrepareLevel(level);
++		u >>= lod;
++		v >>= lod;
++		if(!linear)
++		{
++			return Texel(level, lod, u >> 16, v >> 16);
++		}
++		u -= 0x8000;
++		v -= 0x8000;
++		int32 uf = (u >> 12) & 0xF;
++		int32 vf = (v >> 12) & 0xF;
++		int32 u0 = u >> 16;
++		int32 v0 = v >> 16;
++		uint32 c00 = Texel(level, lod, u0, v0);
++		uint32 c01 = Texel(level, lod, u0 + 1, v0);
++		uint32 c10 = Texel(level, lod, u0, v0 + 1);
++		uint32 c11 = Texel(level, lod, u0 + 1, v0 + 1);
++		uint32 result = 0;
++		for(unsigned int i = 0; i < 32; i += 8)
++		{
++			int32 a = (c00 >> i) & 0xFF, b = (c01 >> i) & 0xFF, c = (c10 >> i) & 0xFF, d = (c11 >> i) & 0xFF;
++			int32 top = a + (((b - a) * uf) >> 4);
++			int32 bottom = c + (((d - c) * uf) >> 4);
++			int32 value = top + (((bottom - top) * vf) >> 4);
++			result |= static_cast<uint32>(value & 0xFF) << i;
++		}
++		return result;
++	}
++
++	uint32 Sample(float tu, float tv, int32 lod)
++	{
++		int32 u = static_cast<int32>(std::clamp(tu, -16000.0f, 16000.0f) * 65536.0f);
++		int32 v = static_cast<int32>(std::clamp(tv, -16000.0f, 16000.0f) * 65536.0f);
++		if(lod <= 0)
++		{
++			return SampleLevel(0, u, v, m_mmag != 0);
++		}
++		bool linear = (m_mmin == 1) || (m_mmin >= 4);
++		if(m_mxl == 0)
++		{
++			return SampleLevel(0, u, v, linear);
++		}
++		int32 maxLod = static_cast<int32>(m_mxl) << 16;
++		lod = std::min(lod, maxLod);
++		if((m_mmin == 2) || (m_mmin == 4))
++		{
++			//Nearest level
++			uint32 level = std::min<uint32>((lod + 0x8000) >> 16, m_mxl);
++			return SampleLevel(level, u, v, linear);
++		}
++		uint32 level0 = lod >> 16;
++		uint32 level1 = std::min<uint32>(level0 + 1, m_mxl);
++		int32 lodf = lod & 0xFFFF;
++		uint32 c0 = SampleLevel(level0, u, v, linear);
++		if((level1 == level0) || (lodf == 0)) return c0;
++		uint32 c1 = SampleLevel(level1, u, v, linear);
++		uint32 result = 0;
++		for(unsigned int i = 0; i < 32; i += 8)
++		{
++			int32 a = (c0 >> i) & 0xFF, b = (c1 >> i) & 0xFF;
++			int32 value = a + (((b - a) * lodf) >> 16);
++			result |= static_cast<uint32>(value & 0xFF) << i;
++		}
++		return result;
++	}
++
++	//---- Pixel pipeline
++
++	static bool AlphaTest(uint32 method, uint32 alpha, uint32 ref)
++	{
++		switch(method)
++		{
++		default:
++		case 0:
++			return false;
++		case 1:
++			return true;
++		case 2:
++			return alpha < ref;
++		case 3:
++			return alpha <= ref;
++		case 4:
++			return alpha == ref;
++		case 5:
++			return alpha >= ref;
++		case 6:
++			return alpha > ref;
++		case 7:
++			return alpha != ref;
++		}
++	}
++
++	uint32 ReadFrame(int32 x, int32 y) const
++	{
++		switch(m_fbBits)
++		{
++		case 16:
++			return Expand16(*Address16(m_fbPtr, m_fbBw, m_fbPsm, x, y));
++		case 24:
++			return ((*Address32(m_fbPtr, m_fbBw, m_fbPsm, x, y)) & 0x00FFFFFF) | 0x80000000U;
++		default:
++			return *Address32(m_fbPtr, m_fbBw, m_fbPsm, x, y);
++		}
++	}
++
++	//mask: bits that keep their value
++	void WriteFrame(int32 x, int32 y, uint32 color, uint32 mask) const
++	{
++		if(m_fbBits == 16)
++		{
++			auto address = Address16(m_fbPtr, m_fbBw, m_fbPsm, x, y);
++			uint32 color16 = ((color >> 3) & 0x001F) | ((color >> 6) & 0x03E0) | ((color >> 9) & 0x7C00) | ((color >> 16) & 0x8000);
++			uint32 mask16 = ((mask >> 3) & 0x001F) | ((mask >> 6) & 0x03E0) | ((mask >> 9) & 0x7C00) | ((mask >> 16) & 0x8000);
++			(*address) = static_cast<uint16>((color16 & ~mask16) | ((*address) & mask16));
++		}
++		else
++		{
++			if(m_fbBits == 24) mask |= 0xFF000000U;
++			auto address = Address32(m_fbPtr, m_fbBw, m_fbPsm, x, y);
++			(*address) = (color & ~mask) | ((*address) & mask);
++		}
++	}
++
++	uint32 ReadDepth(int32 x, int32 y) const
++	{
++		switch(m_zBits)
++		{
++		case 16:
++			return *Address16(m_zPtr, m_fbBw, m_zPsm, x, y);
++		case 24:
++			return (*Address32(m_zPtr, m_fbBw, m_zPsm, x, y)) & 0x00FFFFFF;
++		default:
++			return *Address32(m_zPtr, m_fbBw, m_zPsm, x, y);
++		}
++	}
++
++	void WriteDepth(int32 x, int32 y, uint32 z) const
++	{
++		switch(m_zBits)
++		{
++		case 16:
++			(*Address16(m_zPtr, m_fbBw, m_zPsm, x, y)) = static_cast<uint16>(z);
++			break;
++		case 24:
++		{
++			auto address = Address32(m_zPtr, m_fbBw, m_zPsm, x, y);
++			(*address) = (z & 0x00FFFFFF) | ((*address) & 0xFF000000U);
++		}
++		break;
++		default:
++			(*Address32(m_zPtr, m_fbBw, m_zPsm, x, y)) = z;
++			break;
++		}
++	}
++
++	//Color and alpha of a fragment after texturing and fog
++	uint32 Shade(uint32 rgba, float tu, float tv, int32 lod, uint32 fog)
++	{
++		int32 r = rgba & 0xFF, g = (rgba >> 8) & 0xFF, b = (rgba >> 16) & 0xFF, a = rgba >> 24;
++		if(m_tme)
++		{
++			uint32 texel = Sample(tu, tv, lod);
++			int32 tr = texel & 0xFF, tg = (texel >> 8) & 0xFF, tb = (texel >> 16) & 0xFF, ta = texel >> 24;
++			switch(m_tfx)
++			{
++			case 0: //Modulate
++				r = std::min((tr * r) >> 7, 255);
++				g = std::min((tg * g) >> 7, 255);
++				b = std::min((tb * b) >> 7, 255);
++				if(m_tcc) a = std::min((ta * a) >> 7, 255);
++				break;
++			case 1: //Decal
++				r = tr;
++				g = tg;
++				b = tb;
++				if(m_tcc) a = ta;
++				break;
++			case 2: //Highlight
++				r = std::min(((tr * r) >> 7) + a, 255);
++				g = std::min(((tg * g) >> 7) + a, 255);
++				b = std::min(((tb * b) >> 7) + a, 255);
++				if(m_tcc) a = std::min(ta + a, 255);
++				break;
++			case 3: //Highlight 2
++				r = std::min(((tr * r) >> 7) + a, 255);
++				g = std::min(((tg * g) >> 7) + a, 255);
++				b = std::min(((tb * b) >> 7) + a, 255);
++				if(m_tcc) a = ta;
++				break;
++			}
++		}
++		if(m_fge)
++		{
++			int32 f = fog;
++			r = ((r * f) + (static_cast<int32>(m_fogColor & 0xFF) * (256 - f))) >> 8;
++			g = ((g * f) + (static_cast<int32>((m_fogColor >> 8) & 0xFF) * (256 - f))) >> 8;
++			b = ((b * f) + (static_cast<int32>((m_fogColor >> 16) & 0xFF) * (256 - f))) >> 8;
++		}
++		return static_cast<uint32>(r) | (static_cast<uint32>(g) << 8) | (static_cast<uint32>(b) << 16) | (static_cast<uint32>(a) << 24);
++	}
++
++	void Pixel(int32 x, int32 y, uint32 z, uint32 rgba, float tu, float tv, int32 lod, uint32 fog)
++	{
++		uint32 source = Shade(rgba, tu, tv, lod, fog);
++		uint32 sourceAlpha = source >> 24;
++
++		bool writeColor = true, writeAlpha = true, writeDepth = !m_zMask;
++		if(m_ate && !AlphaTest(m_atst, sourceAlpha, m_aref))
++		{
++			switch(m_afail)
++			{
++			case 0: //Keep
++				return;
++			case 1: //Frame buffer only
++				writeDepth = false;
++				break;
++			case 2: //Z buffer only
++				writeColor = false;
++				writeAlpha = false;
++				break;
++			case 3: //RGB only
++				writeAlpha = false;
++				writeDepth = false;
++				break;
++			}
++		}
++
++		uint32 dest = 0;
++		bool needDest = m_date || (m_abe && writeColor);
++		if(needDest) dest = ReadFrame(x, y);
++		if(m_date)
++		{
++			if(((dest >> 31) & 1) != m_datm) return;
++		}
++
++		z = std::min(z, m_zMax);
++		if(m_ztst != 1)
++		{
++			if(m_ztst == 0) return;
++			uint32 destZ = ReadDepth(x, y);
++			if((m_ztst == 2) ? (z < destZ) : (z <= destZ)) return;
++		}
++
++		if(writeColor)
++		{
++			uint32 color = source;
++			if(m_abe && (!m_pabe || (sourceAlpha & 0x80)))
++			{
++				int32 destAlpha = dest >> 24;
++				int32 factor = (m_blendC == 0) ? static_cast<int32>(sourceAlpha) : ((m_blendC == 1) ? destAlpha : static_cast<int32>(m_blendFix));
++				color = 0;
++				for(unsigned int i = 0; i < 24; i += 8)
++				{
++					int32 cs = (source >> i) & 0xFF, cd = (dest >> i) & 0xFF;
++					int32 ca = (m_blendA == 0) ? cs : ((m_blendA == 1) ? cd : 0);
++					int32 cb = (m_blendB == 0) ? cs : ((m_blendB == 1) ? cd : 0);
++					int32 cdd = (m_blendD == 0) ? cs : ((m_blendD == 1) ? cd : 0);
++					int32 value = (((ca - cb) * factor) >> 7) + cdd;
++					if(m_dthe) value += m_dimx[y & 3][x & 3];
++					value = m_colClamp ? std::clamp(value, 0, 255) : (value & 0xFF);
++					color |= static_cast<uint32>(value) << i;
++				}
++				color |= sourceAlpha << 24;
++			}
++			else if(m_dthe)
++			{
++				color = sourceAlpha << 24;
++				for(unsigned int i = 0; i < 24; i += 8)
++				{
++					int32 value = static_cast<int32>((source >> i) & 0xFF) + m_dimx[y & 3][x & 3];
++					color |= static_cast<uint32>(std::clamp(value, 0, 255)) << i;
++				}
++			}
++			if(m_fba) color |= 0x80000000U;
++			uint32 mask = m_fbMask;
++			if(!writeAlpha) mask |= 0xFF000000U;
++			WriteFrame(x, y, color, mask);
++		}
++		if(writeDepth)
++		{
++			WriteDepth(x, y, z);
++		}
++	}
++
++	//A flat sprite whose pixels don't depend on what's in the buffers: clears, constants
++	bool TryFill(int32 pxStart, int32 pxEnd, int32 pyStart, int32 pyEnd, uint32 z, uint32 rgba, uint32 fog)
++	{
++		if(m_date || m_dthe) return false;
++		if(m_ztst >= 2) return false;
++		if(m_ztst == 0) return true;
++		uint32 source = Shade(rgba, 0, 0, 0, fog);
++		uint32 sourceAlpha = source >> 24;
++		bool blends = m_abe && (!m_pabe || (sourceAlpha & 0x80));
++		if(blends)
++		{
++			//Only when the destination doesn't take part
++			bool usesDest = (m_blendC == 1) || (((m_blendA == 1) || (m_blendB == 1)) && (m_blendA != m_blendB)) || (m_blendD == 1);
++			if(usesDest) return false;
++		}
++		bool writeColor = true, writeAlpha = true, writeDepth = !m_zMask;
++		if(m_ate && !AlphaTest(m_atst, sourceAlpha, m_aref))
++		{
++			switch(m_afail)
++			{
++			case 0:
++				return true;
++			case 1:
++				writeDepth = false;
++				break;
++			case 2:
++				writeColor = false;
++				break;
++			case 3:
++				writeAlpha = false;
++				writeDepth = false;
++				break;
++			}
++		}
++		uint32 color = source;
++		if(blends)
++		{
++			int32 factor = (m_blendC == 0) ? static_cast<int32>(sourceAlpha) : static_cast<int32>(m_blendFix);
++			color = sourceAlpha << 24;
++			for(unsigned int i = 0; i < 24; i += 8)
++			{
++				int32 cs = (source >> i) & 0xFF;
++				int32 ca = (m_blendA == 0) ? cs : 0;
++				int32 cb = (m_blendB == 0) ? cs : 0;
++				int32 cdd = (m_blendD == 0) ? cs : 0;
++				int32 value = (((ca - cb) * factor) >> 7) + cdd;
++				value = m_colClamp ? std::clamp(value, 0, 255) : (value & 0xFF);
++				color |= static_cast<uint32>(value) << i;
++			}
++		}
++		if(m_fba) color |= 0x80000000U;
++		uint32 mask = m_fbMask;
++		if(!writeAlpha) mask |= 0xFF000000U;
++		z = std::min(z, m_zMax);
++		for(int32 py = pyStart; py <= pyEnd; py++)
++		{
++			if(writeColor)
++			{
++				for(int32 px = pxStart; px <= pxEnd; px++)
++				{
++					WriteFrame(px, py, color, mask);
++				}
++			}
++			if(writeDepth)
++			{
++				for(int32 px = pxStart; px <= pxEnd; px++)
++				{
++					WriteDepth(px, py, z);
++				}
++			}
++		}
++		return true;
++	}
++
++	uint8* m_ram = nullptr;
++	uint16* m_clut = nullptr;
++	DIRTY m_dirty;
++
++	//Frame and depth buffers
++	uint32 m_fbPtr = 0;
++	uint32 m_fbBw = 0;
++	uint32 m_fbPsm = 0;
++	uint32 m_fbMask = 0;
++	uint32 m_fbBits = 32;
++	uint32 m_zPtr = 0;
++	uint32 m_zPsm = 0;
++	bool m_zMask = false;
++	uint32 m_zBits = 32;
++	uint32 m_zMax = 0xFFFFFFFFU;
++
++	//Tests
++	bool m_ate = false;
++	uint32 m_atst = 0;
++	uint32 m_aref = 0;
++	uint32 m_afail = 0;
++	bool m_date = false;
++	uint32 m_datm = 0;
++	uint32 m_ztst = 1;
++	int32 m_scX0 = 0, m_scX1 = 0, m_scY0 = 0, m_scY1 = 0;
++
++	//Output
++	bool m_abe = false;
++	bool m_pabe = false;
++	bool m_fba = false;
++	bool m_colClamp = true;
++	bool m_dthe = false;
++	int32 m_dimx[4][4] = {};
++	uint32 m_blendA = 0, m_blendB = 0, m_blendC = 0, m_blendD = 0, m_blendFix = 0;
++
++	//Primitive
++	bool m_iip = false;
++	bool m_fge = false;
++	bool m_fst = false;
++	bool m_tme = false;
++	uint32 m_fogColor = 0;
++
++	//Texture
++	uint32 m_tfx = 0;
++	bool m_tcc = false;
++	uint32 m_texWidth = 1;
++	uint32 m_texHeight = 1;
++	uint32 m_wms = 0, m_wmt = 0;
++	uint32 m_minU = 0, m_maxU = 0, m_minV = 0, m_maxV = 0;
++	bool m_lcm = false;
++	uint32 m_mxl = 0;
++	uint32 m_mmag = 0;
++	uint32 m_mmin = 0;
++	uint32 m_lodL = 0;
++	int32 m_lodK = 0;
++
++	uint64 m_texTex0 = ~0ULL;
++	uint64 m_texTexA = ~0ULL;
++	uint64 m_texMip1 = ~0ULL;
++	uint64 m_texMip2 = ~0ULL;
++	uint32 m_texGeneration = ~0U;
++	uint32 m_memGeneration = 0;
++	uint32 m_texPsm = 0;
++	uint32 m_texCpsm = 0;
++	uint32 m_texCsa = 0;
++	uint32 m_texA0 = 0, m_texA1 = 0;
++	bool m_texAem = false;
++	bool m_clutReady = false;
++	uint32 m_clutColors[256] = {};
++	TEXLEVEL m_levels[MAX_LEVELS];
++};
+diff --git a/Source/gs/WsxGsStats.h b/Source/gs/WsxGsStats.h
+index c8aa9407..7225a963 100644
+--- a/Source/gs/WsxGsStats.h
++++ b/Source/gs/WsxGsStats.h
+@@ -22,5 +22,7 @@ struct WSX_GS_STATS
+ 	std::atomic<uint64> texSetups = 0;      //texture state rebinds (glTexParameteri x9)
+ 	std::atomic<uint64> fbSetups = 0;       //framebuffer rebinds
+ 	std::atomic<uint64> shaderSwitches = 0; //glUseProgram
++	std::atomic<uint64> swPrims = 0;        //Primitives drawn by the software rasterizer
++	std::atomic<uint64> newFrames = 0;      //Flips that showed another buffer than the one before (the game's own frame rate)
+ };
+ extern WSX_GS_STATS g_wsxGsStats;
+-- 
+2.51.0.windows.1
+

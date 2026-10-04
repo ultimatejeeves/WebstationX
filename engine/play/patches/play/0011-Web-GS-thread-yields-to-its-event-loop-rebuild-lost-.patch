@@ -1,0 +1,550 @@
+From 764814d7ff25b6c0e7f9c8ad0f03000a88923fd4 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 12:28:17 -0400
+Subject: [PATCH 11/43] Web: GS thread yields to its event loop; rebuild lost
+ WebGL contexts; per-frame timings; even pacing
+
+- The browser recycles each presented picture's GPU buffer (transferToImageBitmap) on the presenting
+  thread's event loop. The GS worker never returned to it, so every picture leaked a frame of video
+  memory: 27 GB within 3 minutes at 2x, then the GPU process died and the picture went black while the
+  game kept running. The GS loop now runs in slices (until a picture goes out, or 50 ms) and yields
+  through a MessageChannel. GPU memory now stays flat (~95 MB) instead of growing ~70 MB/s.
+- The GS checks its context every picture; a lost context (GPU reset, out of video memory) is rebuilt
+  on a new OffscreenCanvas (GS memory lives in m_pRAM, the GL side is caches) and the page is told
+  through Module.wsxGsEvent. Contexts are dropped on the GS thread: emscripten_webgl_destroy_context
+  is proxied to the main thread, which doesn't know this worker's contexts, and never returned.
+- WsxFrameStats: per-frame rings in shared memory (VM: frame time, limiter sleep, JIT, disc and GS
+  waits; GS: busy/idle per picture), read by the page through getFrameStatsAddress().
+- The frame limiter paces right before vblank start, so pictures leave at the deadline instead of at
+  deadline + that frame's emulation time.
+- debugLoseGsContext() test hook.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ Source/BasicBlock.cpp               |   2 +
+ Source/FrameLimiter.cpp             |   2 +
+ Source/Js_DiscImageDeviceStream.cpp |   2 +
+ Source/PS2VM.cpp                    |  11 +++
+ Source/WsxFrameStats.h              | 126 ++++++++++++++++++++++++++++
+ Source/gs/GSHandler.cpp             |  73 +++++++++++++++-
+ Source/gs/GSHandler.h               |   3 +
+ Source/ui_js/GSH_OpenGLJs.cpp       |  58 +++++++++++--
+ Source/ui_js/GSH_OpenGLJs.h         |   2 +
+ Source/ui_js/Main.cpp               |  23 +++++
+ 10 files changed, 295 insertions(+), 7 deletions(-)
+ create mode 100644 Source/WsxFrameStats.h
+
+diff --git a/Source/BasicBlock.cpp b/Source/BasicBlock.cpp
+index 8513a47c..f076f7f2 100644
+--- a/Source/BasicBlock.cpp
++++ b/Source/BasicBlock.cpp
+@@ -1,4 +1,5 @@
+ #include "BasicBlock.h"
++#include "WsxFrameStats.h"
+ #include "MemStream.h"
+ #include "offsetof_def.h"
+ #include "MipsJitter.h"
+@@ -87,6 +88,7 @@ void CBasicBlock::SetAotBlockOutputStream(Framework::CStdStream* outputStream)
+ 
+ void CBasicBlock::Compile()
+ {
++	WsxFrameStats::CScope compileScope(WsxFrameStats::g_jitUs);
+ #ifndef AOT_USE_CACHE
+ 
+ 	Framework::CMemStream stream;
+diff --git a/Source/FrameLimiter.cpp b/Source/FrameLimiter.cpp
+index 44351904..0f74521d 100644
+--- a/Source/FrameLimiter.cpp
++++ b/Source/FrameLimiter.cpp
+@@ -1,6 +1,7 @@
+ #include "FrameLimiter.h"
+ #include <cassert>
+ #include <thread>
++#include "WsxFrameStats.h"
+ 
+ CFrameLimiter::CFrameLimiter()
+ {
+@@ -47,6 +48,7 @@ void CFrameLimiter::EndFrame()
+ 			m_hasDeadline = true;
+ 		}
+ 		m_nextDeadline += m_minFrameDuration;
++		WsxFrameStats::CScope sleepScope(WsxFrameStats::g_vmSleepUs);
+ 		while(now < m_nextDeadline)
+ 		{
+ 			auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(m_nextDeadline - now);
+diff --git a/Source/Js_DiscImageDeviceStream.cpp b/Source/Js_DiscImageDeviceStream.cpp
+index 891bd635..e3fb8c33 100644
+--- a/Source/Js_DiscImageDeviceStream.cpp
++++ b/Source/Js_DiscImageDeviceStream.cpp
+@@ -6,6 +6,7 @@
+ #include <emscripten.h>
+ #include <emscripten/threading.h>
+ #include <chrono>
++#include "WsxFrameStats.h"
+ 
+ std::atomic<uint64> g_discWaitMicroseconds = 0;
+ 
+@@ -119,6 +120,7 @@ void CJsDiscImageDeviceStream::WaitForSlot(SLOT& slot)
+ 	}
+ 	auto waited = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
+ 	g_discWaitMicroseconds += waited.count();
++	WsxFrameStats::g_discUs += waited.count();
+ }
+ 
+ uint64 CJsDiscImageDeviceStream::Read(void* buffer, uint64 size)
+diff --git a/Source/PS2VM.cpp b/Source/PS2VM.cpp
+index 3718b8b9..1abde8c8 100644
+--- a/Source/PS2VM.cpp
++++ b/Source/PS2VM.cpp
+@@ -6,6 +6,7 @@
+ #include "FpUtils.h"
+ #include "make_unique.h"
+ #include "string_format.h"
++#include "WsxFrameStats.h"
+ #include "PS2VM.h"
+ #include "PS2VM_Preferences.h"
+ #include "ee/PS2OS.h"
+@@ -952,6 +953,14 @@ void CPS2VM::EmuThread()
+ 					m_inVblank = !m_inVblank;
+ 					if(m_inVblank)
+ 					{
++#ifdef __EMSCRIPTEN__
++						//Pace right before the picture goes out, so pictures leave at even intervals
++						//whatever this frame's emulation cost (pacing at vblank end let every
++						//frame's workload shift its picture: judder even at a full 60 fps).
++						m_frameLimiter.EndFrame();
++						m_frameLimiter.BeginFrame();
++						WsxFrameStats::MarkVmFrame();
++#endif
+ 						m_vblankTicks += m_vblankTicksTotal;
+ 						m_ee->NotifyVBlankStart();
+ 						m_iop->NotifyVBlankStart();
+@@ -987,8 +996,10 @@ void CPS2VM::EmuThread()
+ 						{
+ 							m_ee->m_gs->ResetVBlank();
+ 						}
++#ifndef __EMSCRIPTEN__
+ 						m_frameLimiter.EndFrame();
+ 						m_frameLimiter.BeginFrame();
++#endif
+ 					}
+ 				}
+ 
+diff --git a/Source/WsxFrameStats.h b/Source/WsxFrameStats.h
+new file mode 100644
+index 00000000..e11feb6d
+--- /dev/null
++++ b/Source/WsxFrameStats.h
+@@ -0,0 +1,126 @@
++#pragma once
++
++#include <atomic>
++#include "Types.h"
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
++
++//Per-frame timings for the page (WebStationX): what each emulated frame cost on the VM thread and each
++//presented picture on the GS thread, kept in rings the page reads straight out of shared memory, so a
++//stutter can be pinned on the JIT, the disc, the GS, or plain emulation work.
++namespace WsxFrameStats
++{
++	enum
++	{
++		RING_SIZE = 512,
++	};
++
++	struct VM_FRAME
++	{
++		double at;      //ms (emscripten_get_now) at vblank start
++		float frameMs;  //since the previous vblank start
++		float sleepMs;  //frame limiter sleep
++		float jitMs;    //compiling guest code
++		float discMs;   //blocked on disc data
++		float gsWaitMs; //blocked on the GS thread (it may only run 2 frames behind)
++		float reserved;
++	};
++	static_assert(sizeof(VM_FRAME) == 32);
++
++	struct GS_FRAME
++	{
++		double at;    //ms at present
++		float busyMs; //GS thread busy since the previous present
++		float idleMs; //GS thread waiting for work
++	};
++	static_assert(sizeof(GS_FRAME) == 16);
++
++	struct STATE
++	{
++		std::atomic<uint32> vmCount; //entries written; entry i lives at [i % RING_SIZE]
++		std::atomic<uint32> gsCount;
++		uint32 reserved[2];
++		VM_FRAME vm[RING_SIZE];
++		GS_FRAME gs[RING_SIZE];
++	};
++
++	inline STATE g_state = {};
++
++	//Running totals in microseconds, added to by the threads doing the work.
++	inline std::atomic<uint64> g_jitUs = 0;
++	inline std::atomic<uint64> g_discUs = 0;
++	inline std::atomic<uint64> g_vmGsWaitUs = 0;
++	inline std::atomic<uint64> g_vmSleepUs = 0;
++	inline std::atomic<uint64> g_gsIdleUs = 0;
++
++	inline double Now()
++	{
++#ifdef __EMSCRIPTEN__
++		return emscripten_get_now();
++#else
++		return 0;
++#endif
++	}
++
++	//Measures a scope into one of the totals.
++	class CScope
++	{
++	public:
++		explicit CScope(std::atomic<uint64>& total)
++		    : m_total(total)
++		    , m_start(Now())
++		{
++		}
++		~CScope()
++		{
++			m_total += static_cast<uint64>((Now() - m_start) * 1000.0);
++		}
++
++	private:
++		std::atomic<uint64>& m_total;
++		double m_start;
++	};
++
++	//VM thread, at every vblank start.
++	inline void MarkVmFrame()
++	{
++		static double lastAt = 0;
++		static uint64 lastSleep = 0, lastJit = 0, lastDisc = 0, lastGsWait = 0;
++		double now = Now();
++		uint64 sleep = g_vmSleepUs, jit = g_jitUs, disc = g_discUs, gsWait = g_vmGsWaitUs;
++		uint32 index = g_state.vmCount.load(std::memory_order_relaxed);
++		auto& frame = g_state.vm[index % RING_SIZE];
++		frame.at = now;
++		frame.frameMs = lastAt ? static_cast<float>(now - lastAt) : 0;
++		frame.sleepMs = static_cast<float>(sleep - lastSleep) / 1000.0f;
++		frame.jitMs = static_cast<float>(jit - lastJit) / 1000.0f;
++		frame.discMs = static_cast<float>(disc - lastDisc) / 1000.0f;
++		frame.gsWaitMs = static_cast<float>(gsWait - lastGsWait) / 1000.0f;
++		g_state.vmCount.store(index + 1, std::memory_order_release);
++		lastAt = now;
++		lastSleep = sleep;
++		lastJit = jit;
++		lastDisc = disc;
++		lastGsWait = gsWait;
++	}
++
++	//GS thread, at every present.
++	inline void MarkGsFrame()
++	{
++		static double lastAt = 0;
++		static uint64 lastIdle = 0;
++		double now = Now();
++		uint64 idle = g_gsIdleUs;
++		float intervalMs = lastAt ? static_cast<float>(now - lastAt) : 0;
++		float idleMs = static_cast<float>(idle - lastIdle) / 1000.0f;
++		uint32 index = g_state.gsCount.load(std::memory_order_relaxed);
++		auto& frame = g_state.gs[index % RING_SIZE];
++		frame.at = now;
++		frame.idleMs = idleMs;
++		frame.busyMs = (intervalMs > idleMs) ? (intervalMs - idleMs) : 0;
++		g_state.gsCount.store(index + 1, std::memory_order_release);
++		lastAt = now;
++		lastIdle = idle;
++	}
++}
+diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
+index 6fda75ef..6ad11aac 100644
+--- a/Source/gs/GSHandler.cpp
++++ b/Source/gs/GSHandler.cpp
+@@ -2,6 +2,32 @@
+ #include <string.h>
+ #include <functional>
+ #include "AppConfig.h"
++#include "WsxFrameStats.h"
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#include <emscripten/eventloop.h>
++#include <pthread.h>
++
++EM_JS_DEPS(wsxGsYield, "$getWasmTableEntry");
++// Runs fn(arg) on this worker once its event loop had a turn. A MessageChannel instead of setTimeout,
++// which the browser clamps to 4 ms when callbacks keep scheduling each other.
++// clang-format off
++EM_JS(void, wsx_gs_yield, (uintptr_t fn, void* arg), {
++	let channel = globalThis.__wsxGsYield;
++	if(!channel)
++	{
++		channel = globalThis.__wsxGsYield = new MessageChannel();
++		channel.port1.onmessage = () => {
++			const next = channel.next;
++			channel.next = null;
++			if(next) next();
++		};
++	}
++	channel.next = () => getWasmTableEntry(fn)(arg);
++	channel.port2.postMessage(0);
++});
++// clang-format on
++#endif
+ #include "Log.h"
+ #include "../states/MemoryStateFile.h"
+ #include "../states/RegisterStateFile.h"
+@@ -2116,9 +2142,19 @@ void CGSHandler::WriteToDelayedRegister(uint32 address, uint32 value, DELAYED_RE
+ 
+ void CGSHandler::ThreadProc()
+ {
++#ifdef __EMSCRIPTEN__
++	//Browsers recycle each presented picture's GPU buffer on the presenting thread's event loop: a worker
++	//that never returns to it leaks one frame of video memory per picture (gigabytes within minutes, then
++	//the GPU process dies and the picture goes black). So the GS loop runs in slices on the event loop.
++	ThreadSlice(this);
++	emscripten_unwind_to_js_event_loop();
++#endif
+ 	while(!m_threadDone)
+ 	{
+-		m_mailBox.WaitForCall();
++		{
++			WsxFrameStats::CScope idleScope(WsxFrameStats::g_gsIdleUs);
++			m_mailBox.WaitForCall();
++		}
+ 		while(m_mailBox.IsPending())
+ 		{
+ 			m_mailBox.ReceiveCall();
+@@ -2126,6 +2162,33 @@ void CGSHandler::ThreadProc()
+ 	}
+ }
+ 
++#ifdef __EMSCRIPTEN__
++//Processes calls until a picture went out or 50 ms passed, then schedules itself after an event loop turn.
++void CGSHandler::ThreadSlice(void* param)
++{
++	auto self = reinterpret_cast<CGSHandler*>(param);
++	double start = WsxFrameStats::Now();
++	uint32 presents = WsxFrameStats::g_state.gsCount.load();
++	while(!self->m_threadDone)
++	{
++		{
++			WsxFrameStats::CScope idleScope(WsxFrameStats::g_gsIdleUs);
++			self->m_mailBox.WaitForCall(10);
++		}
++		while(self->m_mailBox.IsPending())
++		{
++			self->m_mailBox.ReceiveCall();
++		}
++		if((WsxFrameStats::g_state.gsCount.load() != presents) || ((WsxFrameStats::Now() - start) > 50.0))
++		{
++			wsx_gs_yield(reinterpret_cast<uintptr_t>(&CGSHandler::ThreadSlice), self);
++			return;
++		}
++	}
++	pthread_exit(nullptr);
++}
++#endif
++
+ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitForCompletion, bool forceWaitForCompletion)
+ {
+ 	if(!m_gsThreaded)
+@@ -2133,7 +2196,13 @@ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitFor
+ 		waitForCompletion = false;
+ 	}
+ 	waitForCompletion |= forceWaitForCompletion;
+-	m_mailBox.SendCall(function, waitForCompletion);
++	if(waitForCompletion)
++	{
++		WsxFrameStats::CScope waitScope(WsxFrameStats::g_vmGsWaitUs);
++		m_mailBox.SendCall(function, true);
++		return;
++	}
++	m_mailBox.SendCall(function, false);
+ }
+ 
+ void CGSHandler::SendGSCall(CMailBox::FunctionType&& function)
+diff --git a/Source/gs/GSHandler.h b/Source/gs/GSHandler.h
+index 66bfe59a..715c8529 100644
+--- a/Source/gs/GSHandler.h
++++ b/Source/gs/GSHandler.h
+@@ -1033,6 +1033,9 @@ protected:
+ 	void WriteToDelayedRegister(uint32, uint32, DELAYED_REGISTER&);
+ 
+ 	void ThreadProc();
++#ifdef __EMSCRIPTEN__
++	static void ThreadSlice(void*);
++#endif
+ 	virtual void InitializeImpl() = 0;
+ 	virtual void ReleaseImpl() = 0;
+ 	void ResetBase();
+diff --git a/Source/ui_js/GSH_OpenGLJs.cpp b/Source/ui_js/GSH_OpenGLJs.cpp
+index 02f34bb3..7673635e 100644
+--- a/Source/ui_js/GSH_OpenGLJs.cpp
++++ b/Source/ui_js/GSH_OpenGLJs.cpp
+@@ -1,5 +1,6 @@
+ #include "GSH_OpenGLJs.h"
+ #include <emscripten.h>
++#include "WsxFrameStats.h"
+ 
+ // clang-format off
+ EM_JS(int, wsx_gs_create_context, (int width, int height), {
+@@ -11,7 +12,15 @@ EM_JS(int, wsx_gs_create_context, (int width, int height), {
+ 		failIfMajorPerformanceCaveat: false, enableExtensionsByDefault: true,
+ 	};
+ 	// Registered from this (GS) thread, so Emscripten records it as the owning thread and never proxies.
+-	return GL.createContext(canvas, attrs);
++	const handle = GL.createContext(canvas, attrs);
++	globalThis.__wsxGsGl = handle ? canvas.getContext('webgl2') : null;
++	return handle;
++});
++
++// Drops a context on this thread (emscripten_webgl_destroy_context is proxied to the main thread, which
++// doesn't know contexts created in this worker, and the call never returns).
++EM_JS(void, wsx_gs_destroy_context, (int handle), {
++	GL.deleteContext(handle);
+ });
+ 
+ EM_JS(void, wsx_gs_resize, (int width, int height), {
+@@ -23,13 +32,21 @@ EM_JS(void, wsx_gs_resize, (int width, int height), {
+ 	if (canvas.height !== height) canvas.height = height;
+ });
+ 
+-EM_JS(void, wsx_gs_present, (), {
++// Returns 1 when the context is lost (nothing presented).
++EM_JS(int, wsx_gs_present, (), {
+ 	const canvas = globalThis.__wsxGsCanvas;
+-	if (!canvas) return;
++	if (!canvas) return 0;
++	if (globalThis.__wsxGsGl && globalThis.__wsxGsGl.isContextLost()) return 1;
+ 	const bitmap = canvas.transferToImageBitmap();
+ 	// cmd 9 = Emscripten's "callHandler" worker message: the main thread runs Module[handler](...args).
+ 	// The WebStationX core build script checks the generated glue still handles it this way.
+ 	postMessage({ cmd: 9, handler: 'wsxPresent', args: [bitmap] }, [bitmap]);
++	return 0;
++});
++
++// Tells the page about GS events (Module.wsxGsEvent): 'lost', 'restored', 'restore-failed'.
++EM_JS(void, wsx_gs_event, (const char* name), {
++	postMessage({ cmd: 9, handler: 'wsxGsEvent', args: [UTF8ToString(name)] });
+ });
+ // clang-format on
+ 
+@@ -52,7 +69,7 @@ void CGSH_OpenGLJs::ReleaseImpl()
+ 	if(m_context)
+ 	{
+ 		emscripten_webgl_make_context_current(0);
+-		emscripten_webgl_destroy_context(m_context);
++		wsx_gs_destroy_context(m_context);
+ 		m_context = 0;
+ 	}
+ }
+@@ -65,5 +82,36 @@ void CGSH_OpenGLJs::SetPresentationParams(const PRESENTATION_PARAMS& presentatio
+ 
+ void CGSH_OpenGLJs::PresentBackbuffer()
+ {
+-	wsx_gs_present();
++	WsxFrameStats::MarkGsFrame();
++	if(wsx_gs_present())
++	{
++		RecoverLostContext();
++	}
++}
++
++//The browser can take the WebGL context away (GPU reset, video memory exhausted): the picture goes black
++//for good while the game keeps running. The GL side holds nothing that can't be rebuilt (GS memory lives
++//in m_pRAM), so rebuild it on a new canvas. The GS thread never returns to its event loop, so the
++//context's lost/restored events never arrive: this runs from the per-frame check instead.
++void CGSH_OpenGLJs::RecoverLostContext()
++{
++	double now = WsxFrameStats::Now();
++	if((now - m_lastRecoveryAttempt) < 2000.0) return;
++	bool firstAttempt = (m_lastRecoveryAttempt == 0) || ((now - m_lastRecoveryAttempt) > 10000.0);
++	m_lastRecoveryAttempt = now;
++	if(firstAttempt) wsx_gs_event("lost");
++
++	//New context first: if the GPU isn't back yet, keep the lost one current (its calls are no-ops).
++	auto newContext = wsx_gs_create_context(m_presentationParams.windowWidth, m_presentationParams.windowHeight);
++	if(newContext <= 0)
++	{
++		wsx_gs_event("restore-failed");
++		return;
++	}
++	CGSH_OpenGL::ReleaseImpl();
++	emscripten_webgl_make_context_current(newContext);
++	wsx_gs_destroy_context(m_context);
++	m_context = newContext;
++	CGSH_OpenGL::InitializeImpl();
++	wsx_gs_event("restored");
+ }
+diff --git a/Source/ui_js/GSH_OpenGLJs.h b/Source/ui_js/GSH_OpenGLJs.h
+index 1ce3c08d..9e5ebfbb 100644
+--- a/Source/ui_js/GSH_OpenGLJs.h
++++ b/Source/ui_js/GSH_OpenGLJs.h
+@@ -20,8 +20,10 @@ public:
+ 	void InitializeImpl() override;
+ 	void ReleaseImpl() override;
+ 	void PresentBackbuffer() override;
++	void RecoverLostContext();
+ 	void SetPresentationParams(const PRESENTATION_PARAMS&) override;
+ 
+ private:
+ 	EMSCRIPTEN_WEBGL_CONTEXT_HANDLE m_context = 0;
++	double m_lastRecoveryAttempt = 0;
+ };
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 7d425ff4..f7d0d9f5 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -10,6 +10,7 @@
+ #include "InputProviderEmscripten.h"
+ #include "PH_Js.h"
+ #include "ui_shared/StatsManager.h"
++#include "WsxFrameStats.h"
+ #include "DefaultAppConfig.h"
+ #include "AppConfig.h"
+ #include "PS2VM_Preferences.h"
+@@ -162,6 +163,26 @@ void clearStats()
+ 	CStatsManager::GetInstance().ClearStats();
+ }
+ 
++// Per-frame timing rings (WsxFrameStats::STATE), read by the page straight from shared memory.
++uintptr_t getFrameStatsAddress()
++{
++	return reinterpret_cast<uintptr_t>(&WsxFrameStats::g_state);
++}
++
++// Test hook: makes the browser drop the GS thread's WebGL context, to exercise the recovery path.
++void debugLoseGsContext()
++{
++	WithGs([](CGSHandler* gs) {
++		gs->SendGSCall([]() {
++			EM_ASM({
++				const gl = globalThis.__wsxGsGl;
++				const ext = gl && gl.getExtension('WEBGL_lose_context');
++				if(ext) ext.loseContext();
++			});
++		});
++	});
++}
++
+ uint32 getVblankCount()
+ {
+ 	return g_vblankCount.load();
+@@ -290,6 +311,8 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("clearStats", &clearStats);
+ 	function("takeDiscWaitMs", &takeDiscWaitMs);
+ 	function("getVblankCount", &getVblankCount);
++	function("getFrameStatsAddress", &getFrameStatsAddress);
++	function("debugLoseGsContext", &debugLoseGsContext);
+ 	function("pauseVm", &pauseVm);
+ 	function("resumeVm", &resumeVm);
+ 	function("getVmStatus", &getVmStatus);
+-- 
+2.51.0.windows.1
+

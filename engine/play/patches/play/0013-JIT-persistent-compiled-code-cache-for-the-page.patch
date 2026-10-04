@@ -1,0 +1,303 @@
+From 200b7f1c66b3f65512242fa9ebb8bbd5ec773296 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 12:47:04 -0400
+Subject: [PATCH 13/43] JIT: persistent compiled code cache for the page
+
+Compiling a block is ~2/3 Jitter and ~1/3 V8 compiling the wasm. Blocks are keyed by XXH3-128 over
+their instructions, address range, category, compile hints and a per-type salt (EE: FP rounding mode
+and idle-loop flags, which read code outside the block); VU blocks aren't cached. The page loads
+stored entries before booting (jitCacheAlloc/jitCacheLoad) and takes new ones (jitCacheTakeNew);
+a hit skips the Jitter. Verify mode compiles anyway and compares: 0 mismatches over 13,837 hits.
+
+THPS4, 40 s from a save state: 4.06 s of compiling -> 1.75 s, worst frame 1.9 s -> 0.7 s.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ Source/BasicBlock.cpp      |  65 +++++++++++++++++++++
+ Source/BasicBlock.h        |  10 ++++
+ Source/WsxJitCache.h       | 112 +++++++++++++++++++++++++++++++++++++
+ Source/ee/EeBasicBlock.cpp |   6 ++
+ Source/ee/EeBasicBlock.h   |   1 +
+ Source/ee/VuBasicBlock.h   |   5 ++
+ 6 files changed, 199 insertions(+)
+ create mode 100644 Source/WsxJitCache.h
+
+diff --git a/Source/BasicBlock.cpp b/Source/BasicBlock.cpp
+index f076f7f2..a3d92d8c 100644
+--- a/Source/BasicBlock.cpp
++++ b/Source/BasicBlock.cpp
+@@ -1,5 +1,7 @@
+ #include "BasicBlock.h"
+ #include "WsxFrameStats.h"
++#include "WsxJitCache.h"
++#include "xxhash.h"
+ #include "MemStream.h"
+ #include "offsetof_def.h"
+ #include "MipsJitter.h"
+@@ -86,9 +88,53 @@ void CBasicBlock::SetAotBlockOutputStream(Framework::CStdStream* outputStream)
+ 
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++static WsxJitCache::KEY ComputeCacheKey(CMIPS& context, uint32 begin, uint32 end, uint32 category, uint32 hints, uint64 salt)
++{
++	std::vector<uint32> words;
++	words.reserve(((end - begin) / 4) + 1 + 6);
++	for(uint32 address = begin; address <= end; address += 4)
++	{
++		words.push_back(context.m_pMemoryMap->GetInstruction(address));
++	}
++	words.push_back(begin);
++	words.push_back(end);
++	words.push_back(category);
++	words.push_back(hints);
++	words.push_back(static_cast<uint32>(salt));
++	words.push_back(static_cast<uint32>(salt >> 32));
++	auto hash = XXH3_128bits(words.data(), words.size() * sizeof(uint32));
++	WsxJitCache::KEY key;
++	key.lo = hash.low64;
++	key.hi = hash.high64;
++	return key;
++}
++#endif
++
+ void CBasicBlock::Compile()
+ {
+ 	WsxFrameStats::CScope compileScope(WsxFrameStats::g_jitUs);
++#ifdef __EMSCRIPTEN__
++	bool cacheable = !IsEmpty() && IsCompileCacheable() && (m_category != BLOCK_CATEGORY_UNKNOWN);
++	WsxJitCache::KEY cacheKey;
++	const WsxJitCache::ENTRY* cached = nullptr;
++	if(cacheable)
++	{
++		cacheKey = ComputeCacheKey(m_context, m_begin, m_end, m_category, m_blockCompileHints, GetCompileSalt());
++		cached = WsxJitCache::Find(cacheKey);
++		if(cached && !WsxJitCache::g_verify)
++		{
++			WsxJitCache::g_stats.hits++;
++			for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
++			{
++				m_linkBlockTrampolineOffset[i] = cached->linkOffsets[i];
++			}
++			CMemoryFunction::SetNextWasmLinkBase(reinterpret_cast<uintptr_t>(m_wasmLinkSlots));
++			m_function = CMemoryFunction(cached->code, cached->size);
++			return;
++		}
++	}
++#endif
+ #ifndef AOT_USE_CACHE
+ 
+ 	Framework::CMemStream stream;
+@@ -112,6 +158,25 @@ void CBasicBlock::Compile()
+ 	}
+ 
+ #ifdef __EMSCRIPTEN__
++	if(cacheable)
++	{
++		auto size = static_cast<uint32>(stream.GetSize());
++		if(cached)
++		{
++			bool same = (cached->size == size) && !memcmp(cached->code, stream.GetBuffer(), size);
++			for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
++			{
++				same &= (cached->linkOffsets[i] == m_linkBlockTrampolineOffset[i]);
++			}
++			if(!same) WsxJitCache::g_stats.mismatches++;
++			WsxJitCache::g_stats.hits++;
++		}
++		else
++		{
++			WsxJitCache::g_stats.misses++;
++			WsxJitCache::Record(cacheKey, stream.GetBuffer(), size, m_linkBlockTrampolineOffset);
++		}
++	}
+ 	CMemoryFunction::SetNextWasmLinkBase(reinterpret_cast<uintptr_t>(m_wasmLinkSlots));
+ #endif
+ 	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
+diff --git a/Source/BasicBlock.h b/Source/BasicBlock.h
+index f52539da..b096ebb9 100644
+--- a/Source/BasicBlock.h
++++ b/Source/BasicBlock.h
+@@ -75,6 +75,16 @@ public:
+ 	void Execute();
+ 	void Compile();
+ 	virtual void CompileRange(CMipsJitter*);
++	//Inputs to code generation beyond the instructions, address range, category and compile hints
++	//(part of the compiled code cache key, see WsxJitCache.h).
++	virtual uint64 GetCompileSalt() const
++	{
++		return 0;
++	}
++	virtual bool IsCompileCacheable() const
++	{
++		return true;
++	}
+ 
+ 	void AddBlockCompileHints(uint32);
+ 
+diff --git a/Source/WsxJitCache.h b/Source/WsxJitCache.h
+new file mode 100644
+index 00000000..4c5f3510
+--- /dev/null
++++ b/Source/WsxJitCache.h
+@@ -0,0 +1,112 @@
++#pragma once
++
++#include <cstring>
++#include <mutex>
++#include <unordered_map>
++#include <vector>
++#include "Types.h"
++
++//Persistent cache of compiled guest code (WebStationX). Compiling a block is mostly the Jitter front end
++//(~2/3 of the cost) and V8 compiling the resulting wasm module (~1/3). The page keeps what the Jitter
++//produced, per game and core build, and hands it back on the next launch: a block whose key is known
++//skips the Jitter. The key covers everything that shapes a block's code: its instructions, address
++//range, category, compile hints and the block type's own inputs (CBasicBlock::GetCompileSalt).
++//
++//Blob format (the page stores and returns it verbatim): entries of
++//  KEY (16 bytes) | uint32 size | uint32 linkOffsets[2] | size bytes of wasm | padding to 4 bytes
++namespace WsxJitCache
++{
++	struct KEY
++	{
++		uint64 lo = 0;
++		uint64 hi = 0;
++		bool operator==(const KEY& rhs) const
++		{
++			return (lo == rhs.lo) && (hi == rhs.hi);
++		}
++	};
++
++	struct KEY_HASH
++	{
++		size_t operator()(const KEY& key) const
++		{
++			return static_cast<size_t>(key.lo ^ (key.hi * 0x9E3779B97F4A7C15ULL));
++		}
++	};
++
++	struct ENTRY
++	{
++		const uint8* code = nullptr;
++		uint32 size = 0;
++		uint32 linkOffsets[2] = {};
++	};
++
++	struct STATS
++	{
++		uint32 hits = 0;
++		uint32 misses = 0;
++		uint32 mismatches = 0; //verify mode: the cached code differs from a fresh compile
++		uint32 loaded = 0;
++	};
++
++	//Loaded entries: filled and read on the VM thread only.
++	inline std::unordered_map<KEY, ENTRY, KEY_HASH> g_entries;
++	inline STATS g_stats;
++	inline bool g_verify = false;
++
++	//New entries since the page last took them (VM thread appends, main thread takes).
++	inline std::vector<uint8> g_pending;
++	inline std::mutex g_pendingMutex;
++
++	enum
++	{
++		HEADER_SIZE = 16 + 4 + 8,
++	};
++
++	//VM thread. The blob must outlive the cache (it's never freed).
++	inline void Load(const uint8* blob, uint32 size)
++	{
++		uint32 pos = 0;
++		while((pos + HEADER_SIZE) <= size)
++		{
++			KEY key;
++			ENTRY entry;
++			memcpy(&key, blob + pos, 16);
++			memcpy(&entry.size, blob + pos + 16, 4);
++			memcpy(entry.linkOffsets, blob + pos + 20, 8);
++			pos += HEADER_SIZE;
++			if((pos + entry.size) > size) break;
++			entry.code = blob + pos;
++			pos += (entry.size + 3) & ~3;
++			g_entries[key] = entry;
++		}
++		g_stats.loaded = static_cast<uint32>(g_entries.size());
++	}
++
++	inline const ENTRY* Find(const KEY& key)
++	{
++		auto it = g_entries.find(key);
++		return (it == g_entries.end()) ? nullptr : &it->second;
++	}
++
++	inline void Record(const KEY& key, const void* code, uint32 size, const uint32* linkOffsets)
++	{
++		std::lock_guard lock(g_pendingMutex);
++		size_t pos = g_pending.size();
++		g_pending.resize(pos + HEADER_SIZE + ((size + 3) & ~3), 0);
++		auto out = g_pending.data() + pos;
++		memcpy(out, &key, 16);
++		memcpy(out + 16, &size, 4);
++		memcpy(out + 20, linkOffsets, 8);
++		memcpy(out + HEADER_SIZE, code, size);
++	}
++
++	//Main thread.
++	inline std::vector<uint8> TakePending()
++	{
++		std::lock_guard lock(g_pendingMutex);
++		std::vector<uint8> result;
++		result.swap(g_pending);
++		return result;
++	}
++}
+diff --git a/Source/ee/EeBasicBlock.cpp b/Source/ee/EeBasicBlock.cpp
+index 159699c5..1d99b684 100644
+--- a/Source/ee/EeBasicBlock.cpp
++++ b/Source/ee/EeBasicBlock.cpp
+@@ -21,6 +21,12 @@ void CEeBasicBlock::CompileProlog(CMipsJitter* jitter)
+ 	CBasicBlock::CompileProlog(jitter);
+ }
+ 
++uint64 CEeBasicBlock::GetCompileSalt() const
++{
++	bool idle = m_isIdleLoopBlock || IsCodeIdleLoopBlock() || IsCallSpinLoopBlock();
++	return static_cast<uint64>(m_fpRoundingMode) | (static_cast<uint64>(idle) << 8);
++}
++
+ void CEeBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
+ {
+ 	if(m_fpRoundingMode != DEFAULT_FP_ROUNDING_MODE)
+diff --git a/Source/ee/EeBasicBlock.h b/Source/ee/EeBasicBlock.h
+index f0ac6b05..800da957 100644
+--- a/Source/ee/EeBasicBlock.h
++++ b/Source/ee/EeBasicBlock.h
+@@ -9,6 +9,7 @@ public:
+ 
+ 	void SetFpRoundingMode(Jitter::CJitter::ROUNDINGMODE);
+ 	void SetIsIdleLoopBlock();
++	uint64 GetCompileSalt() const override;
+ 
+ protected:
+ 	void CompileProlog(CMipsJitter*) override;
+diff --git a/Source/ee/VuBasicBlock.h b/Source/ee/VuBasicBlock.h
+index 052b6816..5ad8fd3d 100644
+--- a/Source/ee/VuBasicBlock.h
++++ b/Source/ee/VuBasicBlock.h
+@@ -9,6 +9,11 @@ public:
+ 	virtual ~CVuBasicBlock() = default;
+ 
+ 	bool IsLinkable() const;
++	//VU code generation also depends on analysis state beyond the block: not cached.
++	bool IsCompileCacheable() const override
++	{
++		return false;
++	}
+ 
+ protected:
+ 	void CompileRange(CMipsJitter*) override;
+-- 
+2.51.0.windows.1
+

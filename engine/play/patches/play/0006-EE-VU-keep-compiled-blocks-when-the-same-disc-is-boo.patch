@@ -1,0 +1,207 @@
+From c6600d67efe73b340221ca45b794349dea42d314 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 03:06:52 -0400
+Subject: [PATCH 06/43] EE/VU: keep compiled blocks when the same disc is
+ booted again
+
+Compiling blocks (one WebAssembly module each) is what makes a fresh boot slow to warm up.
+Continuing or restarting the same game now reuses them; cached blocks get their link slots reset.
+---
+ Source/BasicBlock.cpp    | 15 +++++++++++++++
+ Source/BasicBlock.h      |  2 ++
+ Source/ee/EeExecutor.cpp | 19 ++++++++++++++++++-
+ Source/ee/EeExecutor.h   |  4 ++++
+ Source/ee/VuExecutor.cpp | 19 ++++++++++++++++++-
+ Source/ee/VuExecutor.h   |  4 ++++
+ Source/ui_js/Ps2VmJs.cpp |  7 +++++++
+ Source/ui_js/Ps2VmJs.h   |  3 +++
+ 8 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/Source/BasicBlock.cpp b/Source/BasicBlock.cpp
+index f18cb6a8..8513a47c 100644
+--- a/Source/BasicBlock.cpp
++++ b/Source/BasicBlock.cpp
+@@ -476,6 +476,21 @@ void CBasicBlock::UnlinkBlock(LINK_SLOT linkSlot)
+ #endif //!AOT_ENABLED && !__EMSCRIPTEN__
+ }
+ 
++void CBasicBlock::ResetLinkSlots()
++{
++	for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
++	{
++#ifdef _DEBUG
++		m_linkBlock[i] = nullptr;
++#endif
++#ifdef __EMSCRIPTEN__
++		ResetWasmLinkSlot(static_cast<LINK_SLOT>(i));
++#else
++		if(HasLinkSlot(static_cast<LINK_SLOT>(i))) UnlinkBlock(static_cast<LINK_SLOT>(i));
++#endif
++	}
++}
++
+ void CBasicBlock::HandleExternalFunctionReference(uintptr_t symbol, uint32 offset, Jitter::CCodeGen::SYMBOL_REF_TYPE refType)
+ {
+ 	if(symbol == reinterpret_cast<uintptr_t>(&NextBlockTrampoline))
+diff --git a/Source/BasicBlock.h b/Source/BasicBlock.h
+index c72ed40a..f52539da 100644
+--- a/Source/BasicBlock.h
++++ b/Source/BasicBlock.h
+@@ -92,6 +92,8 @@ public:
+ 
+ 	void LinkBlock(LINK_SLOT, CBasicBlock*);
+ 	void UnlinkBlock(LINK_SLOT);
++	//Points every link slot back at its trampoline (the targets may be gone after an executor reset).
++	void ResetLinkSlots();
+ 
+ #ifdef AOT_BUILD_CACHE
+ 	static void SetAotBlockOutputStream(Framework::CStdStream*);
+diff --git a/Source/ee/EeExecutor.cpp b/Source/ee/EeExecutor.cpp
+index c8c72f94..86ef6570 100644
+--- a/Source/ee/EeExecutor.cpp
++++ b/Source/ee/EeExecutor.cpp
+@@ -127,10 +127,27 @@ void CEeExecutor::AttachExceptionHandlerToThread()
+ #endif
+ }
+ 
++bool CEeExecutor::m_keepCachedBlocksOnReset = false;
++
++void CEeExecutor::SetKeepCachedBlocksOnReset(bool keep)
++{
++	m_keepCachedBlocksOnReset = keep;
++}
++
+ void CEeExecutor::Reset()
+ {
+ 	SetMemoryProtected(m_ram, PS2::EE_RAM_SIZE, false);
+-	m_cachedBlocks.clear();
++	if(m_keepCachedBlocksOnReset)
++	{
++		for(auto& [key, block] : m_cachedBlocks)
++		{
++			block->ResetLinkSlots();
++		}
++	}
++	else
++	{
++		m_cachedBlocks.clear();
++	}
+ 	m_blockFpRoundingModes.clear();
+ 	m_idleLoopBlocks.clear();
+ 	CGenericMipsExecutor::Reset();
+diff --git a/Source/ee/EeExecutor.h b/Source/ee/EeExecutor.h
+index 0e8ab924..16386fd9 100644
+--- a/Source/ee/EeExecutor.h
++++ b/Source/ee/EeExecutor.h
+@@ -36,6 +36,9 @@ public:
+ 	void AttachExceptionHandlerToThread();
+ 
+ 	void Reset() override;
++
++	//Rebooting the same game: keep compiled blocks (compiling is the slow part of warming up on WebAssembly).
++	static void SetKeepCachedBlocksOnReset(bool);
+ 	void ClearActiveBlocksInRange(uint32, uint32, bool) override;
+ 
+ 	BasicBlockPtr BlockFactory(CMIPS&, uint32, uint32) override;
+@@ -43,6 +46,7 @@ public:
+ private:
+ 	typedef std::map<CachedBlockKey, BasicBlockPtr> CachedBlockMap;
+ 	CachedBlockMap m_cachedBlocks;
++	static bool m_keepCachedBlocksOnReset;
+ 
+ 	IdleLoopBlockMap m_idleLoopBlocks;
+ 	BlockFpUseAccurateAddSubSet m_blockFpUseAccurateAddSub;
+diff --git a/Source/ee/VuExecutor.cpp b/Source/ee/VuExecutor.cpp
+index 72e80fc4..69ea310e 100644
+--- a/Source/ee/VuExecutor.cpp
++++ b/Source/ee/VuExecutor.cpp
+@@ -21,9 +21,26 @@ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
+ 	m_blockNoClamping = std::move(blockNoClamping);
+ }
+ 
++bool CVuExecutor::m_keepCachedBlocksOnReset = false;
++
++void CVuExecutor::SetKeepCachedBlocksOnReset(bool keep)
++{
++	m_keepCachedBlocksOnReset = keep;
++}
++
+ void CVuExecutor::Reset()
+ {
+-	m_cachedBlocks.clear();
++	if(m_keepCachedBlocksOnReset)
++	{
++		for(auto& [key, block] : m_cachedBlocks)
++		{
++			block->ResetLinkSlots();
++		}
++	}
++	else
++	{
++		m_cachedBlocks.clear();
++	}
+ 	m_blockNoClamping.clear();
+ 	CGenericMipsExecutor::Reset();
+ }
+diff --git a/Source/ee/VuExecutor.h b/Source/ee/VuExecutor.h
+index e2b43c9f..34531347 100644
+--- a/Source/ee/VuExecutor.h
++++ b/Source/ee/VuExecutor.h
+@@ -16,6 +16,9 @@ public:
+ 
+ 	void Reset() override;
+ 
++	//Rebooting the same game: keep compiled blocks (compiling is the slow part of warming up on WebAssembly).
++	static void SetKeepCachedBlocksOnReset(bool);
++
+ protected:
+ 	typedef std::multimap<CachedBlockKey, BasicBlockPtr> CachedBlockMap;
+ 
+@@ -30,6 +33,7 @@ protected:
+ 
+ 	static const BLOCK_COMPILE_HINTS g_blockCompileHints[];
+ 	CachedBlockMap m_cachedBlocks;
++	static bool m_keepCachedBlocksOnReset;
+ 
+ 	BlockNoClampingSet m_blockNoClamping;
+ };
+diff --git a/Source/ui_js/Ps2VmJs.cpp b/Source/ui_js/Ps2VmJs.cpp
+index 6a113db5..6ef7f958 100644
+--- a/Source/ui_js/Ps2VmJs.cpp
++++ b/Source/ui_js/Ps2VmJs.cpp
+@@ -4,6 +4,8 @@
+ #include "BasicBlock.h"
+ #include "PS2VM_Preferences.h"
+ #include "AppConfig.h"
++#include "ee/EeExecutor.h"
++#include "ee/VuExecutor.h"
+ 
+ extern "C" uint32 LWL_Proxy(uint32, uint32, CMIPS*);
+ extern "C" uint32 LWR_Proxy(uint32, uint32, CMIPS*);
+@@ -67,6 +69,11 @@ void CPs2VmJs::BootDiscImage(std::string path)
+ {
+ 	m_mailBox.SendCall([this, path]() {
+ 		printf("Loading '%s'...\r\n", path.c_str());
++		//Same disc again (continue, restart): keep the compiled code.
++		bool sameDisc = (path == m_lastBootPath);
++		CEeExecutor::SetKeepCachedBlocksOnReset(sameDisc);
++		CVuExecutor::SetKeepCachedBlocksOnReset(sameDisc);
++		m_lastBootPath = path;
+ 		try
+ 		{
+ 			CAppConfig::GetInstance().SetPreferencePath(PREF_PS2_CDROM0_PATH, path);
+diff --git a/Source/ui_js/Ps2VmJs.h b/Source/ui_js/Ps2VmJs.h
+index 7e7a5f5e..ab83e23e 100644
+--- a/Source/ui_js/Ps2VmJs.h
++++ b/Source/ui_js/Ps2VmJs.h
+@@ -11,4 +11,7 @@ public:
+ 	void BootDiscImage(std::string);
+ 	void ResumeAsync();
+ 	void SendVmCall(std::function<void()>);
++
++private:
++	std::string m_lastBootPath;
+ };
+-- 
+2.51.0.windows.1
+

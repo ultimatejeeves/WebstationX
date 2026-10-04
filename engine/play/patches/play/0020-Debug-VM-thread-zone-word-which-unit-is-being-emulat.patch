@@ -1,0 +1,285 @@
+From 872e45f780f003408e776ea6b4edf1fc04013e81 Mon Sep 17 00:00:00 2001
+From: wsx <wsx@localhost>
+Date: Tue, 29 Sep 2026 21:17:37 -0400
+Subject: [PATCH 20/43] Debug: VM thread zone word (which unit is being
+ emulated), sampled by the page
+
+---
+ Source/BasicBlock.cpp               |  2 ++
+ Source/Js_DiscImageDeviceStream.cpp |  2 ++
+ Source/PS2VM.cpp                    |  3 ++
+ Source/WsxProfile.h                 | 47 +++++++++++++++++++++++++++++
+ Source/ee/Ee_SubSystem.cpp          |  3 ++
+ Source/ee/GIF.cpp                   |  2 ++
+ Source/ee/Vif.cpp                   |  2 ++
+ Source/ee/Vpu.cpp                   |  2 ++
+ Source/gs/GSHandler.cpp             |  2 ++
+ Source/ui_js/Main.cpp               |  8 +++++
+ 10 files changed, 73 insertions(+)
+ create mode 100644 Source/WsxProfile.h
+
+diff --git a/Source/BasicBlock.cpp b/Source/BasicBlock.cpp
+index 23379745..8a38ede7 100644
+--- a/Source/BasicBlock.cpp
++++ b/Source/BasicBlock.cpp
+@@ -1,6 +1,7 @@
+ #include "BasicBlock.h"
+ #include "WsxFrameStats.h"
+ #include "WsxJitCache.h"
++#include "WsxProfile.h"
+ #include "xxhash.h"
+ #include "MemStream.h"
+ #include "offsetof_def.h"
+@@ -114,6 +115,7 @@ static WsxJitCache::KEY ComputeCacheKey(CMIPS& context, uint32 begin, uint32 end
+ void CBasicBlock::Compile()
+ {
+ 	WsxFrameStats::CScope compileScope(WsxFrameStats::g_jitUs);
++	WsxProfile::CZone profileZone(WsxProfile::ZONE_JIT);
+ #ifdef __EMSCRIPTEN__
+ 	bool cacheable = !IsEmpty() && IsCompileCacheable() && (m_category != BLOCK_CATEGORY_UNKNOWN);
+ 	WsxJitCache::KEY cacheKey;
+diff --git a/Source/Js_DiscImageDeviceStream.cpp b/Source/Js_DiscImageDeviceStream.cpp
+index e3fb8c33..cce85815 100644
+--- a/Source/Js_DiscImageDeviceStream.cpp
++++ b/Source/Js_DiscImageDeviceStream.cpp
+@@ -7,6 +7,7 @@
+ #include <emscripten/threading.h>
+ #include <chrono>
+ #include "WsxFrameStats.h"
++#include "WsxProfile.h"
+ 
+ std::atomic<uint64> g_discWaitMicroseconds = 0;
+ 
+@@ -113,6 +114,7 @@ CJsDiscImageDeviceStream::SLOT* CJsDiscImageDeviceStream::Request(int64 block)
+ void CJsDiscImageDeviceStream::WaitForSlot(SLOT& slot)
+ {
+ 	if(slot.state.load() != SLOT_PENDING) return;
++	WsxProfile::CZone waitZone(WsxProfile::ZONE_WAIT);
+ 	auto start = std::chrono::steady_clock::now();
+ 	while(slot.state.load() == SLOT_PENDING)
+ 	{
+diff --git a/Source/PS2VM.cpp b/Source/PS2VM.cpp
+index a8aa7fdc..708d8bbd 100644
+--- a/Source/PS2VM.cpp
++++ b/Source/PS2VM.cpp
+@@ -9,6 +9,7 @@
+ #include "WsxFrameStats.h"
+ #ifdef __EMSCRIPTEN__
+ #include "WsxJitCache.h"
++#include "WsxProfile.h"
+ #endif
+ #include "PS2VM.h"
+ #include "PS2VM_Preferences.h"
+@@ -759,6 +760,7 @@ void CPS2VM::UpdateEe()
+ 
+ void CPS2VM::UpdateIop()
+ {
++	WsxProfile::CZone zone(WsxProfile::ZONE_IOP);
+ #ifdef PROFILE
+ 	CProfilerZone profilerZone(m_iopProfilerZone);
+ #endif
+@@ -785,6 +787,7 @@ void CPS2VM::UpdateIop()
+ 
+ void CPS2VM::UpdateSpu()
+ {
++	WsxProfile::CZone zone(WsxProfile::ZONE_SPU);
+ #ifdef PROFILE
+ 	CProfilerZone profilerZone(m_spuProfilerZone);
+ #endif
+diff --git a/Source/WsxProfile.h b/Source/WsxProfile.h
+new file mode 100644
+index 00000000..95f5556a
+--- /dev/null
++++ b/Source/WsxProfile.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include <atomic>
++#include "Types.h"
++
++//Where the VM thread's time goes (WebStationX): the unit being emulated right now is kept in one word
++//of shared memory, and the page samples it from another thread (cheap enough to leave on: timing each
++//unit with the clock costs a JS call per read on the web, which made the measured units twice as slow).
++namespace WsxProfile
++{
++	enum ZONE : uint32
++	{
++		ZONE_OTHER,
++		ZONE_EE,
++		ZONE_VU0,
++		ZONE_VIF0,
++		ZONE_VIF1,
++		ZONE_VU1,
++		ZONE_GIF,
++		ZONE_IPU,
++		ZONE_IOP,
++		ZONE_SPU,
++		ZONE_JIT,
++		ZONE_WAIT, //blocked on the GS thread or the disc
++		ZONE_COUNT,
++	};
++
++	inline std::atomic<uint32> g_current = ZONE_OTHER;
++
++	class CZone
++	{
++	public:
++		explicit CZone(ZONE zone)
++		    : m_saved(g_current.load(std::memory_order_relaxed))
++		{
++			g_current.store(zone, std::memory_order_relaxed);
++		}
++
++		~CZone()
++		{
++			g_current.store(m_saved, std::memory_order_relaxed);
++		}
++
++	private:
++		uint32 m_saved;
++	};
++}
+diff --git a/Source/ee/Ee_SubSystem.cpp b/Source/ee/Ee_SubSystem.cpp
+index ff7f6a87..3443e76c 100644
+--- a/Source/ee/Ee_SubSystem.cpp
++++ b/Source/ee/Ee_SubSystem.cpp
+@@ -8,6 +8,7 @@
+ #include "../states/MemoryStateFile.h"
+ #include "../iop/IopBios.h"
+ #include "Vif.h"
++#include "../WsxProfile.h"
+ #include "placeholder_def.h"
+ 
+ using namespace Ee;
+@@ -250,6 +251,7 @@ int CSubSystem::ExecuteCpu(int quota)
+ 	}
+ 	else if(!m_EE.m_State.nHasException)
+ 	{
++		WsxProfile::CZone zone(WsxProfile::ZONE_EE);
+ 		executed = (quota - m_EE.m_executor->Execute(quota));
+ 	}
+ 	m_os->CountExecutedCycles(executed);
+@@ -772,6 +774,7 @@ void CSubSystem::HandleVu1AreaWrite(uint32 offset, uint32 value)
+ 
+ void CSubSystem::ExecuteIpu()
+ {
++	WsxProfile::CZone zone(WsxProfile::ZONE_IPU);
+ 	m_dmac.ResumeDMA4();
+ 	while(m_ipu.WillExecuteCommand())
+ 	{
+diff --git a/Source/ee/GIF.cpp b/Source/ee/GIF.cpp
+index f6e90ac9..86e929c9 100644
+--- a/Source/ee/GIF.cpp
++++ b/Source/ee/GIF.cpp
+@@ -9,6 +9,7 @@
+ #include "../states/MemoryStateFile.h"
+ #include "GIF.h"
+ #include "DMAC.h"
++#include "../WsxProfile.h"
+ 
+ #define QTEMP_INIT (0x3F800000)
+ 
+@@ -295,6 +296,7 @@ uint32 CGIF::ProcessImage(const uint8* memory, uint32 memorySize, uint32 address
+ 
+ uint32 CGIF::ProcessSinglePacket(const uint8* memory, uint32 memorySize, uint32 address, uint32 end, const CGsPacketMetadata& packetMetadata)
+ {
++	WsxProfile::CZone zone(WsxProfile::ZONE_GIF);
+ #ifdef PROFILE
+ 	CProfilerZone profilerZone(m_gifProfilerZone);
+ #endif
+diff --git a/Source/ee/Vif.cpp b/Source/ee/Vif.cpp
+index 50104018..7d1789c5 100644
+--- a/Source/ee/Vif.cpp
++++ b/Source/ee/Vif.cpp
+@@ -9,6 +9,7 @@
+ #include "../states/MemoryStateFile.h"
+ #include "Vpu.h"
+ #include "Vif.h"
++#include "../WsxProfile.h"
+ #include "INTC.h"
+ 
+ #define LOG_NAME ("ee_vif")
+@@ -407,6 +408,7 @@ void CVif::ProcessFifoWrite(uint32 address, uint32 value)
+ 
+ void CVif::ProcessPacket(StreamType& stream)
+ {
++	WsxProfile::CZone zone((m_number == 0) ? WsxProfile::ZONE_VIF0 : WsxProfile::ZONE_VIF1);
+ 	while(stream.GetAvailableReadBytes())
+ 	{
+ 		if(m_STAT.nVPS == 1)
+diff --git a/Source/ee/Vpu.cpp b/Source/ee/Vpu.cpp
+index e21dc8bd..baf15faa 100644
+--- a/Source/ee/Vpu.cpp
++++ b/Source/ee/Vpu.cpp
+@@ -8,6 +8,7 @@
+ #include "Vif.h"
+ #include "Vif1.h"
+ #include "GIF.h"
++#include "../WsxProfile.h"
+ 
+ #define LOG_NAME ("ee_vpu")
+ 
+@@ -46,6 +47,7 @@ CVpu::~CVpu()
+ void CVpu::Execute(int32 quota)
+ {
+ 	if(m_vuState != VU_STATE_RUNNING) return;
++	WsxProfile::CZone zone((m_number == 0) ? WsxProfile::ZONE_VU0 : WsxProfile::ZONE_VU1);
+ 
+ #ifdef PROFILE
+ 	CProfilerZone profilerZone(m_vuProfilerZone);
+diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
+index 6ad11aac..3bf5590d 100644
+--- a/Source/gs/GSHandler.cpp
++++ b/Source/gs/GSHandler.cpp
+@@ -3,6 +3,7 @@
+ #include <functional>
+ #include "AppConfig.h"
+ #include "WsxFrameStats.h"
++#include "WsxProfile.h"
+ #ifdef __EMSCRIPTEN__
+ #include <emscripten.h>
+ #include <emscripten/eventloop.h>
+@@ -2199,6 +2200,7 @@ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitFor
+ 	if(waitForCompletion)
+ 	{
+ 		WsxFrameStats::CScope waitScope(WsxFrameStats::g_vmGsWaitUs);
++		WsxProfile::CZone waitZone(WsxProfile::ZONE_WAIT);
+ 		m_mailBox.SendCall(function, true);
+ 		return;
+ 	}
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 75574067..248663cd 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -12,6 +12,7 @@
+ #include "ui_shared/StatsManager.h"
+ #include "WsxFrameStats.h"
+ #include "WsxJitCache.h"
++#include "WsxProfile.h"
+ #include "DefaultAppConfig.h"
+ #include "AppConfig.h"
+ #include "PS2VM_Preferences.h"
+@@ -352,6 +353,12 @@ void jitCacheSetVerify(bool verify)
+ 	g_virtualMachine->SendVmCall([verify]() { WsxJitCache::g_verify = verify; });
+ }
+ 
++// The unit the VM thread is emulating right now (WsxProfile.h), sampled by the page.
++uintptr_t getVmZoneAddress()
++{
++	return reinterpret_cast<uintptr_t>(&WsxProfile::g_current);
++}
++
+ // Sound ring (CSH_WsxRing::RING) the page's AudioWorklet plays from.
+ uintptr_t getAudioRingAddress()
+ {
+@@ -372,6 +379,7 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("gsTrace", &gsTrace);
+ 	function("getFrameStatsAddress", &getFrameStatsAddress);
+ 	function("getAudioRingAddress", &getAudioRingAddress);
++	function("getVmZoneAddress", &getVmZoneAddress);
+ 	function("jitCacheAlloc", &jitCacheAlloc);
+ 	function("jitCacheLoad", &jitCacheLoad);
+ 	function("jitCacheTakeNew", &jitCacheTakeNew);
+-- 
+2.51.0.windows.1
+

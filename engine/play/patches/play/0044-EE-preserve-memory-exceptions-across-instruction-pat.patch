@@ -1,0 +1,323 @@
+From fa67e3b470fccd5b42501441fdf806780cb882a5 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 12:23:32 -0400
+Subject: [PATCH] EE: preserve memory exceptions across instruction paths and
+ JIT caches
+
+---
+ Source/COP_FPU.cpp                |  4 ++++
+ Source/MA_MIPSIV.cpp              |  6 ++++++
+ Source/MIPS.h                     |  4 ++++
+ Source/MIPSInstructionFactory.cpp |  3 +--
+ Source/ee/COP_VU.cpp              | 34 +++++++++++++++++++++++++++++--
+ Source/ee/EeBasicBlock.cpp        |  3 ++-
+ Source/ee/EeExecutor.cpp          | 20 ++++++++++++++++--
+ Source/ee/EeExecutor.h            |  6 +++++-
+ Source/ee/MA_EE.cpp               |  9 ++++++++
+ 9 files changed, 81 insertions(+), 8 deletions(-)
+
+diff --git a/Source/COP_FPU.cpp b/Source/COP_FPU.cpp
+index 438943a2..62fc3890 100644
+--- a/Source/COP_FPU.cpp
++++ b/Source/COP_FPU.cpp
+@@ -577,6 +577,8 @@ void CCOP_FPU::CVT_S_W()
+ //31
+ void CCOP_FPU::LWC1()
+ {
++	CheckTLBExceptions(false);
++
+ 	bool usePageLookup = (m_pCtx->m_pageLookup != nullptr);
+ 
+ 	if(usePageLookup)
+@@ -616,6 +618,8 @@ void CCOP_FPU::LWC1()
+ //39
+ void CCOP_FPU::SWC1()
+ {
++	CheckTLBExceptions(true);
++
+ 	bool usePageLookup = (m_pCtx->m_pageLookup != nullptr);
+ 
+ 	if(usePageLookup)
+diff --git a/Source/MA_MIPSIV.cpp b/Source/MA_MIPSIV.cpp
+index 5d5bbb29..867110b1 100644
+--- a/Source/MA_MIPSIV.cpp
++++ b/Source/MA_MIPSIV.cpp
+@@ -566,6 +566,7 @@ void CMA_MIPSIV::DADDIU()
+ void CMA_MIPSIV::LDL()
+ {
+ 	if(!Ensure64BitRegs()) return;
++	CheckTLBExceptions(false);
+ 	if(m_nRT == 0) return;
+ 
+ 	ComputeMemAccessAddrNoXlat();
+@@ -579,6 +580,7 @@ void CMA_MIPSIV::LDL()
+ void CMA_MIPSIV::LDR()
+ {
+ 	if(!Ensure64BitRegs()) return;
++	CheckTLBExceptions(false);
+ 	if(m_nRT == 0) return;
+ 
+ 	ComputeMemAccessAddrNoXlat();
+@@ -698,6 +700,7 @@ void CMA_MIPSIV::SW()
+ void CMA_MIPSIV::SDL()
+ {
+ 	if(!Ensure64BitRegs()) return;
++	CheckTLBExceptions(true);
+ 
+ 	ComputeMemAccessAddrNoXlat();
+ 	m_codeGen->PushRel64(offsetof(CMIPS, m_State.nGPR[m_nRT]));
+@@ -709,6 +712,7 @@ void CMA_MIPSIV::SDL()
+ void CMA_MIPSIV::SDR()
+ {
+ 	if(!Ensure64BitRegs()) return;
++	CheckTLBExceptions(true);
+ 
+ 	ComputeMemAccessAddrNoXlat();
+ 	m_codeGen->PushRel64(offsetof(CMIPS, m_State.nGPR[m_nRT]));
+@@ -768,6 +772,7 @@ void CMA_MIPSIV::LDC2()
+ void CMA_MIPSIV::LD()
+ {
+ 	if(!Ensure64BitRegs()) return;
++	CheckTLBExceptions(false);
+ 	if(m_nRT == 0) return;
+ 
+ 	ComputeMemAccessPageRef();
+@@ -824,6 +829,7 @@ void CMA_MIPSIV::SDC2()
+ void CMA_MIPSIV::SD()
+ {
+ 	if(!Ensure64BitRegs()) return;
++	CheckTLBExceptions(true);
+ 
+ 	ComputeMemAccessPageRef();
+ 
+diff --git a/Source/MIPS.h b/Source/MIPS.h
+index fc28a8f9..b422d356 100644
+--- a/Source/MIPS.h
++++ b/Source/MIPS.h
+@@ -157,6 +157,10 @@ public:
+ 	bool IsBranch(uint32);
+ 	static int32 GetBranch(uint16);
+ 	static uint32 TranslateAddress64(CMIPS*, uint32);
++	bool HasTLBExceptionChecks() const
++	{
++		return (m_pAddrTranslator != &TranslateAddress64) && (m_TLBExceptionChecker != nullptr);
++	}
+ 
+ 	void Reset();
+ 
+diff --git a/Source/MIPSInstructionFactory.cpp b/Source/MIPSInstructionFactory.cpp
+index 89875e44..43a57650 100644
+--- a/Source/MIPSInstructionFactory.cpp
++++ b/Source/MIPSInstructionFactory.cpp
+@@ -46,8 +46,7 @@ extern "C" uint32 TLBExceptionChecker_Proxy(CMIPS* context, uint32 vaddrLo, uint
+ 
+ void CMIPSInstructionFactory::CheckTLBExceptions(bool isWrite)
+ {
+-	if(m_pCtx->m_pAddrTranslator == &CMIPS::TranslateAddress64) return;
+-	if(m_pCtx->m_TLBExceptionChecker == nullptr) return;
++	if(!m_pCtx->HasTLBExceptionChecks()) return;
+ 
+ 	uint8 nRS = (uint8)((m_nOpcode >> 21) & 0x001F);
+ 	uint16 nImmediate = (uint16)((m_nOpcode >> 0) & 0xFFFF);
+diff --git a/Source/ee/COP_VU.cpp b/Source/ee/COP_VU.cpp
+index e6c36f88..ad71f781 100644
+--- a/Source/ee/COP_VU.cpp
++++ b/Source/ee/COP_VU.cpp
+@@ -78,6 +78,8 @@ void CCOP_VU::CompileInstruction(uint32 nAddress, CMipsJitter* codeGen, CMIPS* p
+ //36
+ void CCOP_VU::LQC2()
+ {
++	CheckTLBExceptions(false);
++
+ 	if(m_nFT == 0) return;
+ 
+ 	ComputeMemAccessPageRef();
+@@ -105,7 +107,21 @@ void CCOP_VU::LQC2()
+ 		}
+ 		else
+ 		{
+-			m_codeGen->Break();
++			//Wasm can't return v128 from a helper call. Match the quadword proxy
++			//with four word accesses, using the aligned effective address.
++			ComputeMemAccessAddrNoXlat();
++			m_codeGen->PushCst(~0x0F);
++			m_codeGen->And();
++			for(uint32 i = 0; i < 4; i++)
++			{
++				m_codeGen->PushCtx();
++				m_codeGen->PushIdx(1);
++				m_codeGen->PushCst(i * 4);
++				m_codeGen->Add();
++				m_codeGen->Call(reinterpret_cast<void*>(&MemoryUtils_GetWordProxy), 2, Jitter::CJitter::RETURN_VALUE_32);
++				m_codeGen->PullRel(offsetof(CMIPS, m_State.nCOP2[m_nFT].nV[i]));
++			}
++			m_codeGen->PullTop();
+ 		}
+ 	}
+ 	m_codeGen->EndIf();
+@@ -114,6 +130,8 @@ void CCOP_VU::LQC2()
+ //3E
+ void CCOP_VU::SQC2()
+ {
++	CheckTLBExceptions(true);
++
+ 	ComputeMemAccessPageRef();
+ 
+ 	m_codeGen->PushCst(0);
+@@ -139,7 +157,19 @@ void CCOP_VU::SQC2()
+ 		}
+ 		else
+ 		{
+-			m_codeGen->Break();
++			ComputeMemAccessAddrNoXlat();
++			m_codeGen->PushCst(~0x0F);
++			m_codeGen->And();
++			for(uint32 i = 0; i < 4; i++)
++			{
++				m_codeGen->PushCtx();
++				m_codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2[m_nFT].nV[i]));
++				m_codeGen->PushIdx(2);
++				m_codeGen->PushCst(i * 4);
++				m_codeGen->Add();
++				m_codeGen->Call(reinterpret_cast<void*>(&MemoryUtils_SetWordProxy), 3, Jitter::CJitter::RETURN_VALUE_NONE);
++			}
++			m_codeGen->PullTop();
+ 		}
+ 	}
+ 	m_codeGen->EndIf();
+diff --git a/Source/ee/EeBasicBlock.cpp b/Source/ee/EeBasicBlock.cpp
+index 1d99b684..a7f17c0c 100644
+--- a/Source/ee/EeBasicBlock.cpp
++++ b/Source/ee/EeBasicBlock.cpp
+@@ -24,7 +24,8 @@ void CEeBasicBlock::CompileProlog(CMipsJitter* jitter)
+ uint64 CEeBasicBlock::GetCompileSalt() const
+ {
+ 	bool idle = m_isIdleLoopBlock || IsCodeIdleLoopBlock() || IsCallSpinLoopBlock();
+-	return static_cast<uint64>(m_fpRoundingMode) | (static_cast<uint64>(idle) << 8);
++	return static_cast<uint64>(m_fpRoundingMode) | (static_cast<uint64>(idle) << 8) |
++	       (static_cast<uint64>(m_context.HasTLBExceptionChecks()) << 9);
+ }
+ 
+ void CEeBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
+diff --git a/Source/ee/EeExecutor.cpp b/Source/ee/EeExecutor.cpp
+index 86ef6570..263f0986 100644
+--- a/Source/ee/EeExecutor.cpp
++++ b/Source/ee/EeExecutor.cpp
+@@ -153,6 +153,21 @@ void CEeExecutor::Reset()
+ 	CGenericMipsExecutor::Reset();
+ }
+ 
++int CEeExecutor::Execute(int cycles)
++{
++	bool tlbExceptionChecks = m_context.HasTLBExceptionChecks();
++	if(tlbExceptionChecks != m_tlbExceptionChecks)
++	{
++		//A syscall or state load can change the mode between execution slices.
++		//Drop active lookup entries and links before dispatching again; keep the
++		//compiled cache, whose keys distinguish the two modes.
++		for(const auto& block : m_blocks) OrphanBlock(block.get());
++		CGenericMipsExecutor::Reset();
++		m_tlbExceptionChecks = tlbExceptionChecks;
++	}
++	return CGenericMipsExecutor::Execute(cycles);
++}
++
+ void CEeExecutor::ClearActiveBlocksInRange(uint32 start, uint32 end, bool executing)
+ {
+ 	uint32 rangeSize = end - start;
+@@ -185,6 +200,7 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
+ 	memcpy(&hash, &xxHash, sizeof(xxHash));
+ 	static_assert(sizeof(hash) == sizeof(xxHash));
+ 	auto blockKey = std::make_pair(hash, blockSize);
++	auto cacheKey = std::make_pair(blockKey, context.HasTLBExceptionChecks());
+ 
+ 	bool hasBreakpoint = m_context.HasBreakpointInRange(start, end);
+ 
+@@ -211,7 +227,7 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
+ 	bool isCacheableBlock = !hasBreakpoint && !blockFpRoundingModeOverride.has_value() && !isIdleLoopBlockOverride && !fpUseAccurateAddSub;
+ 	if(isCacheableBlock)
+ 	{
+-		auto blockIterator = m_cachedBlocks.find(blockKey);
++		auto blockIterator = m_cachedBlocks.find(cacheKey);
+ 		if(blockIterator != std::end(m_cachedBlocks))
+ 		{
+ 			const auto& basicBlock(blockIterator->second);
+@@ -247,7 +263,7 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
+ 	result->Compile();
+ 	if(isCacheableBlock)
+ 	{
+-		m_cachedBlocks.insert(std::make_pair(blockKey, result));
++		m_cachedBlocks.insert(std::make_pair(cacheKey, result));
+ 	}
+ 	return result;
+ }
+diff --git a/Source/ee/EeExecutor.h b/Source/ee/EeExecutor.h
+index 16386fd9..9c592561 100644
+--- a/Source/ee/EeExecutor.h
++++ b/Source/ee/EeExecutor.h
+@@ -36,6 +36,7 @@ public:
+ 	void AttachExceptionHandlerToThread();
+ 
+ 	void Reset() override;
++	int Execute(int) override;
+ 
+ 	//Rebooting the same game: keep compiled blocks (compiling is the slow part of warming up on WebAssembly).
+ 	static void SetKeepCachedBlocksOnReset(bool);
+@@ -44,9 +45,12 @@ public:
+ 	BasicBlockPtr BlockFactory(CMIPS&, uint32, uint32) override;
+ 
+ private:
+-	typedef std::map<CachedBlockKey, BasicBlockPtr> CachedBlockMap;
++	//Exception checks are emitted at compile time, so checked and unchecked code
++	//must never share a compiled block (including after a same-disc restart).
++	typedef std::map<std::pair<CachedBlockKey, bool>, BasicBlockPtr> CachedBlockMap;
+ 	CachedBlockMap m_cachedBlocks;
+ 	static bool m_keepCachedBlocksOnReset;
++	bool m_tlbExceptionChecks = false;
+ 
+ 	IdleLoopBlockMap m_idleLoopBlocks;
+ 	BlockFpUseAccurateAddSubSet m_blockFpUseAccurateAddSub;
+diff --git a/Source/ee/MA_EE.cpp b/Source/ee/MA_EE.cpp
+index 9c60d5d1..d09f6fbe 100644
+--- a/Source/ee/MA_EE.cpp
++++ b/Source/ee/MA_EE.cpp
+@@ -105,6 +105,8 @@ size_t CMA_EE::GetHiOffset(unsigned int index)
+ //1E
+ void CMA_EE::LQ()
+ {
++	CheckTLBExceptions(false);
++
+ 	if(m_nRT == 0) return;
+ 
+ 	ComputeMemAccessPageRef();
+@@ -133,6 +135,9 @@ void CMA_EE::LQ()
+ 		else
+ 		{
+ 			ComputeMemAccessAddrNoXlat();
++			//Quadword accesses ignore the low four address bits, including on Wasm.
++			m_codeGen->PushCst(~0x0F);
++			m_codeGen->And();
+ 
+ 			for(uint32 i = 0; i < 4; i++)
+ 			{
+@@ -153,6 +158,8 @@ void CMA_EE::LQ()
+ //1F
+ void CMA_EE::SQ()
+ {
++	CheckTLBExceptions(true);
++
+ 	ComputeMemAccessPageRef();
+ 
+ 	m_codeGen->PushCst(0);
+@@ -179,6 +186,8 @@ void CMA_EE::SQ()
+ 		else
+ 		{
+ 			ComputeMemAccessAddrNoXlat();
++			m_codeGen->PushCst(~0x0F);
++			m_codeGen->And();
+ 
+ 			for(uint32 i = 0; i < 4; i++)
+ 			{
+-- 
+2.51.0.windows.1
+

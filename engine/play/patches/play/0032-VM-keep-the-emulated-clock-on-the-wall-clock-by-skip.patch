@@ -1,0 +1,349 @@
+From 8ef2ac5b749665e7a94a293bfd7cedb6731a0d9a Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 12:38:19 -0400
+Subject: [PATCH 32/43] VM: keep the emulated clock on the wall clock by
+ skipping EE cycles (catch-up); EE/VU1 debug counters
+
+Time the EE thread waits on the VPU1/GS threads, and time it can't emulate fast enough, no longer slows the
+whole console down: the cycles it is behind by are counted as run (bounded), so games drop frames at full
+speed. getEeStats, VU1 pc/disassembly for the bench, game frame counter (newFrames).
+---
+ Source/FrameLimiter.cpp      | 15 +++++++++
+ Source/FrameLimiter.h        |  6 ++++
+ Source/GenericMipsExecutor.h |  1 +
+ Source/MipsExecutor.h        |  3 ++
+ Source/PS2VM.cpp             | 62 ++++++++++++++++++++++++++++++++++++
+ Source/PS2VM.h               | 22 +++++++++++++
+ Source/WsxFrameStats.h       |  2 ++
+ Source/ee/Ee_SubSystem.cpp   |  2 ++
+ Source/ui_js/Main.cpp        | 57 +++++++++++++++++++++++++++++++--
+ 9 files changed, 168 insertions(+), 2 deletions(-)
+
+diff --git a/Source/FrameLimiter.cpp b/Source/FrameLimiter.cpp
+index 20737a9b..f767ba09 100644
+--- a/Source/FrameLimiter.cpp
++++ b/Source/FrameLimiter.cpp
+@@ -138,6 +138,21 @@ void CFrameLimiter::SetIdleWork(IdleWork idleWork)
+ {
+ 	m_idleWork = std::move(idleWork);
+ }
++
++double CFrameLimiter::GetLatenessUs(double fraction) const
++{
++	if(!m_hasDeadline || (m_minFrameDuration.count() == 0)) return 0;
++	auto now = std::chrono::high_resolution_clock::now();
++	double sinceDeadlineUs = std::chrono::duration<double, std::micro>(now - m_nextDeadline).count();
++	return sinceDeadlineUs - (fraction * static_cast<double>(m_minFrameDuration.count()));
++}
++
++void CFrameLimiter::Rebase(double fraction)
++{
++	if(!m_hasDeadline) return;
++	auto offset = std::chrono::microseconds(static_cast<int64>(fraction * static_cast<double>(m_minFrameDuration.count())));
++	m_nextDeadline = std::chrono::high_resolution_clock::now() - offset;
++}
+ #endif
+ 
+ void CFrameLimiter::SetFrameRate(uint32 fps)
+diff --git a/Source/FrameLimiter.h b/Source/FrameLimiter.h
+index 0b28f610..7d400b2b 100644
+--- a/Source/FrameLimiter.h
++++ b/Source/FrameLimiter.h
+@@ -24,6 +24,12 @@ public:
+ 	//false when it has nothing to do.
+ 	typedef std::function<bool(double)> IdleWork;
+ 	void SetIdleWork(IdleWork);
++
++	//How far behind schedule the emulation is, `fraction` of the way through the frame that began at the
++	//last EndFrame (microseconds, negative when ahead; 0 without a frame rate limit).
++	double GetLatenessUs(double fraction) const;
++	//The schedule restarts from now (after a pause or a stall that isn't worth catching up on).
++	void Rebase(double fraction);
+ #endif
+ 
+ private:
+diff --git a/Source/GenericMipsExecutor.h b/Source/GenericMipsExecutor.h
+index 2fb630fa..99bbc6de 100644
+--- a/Source/GenericMipsExecutor.h
++++ b/Source/GenericMipsExecutor.h
+@@ -67,6 +67,7 @@ public:
+ 		{
+ 			uint32 address = m_context.m_State.nPC & m_addressMask;
+ 			auto block = m_blockLookup.FindBlockAt(address);
++			m_dispatchCount++;
+ 			block->Execute();
+ 		}
+ 		m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
+diff --git a/Source/MipsExecutor.h b/Source/MipsExecutor.h
+index 2347e7c8..43bddff3 100644
+--- a/Source/MipsExecutor.h
++++ b/Source/MipsExecutor.h
+@@ -10,6 +10,9 @@ public:
+ 	virtual int Execute(int) = 0;
+ 	virtual void ClearActiveBlocksInRange(uint32 start, uint32 end, bool executing) = 0;
+ 
++	//Debug counter: times the dispatcher looked a block up and entered compiled code
++	uint64 m_dispatchCount = 0;
++
+ #ifdef DEBUGGER_INCLUDED
+ 	virtual bool MustBreak() const = 0;
+ 	virtual void DisableBreakpointsOnce() = 0;
+diff --git a/Source/PS2VM.cpp b/Source/PS2VM.cpp
+index 0d41ae8f..d3bcbef4 100644
+--- a/Source/PS2VM.cpp
++++ b/Source/PS2VM.cpp
+@@ -240,6 +240,58 @@ void CPS2VM::SetEeFrequencyScale(uint32 numerator, uint32 denominator)
+ 	ReloadFrameRateLimit();
+ }
+ 
++void CPS2VM::SetCatchUp(bool enabled)
++{
++	m_catchUpEnabled = enabled;
++}
++
++//A machine that can't emulate in real time used to slow the whole console down: slow motion, stretched
++//sound. Two things make the EE thread fall behind the wall clock:
++//- It waits for the VPU1 or GS thread (Drain, a download). The vector unit and the GS take no emulated
++//  time in this emulator, so a game that waits for its display list before every flip (ATV Offroad Fury 2)
++//  saw every frame fit in one vblank and drew 60 of them per emulated second however long each took.
++//- It can't run the game's code fast enough.
++//Either way the console's clock now stays on the wall clock: the cycles the EE is behind by are counted
++//as run without running them, which to the game is what a slower EE (or a busy vector unit) would be. It
++//misses vblanks and skips frames at full speed, with sound, timers and the IOP in real time. Bounded:
++//time spent waiting counts in full, and on top of that at most CATCHUP_MAX_RATIO cycles per cycle run.
++//Nothing is skipped while the emulation is on schedule, so a machine with headroom emulates exactly what
++//it did before; there is no schedule without the frame limiter (benchmarks, determinism checks).
++int CPS2VM::TakeCatchUpTicks(int executed)
++{
++	uint64 waitUs = WsxFrameStats::g_vpu1WaitUs.load(std::memory_order_relaxed) + WsxFrameStats::g_eeGsWaitUs.load(std::memory_order_relaxed);
++	uint64 waitedUs = waitUs - m_waitUsSeen;
++	m_waitUsSeen = waitUs;
++	if(!m_catchUpEnabled)
++	{
++		m_catchUpCredit = 0;
++		return 0;
++	}
++	uint64 eeFreqScaled = static_cast<uint64>(PS2::EE_CLOCK_FREQ) * m_eeFreqScaleNumerator / m_eeFreqScaleDenominator;
++	int64 frameTicks = static_cast<int64>(m_onScreenTicksTotal) + static_cast<int64>(m_vblankTicksTotal);
++	m_catchUpCredit += static_cast<int64>(executed) * CATCHUP_MAX_RATIO;
++	m_catchUpCredit += static_cast<int64>((std::min<uint64>(waitedUs, 50000) * eeFreqScaled) / 1000000);
++	m_catchUpCredit = std::min(m_catchUpCredit, frameTicks);
++	//The clock is read every few slices (a slice is ~16 microseconds of emulated time)
++	if((waitedUs == 0) && ((++m_catchUpSlice & 3) != 0)) return 0;
++
++	int64 remaining = m_inVblank ? (static_cast<int64>(m_vblankTicks) + m_onScreenTicksTotal) : static_cast<int64>(m_vblankTicks);
++	double fraction = 1.0 - (static_cast<double>(remaining) / static_cast<double>(frameTicks));
++	double lateUs = m_frameLimiter.GetLatenessUs(fraction);
++	if(lateUs > 100000.0)
++	{
++		//Not something to play back (the tab was suspended, a long compile or disc stall)
++		m_frameLimiter.Rebase(fraction);
++		m_catchUpCredit = 0;
++		return 0;
++	}
++	if(lateUs < 250.0) return 0;
++	int64 lateTicks = static_cast<int64>(lateUs * static_cast<double>(eeFreqScaled) / 1000000.0);
++	int64 skipped = std::min(lateTicks, m_catchUpCredit);
++	m_catchUpCredit -= skipped;
++	return static_cast<int>(skipped);
++}
++
+ void CPS2VM::ReloadFrameRateLimit()
+ {
+ 	uint32 hRefreshRate = PS2::GS_NTSC_HSYNC_FREQ;
+@@ -770,12 +822,22 @@ void CPS2VM::UpdateEe()
+ 	while(m_eeExecutionTicks > 0)
+ 	{
+ 		int executed = m_ee->ExecuteCpu(m_singleStepEe ? 1 : m_eeExecutionTicks);
++		m_statEeSlices++;
++		m_statEeTicks += executed;
+ 		if(m_ee->IsCpuIdle())
+ 		{
++			m_statIdleTicks += (m_eeExecutionTicks - executed);
+ 			m_cpuUtilisation.eeIdleTicks += (m_eeExecutionTicks - executed);
+ 			executed = m_eeExecutionTicks;
+ 		}
+ 		m_cpuUtilisation.eeTotalTicks += executed;
++#ifdef __EMSCRIPTEN__
++		{
++			int waitTicks = TakeCatchUpTicks(executed);
++			m_statWaitTicks += waitTicks;
++			executed += waitTicks;
++		}
++#endif
+ 
+ 		m_ee->m_vpu0->Execute(m_singleStepVu0 ? 1 : executed);
+ 		if(!m_ee->m_vpu1Thread)
+diff --git a/Source/PS2VM.h b/Source/PS2VM.h
+index fd27206d..d7279597 100644
+--- a/Source/PS2VM.h
++++ b/Source/PS2VM.h
+@@ -71,6 +71,7 @@ public:
+ 	void CDROM0_Reset();
+ 
+ 	void SetEeFrequencyScale(uint32, uint32);
++	void SetCatchUp(bool);
+ 	void ReloadFrameRateLimit();
+ 
+ 	static fs::path GetStateDirectoryPath();
+@@ -180,6 +181,27 @@ private:
+ 	int m_eeExecutionTicks = 0;
+ 	int m_iopExecutionTicks = 0;
+ 	static const int m_eeTickStep = 4800;
++
++	//Keeping the emulated clock on the wall clock by skipping EE cycles: see TakeCatchUpTicks.
++	enum
++	{
++		//EE cycles that may be skipped per cycle run: the EE never drops under a quarter of its speed
++		CATCHUP_MAX_RATIO = 3,
++	};
++	int TakeCatchUpTicks(int);
++	bool m_catchUpEnabled = true;
++	uint64 m_waitUsSeen = 0;
++	int64 m_catchUpCredit = 0;
++	uint32 m_catchUpSlice = 0;
++
++public:
++	//Debug counters (getEeStats)
++	uint64 m_statEeTicks = 0;     //EE cycles executed by compiled code
++	uint64 m_statEeSlices = 0;    //ExecuteCpu calls
++	uint64 m_statWaitTicks = 0;   //Cycles skipped to keep up with the wall clock
++	uint64 m_statIdleTicks = 0;   //Cycles skipped as idle
++
++private:
+ 	int m_iopTickStep = 0;
+ 	CFrameLimiter m_frameLimiter;
+ 
+diff --git a/Source/WsxFrameStats.h b/Source/WsxFrameStats.h
+index e68f5013..3f331bd6 100644
+--- a/Source/WsxFrameStats.h
++++ b/Source/WsxFrameStats.h
+@@ -54,6 +54,8 @@ namespace WsxFrameStats
+ 	inline std::atomic<uint64> g_vmSleepUs = 0;
+ 	inline std::atomic<uint64> g_gsIdleUs = 0;
+ 	inline std::atomic<uint64> g_vpu1WaitUs = 0;
++	//EE thread blocked on the GS for a download (local to host transfer)
++	inline std::atomic<uint64> g_eeGsWaitUs = 0;
+ 
+ 	inline double Now()
+ 	{
+diff --git a/Source/ee/Ee_SubSystem.cpp b/Source/ee/Ee_SubSystem.cpp
+index d1b883a7..c32f2b55 100644
+--- a/Source/ee/Ee_SubSystem.cpp
++++ b/Source/ee/Ee_SubSystem.cpp
+@@ -9,6 +9,7 @@
+ #include "../iop/IopBios.h"
+ #include "Vif.h"
+ #include "../WsxProfile.h"
++#include "../WsxFrameStats.h"
+ #include "placeholder_def.h"
+ 
+ using namespace Ee;
+@@ -268,6 +269,7 @@ uint32 CSubSystem::Vif1ThreadedReceiveDMA(uint32 address, uint32 qwc, uint32 dir
+ 	{
+ 		//GS to memory: done here, once the thread is done with what it was sent
+ 		m_vpu1Thread->Drain(CVpu1Thread::DRAIN_GS_READBACK);
++		WsxFrameStats::CScope waitScope(WsxFrameStats::g_eeGsWaitUs);
+ 		return m_vpu1->GetVif().ReceiveDMA(address, qwc, direction, tagIncluded);
+ 	}
+ 	return m_vpu1Thread->SendVif1Dma(address, qwc, tagIncluded);
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index f7c8b54e..b64a456e 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -368,6 +368,13 @@ void setEeFrequencyScale(int numerator, int denominator)
+ 	g_virtualMachine->SendVmCall([numerator, denominator]() { g_virtualMachine->SetEeFrequencyScale(numerator, denominator); });
+ }
+ 
++// Whether the emulated clock keeps up with the wall clock by skipping EE cycles when the machine can't
++// emulate in real time (CPS2VM::TakeCatchUpTicks). On by default; off, a slow machine slows the console down.
++void setCatchUp(bool enabled)
++{
++	g_virtualMachine->SendVmCall([enabled]() { g_virtualMachine->SetCatchUp(enabled); });
++}
++
+ // Diagnostics: address of the EE program counter in linear memory (sampled by a profiler worker) and a
+ // disassembler for EE code.
+ uintptr_t getEePcAddress()
+@@ -375,6 +382,35 @@ uintptr_t getEePcAddress()
+ 	return reinterpret_cast<uintptr_t>(&g_virtualMachine->m_ee->m_EE.m_State.nPC);
+ }
+ 
++std::string disassembleVu1(uint32 address, int count)
++{
++	std::string result;
++	auto& vu1 = g_virtualMachine->m_ee->m_VU1;
++	for(int i = 0; i < count; i++)
++	{
++		uint32 pc = address + i * 4;
++		uint32 opcode = vu1.m_pMemoryMap->GetInstruction(pc);
++		char mnemonic[256] = {}, operands[256] = {};
++		vu1.m_pArch->GetInstructionMnemonic(&vu1, pc, opcode, mnemonic, sizeof(mnemonic));
++		vu1.m_pArch->GetInstructionOperands(&vu1, pc, opcode, operands, sizeof(operands));
++		char line[600];
++		snprintf(line, sizeof(line), "%04X  %08X  %-8s %s\n", pc, opcode, mnemonic, operands);
++		result += line;
++	}
++	return result;
++}
++
++// VU1 program counter (the VPU1 thread's, sampled like the EE's) and its micro memory, for profiling microprograms.
++uintptr_t getVu1PcAddress()
++{
++	return reinterpret_cast<uintptr_t>(&g_virtualMachine->m_ee->m_VU1.m_State.nPC);
++}
++
++uintptr_t getVu1MicroMemAddress()
++{
++	return reinterpret_cast<uintptr_t>(g_virtualMachine->m_ee->m_microMem1);
++}
++
+ uintptr_t getEeRamAddress()
+ {
+ 	return reinterpret_cast<uintptr_t>(g_virtualMachine->m_ee->m_ram);
+@@ -513,7 +549,7 @@ std::string getGsStats()
+ {
+ 	auto& s = g_wsxGsStats;
+ 	char text[1024];
+-	snprintf(text, sizeof(text), "{\"frames\":%llu,\"regWrites\":%llu,\"gsCalls\":%llu,\"transfers\":%llu,\"transfersDirty\":%llu,\"transferBytes\":%llu,\"texMisses\":%llu,\"texUploads\":%llu,\"texUploadPx\":%llu,\"palMisses\":%llu,\"clutReads\":%llu,\"draws\":%llu,\"verts\":%llu,\"texSetups\":%llu,\"fbSetups\":%llu,\"shaderSwitches\":%llu}",
++	snprintf(text, sizeof(text), "{\"frames\":%llu,\"regWrites\":%llu,\"gsCalls\":%llu,\"transfers\":%llu,\"transfersDirty\":%llu,\"transferBytes\":%llu,\"texMisses\":%llu,\"texUploads\":%llu,\"texUploadPx\":%llu,\"palMisses\":%llu,\"clutReads\":%llu,\"draws\":%llu,\"verts\":%llu,\"texSetups\":%llu,\"fbSetups\":%llu,\"shaderSwitches\":%llu,\"swPrims\":%llu,\"newFrames\":%llu}",
+ 	         (unsigned long long)s.frames.load(),
+ 	         (unsigned long long)s.regWrites.load(),
+ 	         (unsigned long long)s.gsCalls.load(),
+@@ -529,7 +565,19 @@ std::string getGsStats()
+ 	         (unsigned long long)s.verts.load(),
+ 	         (unsigned long long)s.texSetups.load(),
+ 	         (unsigned long long)s.fbSetups.load(),
+-	         (unsigned long long)s.shaderSwitches.load());
++	         (unsigned long long)s.shaderSwitches.load(), (unsigned long long)s.swPrims.load(), (unsigned long long)s.newFrames.load());
++	return text;
++}
++
++// Debug: what the EE thread did since boot (cycles run by compiled code, counted for waits, skipped as idle,
++// dispatcher entries, syscalls).
++std::string getEeStats()
++{
++	char text[512];
++	snprintf(text, sizeof(text), "{\"ticks\":%llu,\"waitTicks\":%llu,\"idleTicks\":%llu,\"slices\":%llu,\"dispatches\":%llu}",
++	         (unsigned long long)g_virtualMachine->m_statEeTicks, (unsigned long long)g_virtualMachine->m_statWaitTicks,
++	         (unsigned long long)g_virtualMachine->m_statIdleTicks, (unsigned long long)g_virtualMachine->m_statEeSlices,
++	         (unsigned long long)g_virtualMachine->m_ee->m_EE.m_executor->m_dispatchCount);
+ 	return text;
+ }
+ 
+@@ -605,7 +653,12 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("setFrameLimit", &setFrameLimit);
+ 	function("setVolume", &setVolume);
+ 	function("setEeFrequencyScale", &setEeFrequencyScale);
++	function("setCatchUp", &setCatchUp);
+ 	function("getEePcAddress", &getEePcAddress);
+ 	function("disassembleEe", &disassembleEe);
+ 	function("getEeRamAddress", &getEeRamAddress);
++	function("getVu1PcAddress", &getVu1PcAddress);
++	function("getEeStats", &getEeStats);
++	function("disassembleVu1", &disassembleVu1);
++	function("getVu1MicroMemAddress", &getVu1MicroMemAddress);
+ }
+-- 
+2.51.0.windows.1
+

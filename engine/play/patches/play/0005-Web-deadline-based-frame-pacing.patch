@@ -1,0 +1,65 @@
+From 10309d0071ed137b30ac5384a0d122a2814a9680 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 02:25:11 -0400
+Subject: [PATCH 05/43] Web: deadline based frame pacing
+
+---
+ Source/FrameLimiter.cpp | 26 ++++++++++++++++++++++++++
+ Source/FrameLimiter.h   |  4 ++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/Source/FrameLimiter.cpp b/Source/FrameLimiter.cpp
+index 0d050fa3..44351904 100644
+--- a/Source/FrameLimiter.cpp
++++ b/Source/FrameLimiter.cpp
+@@ -33,6 +33,32 @@ void CFrameLimiter::EndFrame()
+ {
+ 	assert(m_frameStarted);
+ 
++#ifdef __EMSCRIPTEN__
++	//Pace frames against a running deadline instead of the average work time: time spent outside
++	//BeginFrame/EndFrame and sleep overshoot are absorbed instead of adding up (which made a machine
++	//with plenty of headroom settle at ~55 fps).
++	if(m_minFrameDuration.count() != 0)
++	{
++		auto now = std::chrono::high_resolution_clock::now();
++		if(!m_hasDeadline || (now - m_nextDeadline) > (m_minFrameDuration * 4))
++		{
++			//First frame, or we fell far behind (loading, tab in background): don't try to catch up.
++			m_nextDeadline = now;
++			m_hasDeadline = true;
++		}
++		m_nextDeadline += m_minFrameDuration;
++		while(now < m_nextDeadline)
++		{
++			auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(m_nextDeadline - now);
++			//Coarse sleep first, then short sleeps to land close to the deadline.
++			std::this_thread::sleep_for(remaining > std::chrono::microseconds(2000) ? remaining - std::chrono::microseconds(1000) : std::chrono::microseconds(200));
++			now = std::chrono::high_resolution_clock::now();
++		}
++	}
++	m_frameStarted = false;
++	return;
++#endif
++
+ 	//Add current frame time to array
+ 	{
+ 		auto currentFrameTime = std::chrono::high_resolution_clock::now();
+diff --git a/Source/FrameLimiter.h b/Source/FrameLimiter.h
+index 36e8b935..db484e30 100644
+--- a/Source/FrameLimiter.h
++++ b/Source/FrameLimiter.h
+@@ -32,6 +32,10 @@ private:
+ 	std::chrono::microseconds m_minFrameDuration = std::chrono::microseconds(0);
+ 	bool m_frameStarted = false;
+ 	TimePoint m_lastFrameTime;
++#ifdef __EMSCRIPTEN__
++	TimePoint m_nextDeadline;
++	bool m_hasDeadline = false;
++#endif
+ 
+ #ifdef _WIN32
+ 	HANDLE m_timer = 0;
+-- 
+2.51.0.windows.1
+

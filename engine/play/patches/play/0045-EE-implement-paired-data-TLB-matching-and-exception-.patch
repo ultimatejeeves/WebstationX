@@ -1,0 +1,468 @@
+From 6176c4792e0ba948d65fe28374f45054f7902d93 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 12:51:31 -0400
+Subject: [PATCH] EE: implement paired data TLB matching and exception routing
+
+---
+ Source/COP_SCU.cpp                |  42 ++++++++---
+ Source/COP_SCU.h                  |   4 +-
+ Source/MIPS.h                     |   1 +
+ Source/MIPSInstructionFactory.cpp |  15 +++-
+ Source/ee/EeTlb.h                 |  35 +++++++++
+ Source/ee/Ee_SubSystem.cpp        |   1 +
+ Source/ee/PS2OS.cpp               | 115 ++++++++++++------------------
+ Source/ee/PS2OS.h                 |   3 +-
+ Source/ui_js/CMakeLists.txt       |   2 +-
+ Source/ui_js/Ps2VmJs.cpp          |   8 +++
+ 10 files changed, 141 insertions(+), 85 deletions(-)
+ create mode 100644 Source/ee/EeTlb.h
+
+diff --git a/Source/COP_SCU.cpp b/Source/COP_SCU.cpp
+index 7b1c7756..80bdfc2b 100644
+--- a/Source/COP_SCU.cpp
++++ b/Source/COP_SCU.cpp
+@@ -2,6 +2,7 @@
+ #include <stdio.h>
+ #include <stddef.h>
+ #include "COP_SCU.h"
++#include "ee/EeTlb.h"
+ #include "MIPS.h"
+ #include "Jitter.h"
+ #include "offsetof_def.h"
+@@ -62,11 +63,11 @@ void CCOP_SCU::CompileInstruction(uint32 nAddress, CMipsJitter* codeGen, CMIPS*
+ 	((this)->*(m_pOpGeneral[(m_nOpcode >> 21) & 0x1F]))();
+ }
+ 
+-void CCOP_SCU::HandleTLBRead(CMIPS* context)
++extern "C" void Cop0_TLBRead(CMIPS* context)
+ {
+ 	uint32 index = context->m_State.nCOP0[CCOP_SCU::INDEX];
+-	assert(index < MIPSSTATE::TLB_ENTRY_MAX);
+-	index &= (MIPSSTATE::TLB_ENTRY_MAX - 1);
++	index &= 0x3F;
++	if(index >= MIPSSTATE::TLB_ENTRY_MAX) return;
+ 
+ 	const auto& entry = context->m_State.tlbEntries[index];
+ 	context->m_State.nCOP0[CCOP_SCU::ENTRYLO0] = entry.entryLo0;
+@@ -75,17 +76,24 @@ void CCOP_SCU::HandleTLBRead(CMIPS* context)
+ 	context->m_State.nCOP0[CCOP_SCU::PAGEMASK] = entry.pageMask;
+ }
+ 
+-void CCOP_SCU::HandleTLBWrite(CMIPS* context)
++extern "C" void Cop0_TLBWrite(CMIPS* context)
+ {
+ 	uint32 index = context->m_State.nCOP0[CCOP_SCU::INDEX];
+-	assert(index < MIPSSTATE::TLB_ENTRY_MAX);
+-	index &= (MIPSSTATE::TLB_ENTRY_MAX - 1);
++	index &= 0x3F;
++	if(index >= MIPSSTATE::TLB_ENTRY_MAX) return;
+ 
+ 	auto& entry = context->m_State.tlbEntries[index];
+ 	entry.entryLo0 = context->m_State.nCOP0[CCOP_SCU::ENTRYLO0];
+ 	entry.entryLo1 = context->m_State.nCOP0[CCOP_SCU::ENTRYLO1];
+ 	entry.entryHi = context->m_State.nCOP0[CCOP_SCU::ENTRYHI];
+-	entry.pageMask = context->m_State.nCOP0[CCOP_SCU::PAGEMASK];
++	entry.pageMask = context->m_State.nCOP0[CCOP_SCU::PAGEMASK] & 0x01FFE000;
++	entry.entryHi &= ~(entry.pageMask | 0x1F00);
++	// Hardware stores one G bit, formed from both EntryLo G bits.
++	if(!(entry.entryLo0 & entry.entryLo1 & CCOP_SCU::ENTRYLO_GLOBAL))
++	{
++		entry.entryLo0 &= ~CCOP_SCU::ENTRYLO_GLOBAL;
++		entry.entryLo1 &= ~CCOP_SCU::ENTRYLO_GLOBAL;
++	}
+ }
+ 
+ //////////////////////////////////////////////////
+@@ -240,19 +248,35 @@ void CCOP_SCU::BC0FL()
+ void CCOP_SCU::TLBR()
+ {
+ 	m_codeGen->PushCtx();
+-	m_codeGen->Call(reinterpret_cast<void*>(&CCOP_SCU::HandleTLBRead), 1, Jitter::CJitter::RETURN_VALUE_NONE);
++	m_codeGen->Call(reinterpret_cast<void*>(&Cop0_TLBRead), 1, Jitter::CJitter::RETURN_VALUE_NONE);
+ }
+ 
+ //02
+ void CCOP_SCU::TLBWI()
+ {
+ 	m_codeGen->PushCtx();
+-	m_codeGen->Call(reinterpret_cast<void*>(&CCOP_SCU::HandleTLBWrite), 1, Jitter::CJitter::RETURN_VALUE_NONE);
++	m_codeGen->Call(reinterpret_cast<void*>(&Cop0_TLBWrite), 1, Jitter::CJitter::RETURN_VALUE_NONE);
++}
++
++extern "C" void Cop0_TLBProbe(CMIPS* context)
++{
++	auto& state = context->m_State;
++	state.nCOP0[CCOP_SCU::INDEX] = 0x80000000;
++	for(uint32 index = 0; index < MIPSSTATE::TLB_ENTRY_MAX; ++index)
++	{
++		if(EeTlb::Matches(state.tlbEntries[index], state.nCOP0[CCOP_SCU::ENTRYHI], state.nCOP0[CCOP_SCU::ENTRYHI]))
++		{
++			state.nCOP0[CCOP_SCU::INDEX] = index;
++			break;
++		}
++	}
+ }
+ 
+ //08
+ void CCOP_SCU::TLBP()
+ {
++	m_codeGen->PushCtx();
++	m_codeGen->Call(reinterpret_cast<void*>(&Cop0_TLBProbe), 1, Jitter::CJitter::RETURN_VALUE_NONE);
+ }
+ 
+ //18
+diff --git a/Source/COP_SCU.h b/Source/COP_SCU.h
+index 96b588ba..851ae29f 100644
+--- a/Source/COP_SCU.h
++++ b/Source/COP_SCU.h
+@@ -12,6 +12,7 @@ public:
+ 		INDEX = 0x00,
+ 		ENTRYLO0 = 0x02,
+ 		ENTRYLO1 = 0x03,
++		CONTEXT = 0x04,
+ 		PAGEMASK = 0x05,
+ 		BADVADDR = 0x08,
+ 		COUNT = 0x09,
+@@ -26,6 +27,7 @@ public:
+ 	enum CAUSE_BITS
+ 	{
+ 		CAUSE_EXCCODE_INT = (0x00 << 2),  //Interrupt
++		CAUSE_EXCCODE_MOD = (0x01 << 2),  //TLB modification
+ 		CAUSE_EXCCODE_TLBL = (0x02 << 2), //TLB refill exception (load or instruction fetch)
+ 		CAUSE_EXCCODE_TLBS = (0x03 << 2), //TLB refill exception (store)
+ 		CAUSE_EXCCODE_TRAP = (0x0D << 2), //Trap
+@@ -99,8 +101,6 @@ protected:
+ 	MIPSReflection::SUBTABLE m_ReflMtPerfTable;
+ 
+ private:
+-	static void HandleTLBRead(CMIPS*);
+-	static void HandleTLBWrite(CMIPS*);
+ 
+ 	typedef void (CCOP_SCU::*InstructionFuncConstant)();
+ 
+diff --git a/Source/MIPS.h b/Source/MIPS.h
+index b422d356..bfadfb92 100644
+--- a/Source/MIPS.h
++++ b/Source/MIPS.h
+@@ -45,6 +45,7 @@ enum
+ 	MIPS_EXCEPTION_VU_DBIT,
+ 	MIPS_EXCEPTION_VU_TBIT,
+ 	MIPS_EXCEPTION_VU_EBIT,
++	MIPS_EXCEPTION_TLB_REFILL,
+ 	MIPS_EXCEPTION_MAX, //Used to make sure we don't conflict with the QUOTADONE status
+ };
+ static_assert(MIPS_EXCEPTION_MAX <= 0x80);
+diff --git a/Source/MIPSInstructionFactory.cpp b/Source/MIPSInstructionFactory.cpp
+index 43a57650..d71dbfbf 100644
+--- a/Source/MIPSInstructionFactory.cpp
++++ b/Source/MIPSInstructionFactory.cpp
+@@ -44,6 +44,17 @@ extern "C" uint32 TLBExceptionChecker_Proxy(CMIPS* context, uint32 vaddrLo, uint
+ 	return context->m_TLBExceptionChecker(context, vaddrLo, isWrite);
+ }
+ 
++// The checker records the fault address first; EPC/BD depend on the instruction
++// position and must remain untouched when entering a nested exception.
++extern "C" void TLBException_SetPC(CMIPS* context, uint32 pc, uint32 delaySlot)
++{
++	auto& state = context->m_State;
++	if(state.nCOP0[CCOP_SCU::STATUS] & CMIPS::STATUS_EXL) return;
++	bool delayed = delaySlot || state.nDelayedJumpAddr != MIPS_INVALID_PC;
++	state.nCOP0[CCOP_SCU::EPC] = delayed ? pc - 4 : pc;
++	state.nCOP0[CCOP_SCU::CAUSE] = (state.nCOP0[CCOP_SCU::CAUSE] & ~0x80000000U) | (delayed ? 0x80000000U : 0);
++}
++
+ void CMIPSInstructionFactory::CheckTLBExceptions(bool isWrite)
+ {
+ 	if(!m_pCtx->HasTLBExceptionChecks()) return;
+@@ -71,10 +82,12 @@ void CMIPSInstructionFactory::CheckTLBExceptions(bool isWrite)
+ 	m_codeGen->PushCst(MIPS_EXCEPTION_NONE);
+ 	m_codeGen->BeginIf(Jitter::CONDITION_NE);
+ 	{
++		m_codeGen->PushCtx();
+ 		m_codeGen->PushRel(offsetof(CMIPS, m_State.nPC));
+ 		m_codeGen->PushCst(m_instrPosition);
+ 		m_codeGen->Add();
+-		m_codeGen->PullRel(offsetof(CMIPS, m_State.nCOP0[CCOP_SCU::EPC]));
++		m_codeGen->PushCst(m_instrPosition >= 4 && m_pCtx->IsBranch(m_nAddress - 4));
++		m_codeGen->Call(reinterpret_cast<void*>(&TLBException_SetPC), 3, Jitter::CJitter::RETURN_VALUE_NONE);
+ 		m_codeGen->JumpTo(reinterpret_cast<void*>(&HandleTLBException));
+ 	}
+ 	m_codeGen->EndIf();
+diff --git a/Source/ee/EeTlb.h b/Source/ee/EeTlb.h
+new file mode 100644
+index 00000000..359aa468
+--- /dev/null
++++ b/Source/ee/EeTlb.h
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include "../MIPS.h"
++#include "../COP_SCU.h"
++
++// Shared by translation, permission checks and TLBP. PageMask covers both pages.
++namespace EeTlb
++{
++inline uint32 PairMask(const TLBENTRY& entry)
++{
++	return (entry.pageMask & 0x01FFE000) | 0x1FFF;
++}
++
++inline bool Matches(const TLBENTRY& entry, uint32 address, uint32 asid)
++{
++	bool global = (entry.entryLo0 & entry.entryLo1 & CCOP_SCU::ENTRYLO_GLOBAL) != 0;
++	return ((address ^ entry.entryHi) & ~PairMask(entry)) == 0 &&
++	       (global || ((entry.entryHi ^ asid) & 0xFF) == 0);
++}
++
++inline const TLBENTRY* Find(const MIPSSTATE& state, uint32 address)
++{
++	for(const auto& entry : state.tlbEntries)
++	{
++		if(Matches(entry, address, state.nCOP0[CCOP_SCU::ENTRYHI])) return &entry;
++	}
++	return nullptr;
++}
++
++inline uint32 PageSize(const TLBENTRY& entry) { return (PairMask(entry) + 1) >> 1; }
++inline uint32 EntryLo(const TLBENTRY& entry, uint32 address)
++{
++	return (address & PageSize(entry)) ? entry.entryLo1 : entry.entryLo0;
++}
++}
+diff --git a/Source/ee/Ee_SubSystem.cpp b/Source/ee/Ee_SubSystem.cpp
+index c78f2cd8..dc8ca310 100644
+--- a/Source/ee/Ee_SubSystem.cpp
++++ b/Source/ee/Ee_SubSystem.cpp
+@@ -413,6 +413,7 @@ int CSubSystem::ExecuteCpu(int quota)
+ 		case MIPS_EXCEPTION_SYSCALL:
+ 			m_os->HandleSyscall();
+ 			break;
++		case MIPS_EXCEPTION_TLB_REFILL:
+ 		case MIPS_EXCEPTION_TLB:
+ 			m_os->HandleTLBException();
+ 			break;
+diff --git a/Source/ee/PS2OS.cpp b/Source/ee/PS2OS.cpp
+index d731dee7..a8315796 100644
+--- a/Source/ee/PS2OS.cpp
++++ b/Source/ee/PS2OS.cpp
+@@ -4,6 +4,7 @@
+ #include <exception>
+ #include "string_format.h"
+ #include "PS2OS.h"
++#include "EeTlb.h"
+ #include "StdStream.h"
+ #include "StdStreamUtils.h"
+ #ifdef __ANDROID__
+@@ -1504,7 +1505,8 @@ void CPS2OS::ResumeThread(uint32 threadId)
+ 
+ void CPS2OS::UpdateTLBEnabledState()
+ {
+-	bool TLBenabled = (m_tlblExceptionHandler != 0) || (m_tlbsExceptionHandler != 0);
++	bool TLBenabled = (m_tlblExceptionHandler != 0) || (m_tlbsExceptionHandler != 0) ||
++	                  m_state->commonTlbHandlers[0] || m_state->commonTlbHandlers[1] || m_state->commonTlbHandlers[2];
+ 	if(TLBenabled)
+ 	{
+ 		m_ee.m_pAddrTranslator = &TranslateAddressTLB;
+@@ -1521,7 +1523,7 @@ void CPS2OS::UpdateTLBEnabledState()
+ //These defines seek to allow simple translation without scanning the TLB
+ 
+ //Direct access to physical addresses
+-#define TLB_IS_DIRECT_VADDRESS(a) ((a) <= 0x1FFFFFFF)
++#define TLB_IS_DIRECT_VADDRESS(a) (((a) <= 0x1FFFFFFF) || (((a) >= 0x80000000) && ((a) <= 0xBFFFFFFF)))
+ #define TLB_TRANSLATE_DIRECT_VADDRESS(a) ((a)&0x1FFFFFFF)
+ 
+ //RAM access, "uncached" as per TLB entry
+@@ -1568,29 +1570,15 @@ uint32 CPS2OS::TranslateAddressTLB(CMIPS* context, uint32 vaddrLo)
+ 	{
+ 		return TLB_TRANSLATE_SPR_VADDRESS(vaddrLo);
+ 	}
+-	for(uint32 i = 0; i < MIPSSTATE::TLB_ENTRY_MAX; i++)
++	if(const auto* entry = EeTlb::Find(context->m_State, vaddrLo))
+ 	{
+-		const auto& entry = context->m_State.tlbEntries[i];
+-		if(entry.entryHi == 0) continue;
+-
+-		uint32 pageSize = ((entry.pageMask >> 13) + 1) * 0x1000;
+-		uint32 vpnMask = (pageSize * 2) - 1;
+-		uint32 vpn = vaddrLo & ~vpnMask;
+-		uint32 tlbVpn = entry.entryHi & ~vpnMask;
+-
+-		if(vpn == tlbVpn)
+-		{
+-			uint32 mask = (pageSize - 1);
+-			uint32 entryLo = (vaddrLo & pageSize) ? entry.entryLo1 : entry.entryLo0;
+-			assert(entryLo & CCOP_SCU::ENTRYLO_GLOBAL);
+-			assert(entryLo & CCOP_SCU::ENTRYLO_VALID);
+-			uint32 pfn = ((entryLo >> 6) << 12);
+-			uint32 paddr = pfn + (vaddrLo & mask);
+-			return paddr;
+-		}
++		uint32 mask = EeTlb::PageSize(*entry) - 1;
++		uint32 entryLo = EeTlb::EntryLo(*entry, vaddrLo);
++		uint32 pfn = (entryLo & 0x03FFFFC0) << 6;
++		return (pfn & ~mask) | (vaddrLo & mask);
+ 	}
+-	//Shouldn't come here
+-	//assert(false);
++	// Data accesses have already faulted in CheckTLBExceptions. Instruction fetch
++	// still uses the HLE translator; full instruction-side MMU handling is separate.
+ 	return vaddrLo & 0x1FFFFFFF;
+ }
+ 
+@@ -1612,36 +1600,20 @@ uint32 CPS2OS::CheckTLBExceptions(CMIPS* context, uint32 vaddrLo, uint32 isWrite
+ 	{
+ 		return MIPS_EXCEPTION_NONE;
+ 	}
+-	for(uint32 i = 0; i < MIPSSTATE::TLB_ENTRY_MAX; i++)
+-	{
+-		const auto& entry = context->m_State.tlbEntries[i];
+-		if(entry.entryHi == 0) continue;
+-
+-		uint32 pageSize = ((entry.pageMask >> 13) + 1) * 0x1000;
+-		uint32 vpnMask = (pageSize * 2) - 1;
+-		uint32 vpn = vaddrLo & ~vpnMask;
+-		uint32 tlbVpn = entry.entryHi & ~vpnMask;
++	auto& state = context->m_State;
++	const auto* entry = EeTlb::Find(state, vaddrLo);
++	uint32 entryLo = entry ? EeTlb::EntryLo(*entry, vaddrLo) : 0;
++	bool valid = (entryLo & CCOP_SCU::ENTRYLO_VALID) != 0;
++	if(valid && (!isWrite || (entryLo & CCOP_SCU::ENTRYLO_DIRTY))) return MIPS_EXCEPTION_NONE;
+ 
+-		if(vpn == tlbVpn)
+-		{
+-			uint32 entryLo = (vaddrLo & pageSize) ? entry.entryLo1 : entry.entryLo0;
+-			assert(entryLo & CCOP_SCU::ENTRYLO_GLOBAL);
+-			if((entryLo & CCOP_SCU::ENTRYLO_VALID) == 0)
+-			{
+-				//This causes a TLBL or TLBS exception, but should use the common vector
+-				context->m_State.nCOP0[CCOP_SCU::CAUSE] &= ~CCOP_SCU::CAUSE_EXCCODE_MASK;
+-				context->m_State.nCOP0[CCOP_SCU::CAUSE] |= isWrite ? CCOP_SCU::CAUSE_EXCCODE_TLBS : CCOP_SCU::CAUSE_EXCCODE_TLBL;
+-				context->m_State.nCOP0[CCOP_SCU::BADVADDR] = vaddrLo;
+-				context->m_State.nHasException = MIPS_EXCEPTION_TLB;
+-				return context->m_State.nHasException;
+-			}
+-			assert(!isWrite || ((entryLo & CCOP_SCU::ENTRYLO_DIRTY) != 0));
+-			return MIPS_EXCEPTION_NONE;
+-		}
+-	}
+-	//assert(false);
+-	//We should probably raise some kind of exception here since we didn't match anything
+-	return MIPS_EXCEPTION_NONE;
++	uint32 cause = valid ? CCOP_SCU::CAUSE_EXCCODE_MOD :
++	                      isWrite ? CCOP_SCU::CAUSE_EXCCODE_TLBS : CCOP_SCU::CAUSE_EXCCODE_TLBL;
++	state.nCOP0[CCOP_SCU::CAUSE] = (state.nCOP0[CCOP_SCU::CAUSE] & ~CCOP_SCU::CAUSE_EXCCODE_MASK) | cause;
++	state.nCOP0[CCOP_SCU::BADVADDR] = vaddrLo;
++	state.nCOP0[CCOP_SCU::ENTRYHI] = (vaddrLo & 0xFFFFE000) | (state.nCOP0[CCOP_SCU::ENTRYHI] & 0xFF);
++	state.nCOP0[CCOP_SCU::CONTEXT] = (state.nCOP0[CCOP_SCU::CONTEXT] & 0xFF800000) | ((vaddrLo >> 9) & 0x007FFFF0);
++	state.nHasException = entry ? MIPS_EXCEPTION_TLB : MIPS_EXCEPTION_TLB_REFILL;
++	return state.nHasException;
+ }
+ 
+ //////////////////////////////////////////////////
+@@ -1773,6 +1745,12 @@ void CPS2OS::sc_SetVCommonHandler()
+ 
+ 	switch(cause << 2)
+ 	{
++	case CCOP_SCU::CAUSE_EXCCODE_MOD:
++	case CCOP_SCU::CAUSE_EXCCODE_TLBL:
++	case CCOP_SCU::CAUSE_EXCCODE_TLBS:
++		m_state->commonTlbHandlers[cause - 1] = handler;
++		UpdateTLBEnabledState();
++		break;
+ 	case CCOP_SCU::CAUSE_EXCCODE_TRAP:
+ 		m_trapExceptionHandler = handler;
+ 		break;
+@@ -3287,25 +3265,20 @@ void CPS2OS::HandleSyscall()
+ 
+ void CPS2OS::HandleTLBException()
+ {
+-	assert(m_ee.CanGenerateInterrupt());
+-	m_ee.m_State.nCOP0[CCOP_SCU::STATUS] |= CMIPS::STATUS_EXL;
+-	assert(m_ee.m_State.nDelayedJumpAddr == MIPS_INVALID_PC);
+-
+-	uint32 excCode = m_ee.m_State.nCOP0[CCOP_SCU::CAUSE] & CCOP_SCU::CAUSE_EXCCODE_MASK;
+-	switch(excCode)
+-	{
+-	case CCOP_SCU::CAUSE_EXCCODE_TLBL:
+-		m_ee.m_State.nPC = m_tlblExceptionHandler;
+-		break;
+-	case CCOP_SCU::CAUSE_EXCCODE_TLBS:
+-		m_ee.m_State.nPC = m_tlbsExceptionHandler;
+-		break;
+-	default:
+-		//Can't handle other types of exceptions here
+-		assert(false);
+-		break;
+-	}
+-	m_ee.m_State.nHasException = MIPS_EXCEPTION_NONE;
++	auto& state = m_ee.m_State;
++	bool refill = state.nHasException == MIPS_EXCEPTION_TLB_REFILL && !(state.nCOP0[CCOP_SCU::STATUS] & CMIPS::STATUS_EXL);
++	uint32 cause = (state.nCOP0[CCOP_SCU::CAUSE] & CCOP_SCU::CAUSE_EXCCODE_MASK) >> 2;
++	uint32 handler = (cause >= 1 && cause <= 3) ? m_state->commonTlbHandlers[cause - 1] : 0;
++	uint32 refillHandler = cause == 2 ? m_tlblExceptionHandler.Get() : m_tlbsExceptionHandler.Get();
++	if(refill) handler = refillHandler;
++	// Older HLE clients only registered refill callbacks even for invalid pages.
++	// Preserve that fallback until they provide a common handler.
++	if(!handler) handler = refillHandler;
++	if(!handler) handler = (state.nCOP0[CCOP_SCU::STATUS] & (1 << 22)) ? 0xBFC00380 : 0x80000180;
++	state.nCOP0[CCOP_SCU::STATUS] |= CMIPS::STATUS_EXL;
++	state.nDelayedJumpAddr = MIPS_INVALID_PC;
++	state.nPC = handler;
++	state.nHasException = MIPS_EXCEPTION_NONE;
+ }
+ 
+ void CPS2OS::DisassembleSysCall(uint8 func)
+diff --git a/Source/ee/PS2OS.h b/Source/ee/PS2OS.h
+index 9f9928d7..84e40336 100644
+--- a/Source/ee/PS2OS.h
++++ b/Source/ee/PS2OS.h
+@@ -90,7 +90,8 @@ private:
+ 
+ 	struct BIOS_STATE
+ 	{
+-		uint32 padding[4];
++		uint32 commonTlbHandlers[3]; // Mod, TLBL, TLBS; previously padding, same state layout.
++		uint32 padding;
+ 		uint32 idleThreadId;
+ 		uint32 currentThreadId;
+ 		uint32 vsyncFlagValue1Ptr;
+diff --git a/Source/ui_js/CMakeLists.txt b/Source/ui_js/CMakeLists.txt
+index 1a273bbd..5c0ad445 100644
+--- a/Source/ui_js/CMakeLists.txt
++++ b/Source/ui_js/CMakeLists.txt
+@@ -58,7 +58,7 @@ target_link_libraries(Play PUBLIC ${UI_JS_PROJECT_LIBS})
+ target_link_options(Play PRIVATE "--bind")
+ target_link_options(Play PRIVATE "-sMODULARIZE=1")
+ target_link_options(Play PRIVATE "-sEXPORT_ES6=1")
+-target_link_options(Play PRIVATE "-sEXPORTED_FUNCTIONS=['_main', '_initVm', '_EmptyBlockHandler', '_HandleTLBException', '_TLBExceptionChecker_Proxy', '_MemoryUtils_GetByteProxy', '_MemoryUtils_GetHalfProxy', '_MemoryUtils_GetWordProxy', '_MemoryUtils_GetDoubleProxy', '_MemoryUtils_SetByteProxy', '_MemoryUtils_SetHalfProxy', '_MemoryUtils_SetWordProxy', '_MemoryUtils_SetDoubleProxy', '_LWL_Proxy', '_LWR_Proxy', '_LDL_Proxy', '_LDR_Proxy', '_SWL_Proxy', '_SWR_Proxy', '_SDL_Proxy', '_SDR_Proxy']")
++target_link_options(Play PRIVATE "-sEXPORTED_FUNCTIONS=['_main', '_initVm', '_EmptyBlockHandler', '_Cop0_TLBRead', '_Cop0_TLBWrite', '_Cop0_TLBProbe', '_TLBException_SetPC', '_HandleTLBException', '_TLBExceptionChecker_Proxy', '_MemoryUtils_GetByteProxy', '_MemoryUtils_GetHalfProxy', '_MemoryUtils_GetWordProxy', '_MemoryUtils_GetDoubleProxy', '_MemoryUtils_SetByteProxy', '_MemoryUtils_SetHalfProxy', '_MemoryUtils_SetWordProxy', '_MemoryUtils_SetDoubleProxy', '_LWL_Proxy', '_LWR_Proxy', '_LDL_Proxy', '_LDR_Proxy', '_SWL_Proxy', '_SWR_Proxy', '_SDL_Proxy', '_SDR_Proxy']")
+ target_link_options(Play PRIVATE "-sEXPORTED_RUNTIME_METHODS=['ccall', 'FS', 'HEAPU8', 'GL', 'AL']")
+ target_link_options(Play PRIVATE "-sFORCE_FILESYSTEM")
+ target_link_options(Play PRIVATE "-sALLOW_TABLE_GROWTH")
+diff --git a/Source/ui_js/Ps2VmJs.cpp b/Source/ui_js/Ps2VmJs.cpp
+index 0af319c9..05ac7fcd 100644
+--- a/Source/ui_js/Ps2VmJs.cpp
++++ b/Source/ui_js/Ps2VmJs.cpp
+@@ -16,11 +16,19 @@ extern "C" void SWR_Proxy(uint32, uint32, CMIPS*);
+ extern "C" void SDL_Proxy(uint32, uint64, CMIPS*);
+ extern "C" void SDR_Proxy(uint32, uint64, CMIPS*);
+ 
++extern "C" void Cop0_TLBRead(CMIPS*);
++extern "C" void Cop0_TLBWrite(CMIPS*);
++extern "C" void Cop0_TLBProbe(CMIPS*);
++extern "C" void TLBException_SetPC(CMIPS*, uint32, uint32);
+ extern "C" void HandleTLBException(CMIPS*);
+ extern "C" uint32 TLBExceptionChecker_Proxy(CMIPS*, uint32, uint32);
+ 
+ void CPs2VmJs::CreateVM()
+ {
++	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&Cop0_TLBRead), "_Cop0_TLBRead", "vi");
++	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&Cop0_TLBWrite), "_Cop0_TLBWrite", "vi");
++	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&Cop0_TLBProbe), "_Cop0_TLBProbe", "vi");
++	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&TLBException_SetPC), "_TLBException_SetPC", "viii");
+ 	printf("Initializing PS2VM...\r\n");
+ 
+ 	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&EmptyBlockHandler), "_EmptyBlockHandler", "vi");
+-- 
+2.51.0.windows.1
+

@@ -1,0 +1,128 @@
+{
+  "assets": [
+    {
+      "id": "bg-main",
+      "file": "bg-main.jpg",
+      "width": 1920,
+      "height": 1080,
+      "purpose": "Main menu / library background",
+      "thumb": "bg-main.thumb.jpg"
+    },
+    {
+      "id": "bg-boot",
+      "file": "bg-boot.jpg",
+      "width": 1920,
+      "height": 1080,
+      "purpose": "Boot screen background",
+      "thumb": "bg-boot.thumb.jpg"
+    },
+    {
+      "id": "bg-play",
+      "file": "bg-play.jpg",
+      "width": 1920,
+      "height": 1080,
+      "purpose": "Behind-the-game-screen background",
+      "thumb": "bg-play.thumb.jpg"
+    },
+    {
+      "id": "emblem",
+      "file": "emblem.png",
+      "width": 1024,
+      "height": 1024,
+      "purpose": "Logo emblem (screen-blend over dark UI)"
+    },
+    {
+      "id": "hero-controller",
+      "file": "hero-controller.png",
+      "width": 1024,
+      "height": 1024,
+      "purpose": "Hero image: grey dual-analog controller"
+    },
+    {
+      "id": "hero-memcard",
+      "file": "hero-memcard.png",
+      "width": 1024,
+      "height": 1024,
+      "purpose": "Hero image: grey memory card"
+    },
+    {
+      "id": "hero-disc",
+      "file": "hero-disc.png",
+      "width": 1024,
+      "height": 1024,
+      "purpose": "Hero image: black-bottomed game disc"
+    },
+    {
+      "id": "texture-metal",
+      "file": "texture-metal.jpg",
+      "width": 1024,
+      "height": 1024,
+      "purpose": "Seamless brushed aluminium tile"
+    },
+    {
+      "id": "texture-glass",
+      "file": "texture-glass.png",
+      "width": 1024,
+      "height": 256,
+      "purpose": "Aqua glass button sheen strip"
+    },
+    {
+      "id": "cover-crash-bash",
+      "file": "cover-crash-bash.jpg",
+      "width": 600,
+      "height": 840,
+      "purpose": "Placeholder box art: cartoon party arena",
+      "thumb": "cover-crash-bash.thumb.jpg"
+    },
+    {
+      "id": "cover-medievil",
+      "file": "cover-medievil.jpg",
+      "width": 600,
+      "height": 840,
+      "purpose": "Placeholder box art: skeleton knight",
+      "thumb": "cover-medievil.thumb.jpg"
+    },
+    {
+      "id": "avatar-01",
+      "file": "avatar-01.png",
+      "width": 512,
+      "height": 512,
+      "purpose": "Profile avatar orb 01"
+    },
+    {
+      "id": "avatar-02",
+      "file": "avatar-02.png",
+      "width": 512,
+      "height": 512,
+      "purpose": "Profile avatar orb 02"
+    },
+    {
+      "id": "avatar-03",
+      "file": "avatar-03.png",
+      "width": 512,
+      "height": 512,
+      "purpose": "Profile avatar orb 03"
+    },
+    {
+      "id": "avatar-04",
+      "file": "avatar-04.png",
+      "width": 512,
+      "height": 512,
+      "purpose": "Profile avatar orb 04"
+    },
+    {
+      "id": "avatar-05",
+      "file": "avatar-05.png",
+      "width": 512,
+      "height": 512,
+      "purpose": "Profile avatar orb 05"
+    },
+    {
+      "id": "avatar-06",
+      "file": "avatar-06.png",
+      "width": 512,
+      "height": 512,
+      "purpose": "Profile avatar orb 06"
+    }
+  ]
+}

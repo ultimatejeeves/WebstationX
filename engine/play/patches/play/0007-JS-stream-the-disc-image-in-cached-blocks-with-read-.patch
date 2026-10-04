@@ -1,0 +1,289 @@
+From 3280efa840aa8f6b1595bd2742ba63a3be4a22e2 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 10:46:56 -0400
+Subject: [PATCH 07/43] JS: stream the disc image in cached blocks with
+ read-ahead
+
+The disc stream made a synchronous round trip to the page's main thread for every read (every CHD
+hunk), then polled the page every 100us with more round trips until the data landed. The VM thread
+stalled on every read, for as long as the main thread took to answer, and for the whole network
+fetch when the data wasn't there yet.
+
+Blocks of 1 MiB now live in a small cache in the wasm heap. Missing blocks, and the next few for
+read-ahead, are requested from the page asynchronously; the page writes them in place and wakes the
+VM with Atomics.notify. The VM only waits when data is really missing.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ Source/Js_DiscImageDeviceStream.cpp | 163 ++++++++++++++++++++++++----
+ Source/Js_DiscImageDeviceStream.h   |  42 ++++++-
+ 2 files changed, 182 insertions(+), 23 deletions(-)
+
+diff --git a/Source/Js_DiscImageDeviceStream.cpp b/Source/Js_DiscImageDeviceStream.cpp
+index 71d60516..891bd635 100644
+--- a/Source/Js_DiscImageDeviceStream.cpp
++++ b/Source/Js_DiscImageDeviceStream.cpp
+@@ -1,8 +1,39 @@
+ #include "Js_DiscImageDeviceStream.h"
+ #include <stdexcept>
+ #include <cassert>
++#include <cstring>
++#include <algorithm>
+ #include <emscripten.h>
+-#include <unistd.h>
++#include <emscripten/threading.h>
++#include <chrono>
++
++std::atomic<uint64> g_discWaitMicroseconds = 0;
++
++CJsDiscImageDeviceStream::CJsDiscImageDeviceStream()
++{
++	m_size = static_cast<uint64>(MAIN_THREAD_EM_ASM_DOUBLE({ return Module.discImageDevice.getFileSize(); }));
++	for(auto& slot : m_slots)
++	{
++		slot.data = reinterpret_cast<uint8*>(malloc(BLOCK_SIZE));
++	}
++}
++
++CJsDiscImageDeviceStream::~CJsDiscImageDeviceStream()
++{
++	for(auto& slot : m_slots)
++	{
++		//The page still owns a pending slot's buffer: give it a moment to land (the page answers
++		//right away once its disc is closed), and leak the buffer if it doesn't.
++		for(int i = 0; (slot.state.load() == SLOT_PENDING) && (i < 50); i++)
++		{
++			emscripten_futex_wait(&slot.state, SLOT_PENDING, 100.0);
++		}
++		if(slot.state.load() != SLOT_PENDING)
++		{
++			free(slot.data);
++		}
++	}
++}
+ 
+ void CJsDiscImageDeviceStream::Seek(int64 position, Framework::STREAM_SEEK_DIRECTION whence)
+ {
+@@ -15,12 +46,8 @@ void CJsDiscImageDeviceStream::Seek(int64 position, Framework::STREAM_SEEK_DIREC
+ 		m_position += position;
+ 		break;
+ 	case Framework::STREAM_SEEK_END:
+-	{
+-		uint32 positionLo = MAIN_THREAD_EM_ASM_INT({return Module.discImageDevice.getFileSize()});
+-		uint32 positionHi = MAIN_THREAD_EM_ASM_INT({return Module.discImageDevice.getFileSize() / 4294967296});
+-		m_position = static_cast<uint64>(positionLo) | (static_cast<uint64>(positionHi) << 32);
+-	}
+-	break;
++		m_position = m_size + position;
++		break;
+ 	}
+ }
+ 
+@@ -29,25 +56,117 @@ uint64 CJsDiscImageDeviceStream::Tell()
+ 	return m_position;
+ }
+ 
+-uint64 CJsDiscImageDeviceStream::Read(void* buffer, uint64 size)
++CJsDiscImageDeviceStream::SLOT* CJsDiscImageDeviceStream::FindSlot(int64 block)
+ {
+-	if(size == 0) return 0;
++	for(auto& slot : m_slots)
++	{
++		if(slot.block == block) return &slot;
++	}
++	return nullptr;
++}
+ 
+-	assert(size <= std::numeric_limits<uint32>::max());
++CJsDiscImageDeviceStream::SLOT* CJsDiscImageDeviceStream::Request(int64 block)
++{
++	if(auto slot = FindSlot(block)) return slot;
++	//Least recently used slot that isn't waiting on the page.
++	SLOT* victim = nullptr;
++	for(auto& slot : m_slots)
++	{
++		if(slot.state.load() == SLOT_PENDING) continue;
++		if(!victim || (slot.lastUse < victim->lastUse)) victim = &slot;
++	}
++	if(!victim) return nullptr;
++	victim->block = block;
++	victim->lastUse = ++m_useCounter;
++	victim->state.store(SLOT_PENDING);
++	uint32 length = static_cast<uint32>(std::min<uint64>(BLOCK_SIZE, m_size - (block * BLOCK_SIZE)));
++	// clang-format off
++	MAIN_THREAD_ASYNC_EM_ASM({
++		let block = $0;
++		let data = $1;
++		let state = $2;
++		let length = $3;
++		let finish = (bytes) => {
++			let buffer = wasmMemory.buffer;
++			let ok = bytes && (bytes.length >= length);
++			if(ok) new Uint8Array(buffer, data, length).set(bytes.subarray(0, length));
++			let states = new Int32Array(buffer, state, 1);
++			Atomics.store(states, 0, ok ? 2 : 0);
++			Atomics.notify(states, 0);
++		};
++		let device = Module.discImageDevice;
++		if(!device || !device.fetchBlock)
++		{
++			finish(null);
++			return;
++		}
++		Promise.resolve().then(() => device.fetchBlock(block)).then(finish, (error) => {
++			console.error('disc block ' + block + ': ' + error);
++			finish(null);
++		});
++	}, static_cast<int32>(block), reinterpret_cast<uintptr_t>(victim->data), reinterpret_cast<uintptr_t>(&victim->state), length);
++	// clang-format on
++	return victim;
++}
+ 
+-	uint32 positionLow = static_cast<uint32>(m_position);
+-	uint32 positionHigh = static_cast<uint32>(m_position >> 32);
++void CJsDiscImageDeviceStream::WaitForSlot(SLOT& slot)
++{
++	if(slot.state.load() != SLOT_PENDING) return;
++	auto start = std::chrono::steady_clock::now();
++	while(slot.state.load() == SLOT_PENDING)
++	{
++		emscripten_futex_wait(&slot.state, SLOT_PENDING, 1000.0);
++	}
++	auto waited = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
++	g_discWaitMicroseconds += waited.count();
++}
++
++uint64 CJsDiscImageDeviceStream::Read(void* buffer, uint64 size)
++{
++	if(size == 0) return 0;
+ 
+-	MAIN_THREAD_EM_ASM({
+-		let posLow = $1 >>> 0;
+-		let posHigh = $2 >>> 0;
+-		let position = posLow + (posHigh * 4294967296);
+-		Module.discImageDevice.read($0, position, $3);
+-	},
+-	                   buffer, positionLow, positionHigh, static_cast<uint32>(size));
+-	while(!MAIN_THREAD_EM_ASM_INT({return Module.discImageDevice.isDone()}))
++	auto output = reinterpret_cast<uint8*>(buffer);
++	uint64 position = m_position;
++	uint64 end = std::max(m_position, std::min(m_position + size, m_size));
++	int64 lastBlock = -1;
++	while(position < end)
++	{
++		int64 block = position / BLOCK_SIZE;
++		uint32 offset = static_cast<uint32>(position % BLOCK_SIZE);
++		uint32 count = static_cast<uint32>(std::min<uint64>(BLOCK_SIZE - offset, end - position));
++		for(int attempt = 0;; attempt++)
++		{
++			auto slot = Request(block);
++			assert(slot);
++			WaitForSlot(*slot);
++			if(slot->state.load() == SLOT_READY)
++			{
++				slot->lastUse = ++m_useCounter;
++				memcpy(output, slot->data + offset, count);
++				break;
++			}
++			//The page couldn't deliver (disc closed): forget the slot and hand back zeros.
++			slot->block = -1;
++			if(attempt == 1)
++			{
++				memset(output, 0, count);
++				break;
++			}
++		}
++		output += count;
++		position += count;
++		lastBlock = block;
++	}
++	//Past the end of the image.
++	memset(output, 0, size - (end - m_position));
++	//Discs are mostly read sequentially: keep the next blocks coming while the VM works.
++	if(lastBlock >= 0)
+ 	{
+-		usleep(100);
++		int64 blockCount = (m_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
++		for(int64 next = lastBlock + 1; (next <= lastBlock + READ_AHEAD) && (next < blockCount); next++)
++		{
++			if(!FindSlot(next)) Request(next);
++		}
+ 	}
+ 	m_position += size;
+ 	return size;
+@@ -60,7 +179,7 @@ uint64 CJsDiscImageDeviceStream::Write(const void*, uint64)
+ 
+ bool CJsDiscImageDeviceStream::IsEOF()
+ {
+-	throw std::runtime_error("Not supported.");
++	return m_position >= m_size;
+ }
+ 
+ void CJsDiscImageDeviceStream::Flush()
+diff --git a/Source/Js_DiscImageDeviceStream.h b/Source/Js_DiscImageDeviceStream.h
+index 07026720..3af1ab67 100644
+--- a/Source/Js_DiscImageDeviceStream.h
++++ b/Source/Js_DiscImageDeviceStream.h
+@@ -1,11 +1,22 @@
+ #pragma once
+ 
++#include <array>
++#include <atomic>
+ #include "Stream.h"
+ 
++//Disc image provided by the page (Module.discImageDevice), read in fixed size blocks.
++//Blocks are cached in the wasm heap and requested from the page asynchronously, with read-ahead,
++//so the VM thread only waits when data is really missing and never makes synchronous round trips
++//to the main thread for data it already has (the old stream polled the page every 100us per read).
++//
++//Page side contract: discImageDevice.getFileSize() and discImageDevice.fetchBlock(index), which
++//returns a Promise of the block's bytes (a Uint8Array, BLOCK_SIZE long except for the last block),
++//or of null when the disc went away.
+ class CJsDiscImageDeviceStream : public Framework::CStream
+ {
+ public:
+-	virtual ~CJsDiscImageDeviceStream() = default;
++	CJsDiscImageDeviceStream();
++	virtual ~CJsDiscImageDeviceStream();
+ 
+ 	void Seek(int64, Framework::STREAM_SEEK_DIRECTION) override;
+ 	uint64 Tell() override;
+@@ -14,6 +25,35 @@ public:
+ 	bool IsEOF() override;
+ 	void Flush() override;
+ 
++	//Must match the page's block size (BLOCK in src/emu/ps2/disc.ts).
++	static constexpr uint32 BLOCK_SIZE = 0x100000;
++
+ private:
++	enum SLOT_STATE : int32
++	{
++		SLOT_EMPTY = 0,
++		SLOT_PENDING = 1,
++		SLOT_READY = 2,
++	};
++
++	struct SLOT
++	{
++		int64 block = -1;
++		//Set to SLOT_READY by the main thread once the data is in place (Atomics.store + notify).
++		std::atomic<int32> state = SLOT_EMPTY;
++		uint8* data = nullptr;
++		uint64 lastUse = 0;
++	};
++
++	static constexpr uint32 SLOT_COUNT = 40;
++	static constexpr uint32 READ_AHEAD = 8;
++
++	SLOT* FindSlot(int64);
++	SLOT* Request(int64);
++	void WaitForSlot(SLOT&);
++
+ 	uint64 m_position = 0;
++	uint64 m_size = 0;
++	uint64 m_useCounter = 0;
++	std::array<SLOT, SLOT_COUNT> m_slots;
+ };
+-- 
+2.51.0.windows.1
+

@@ -1,0 +1,57 @@
+name: Build release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Check tag matches package version
+        shell: bash
+        run: test "$GITHUB_REF_NAME" = "v$(node -p 'require("./package.json").version')"
+      - run: npm run build:desktop
+      - name: Checksums
+        shell: pwsh
+        run: Get-FileHash release/*.exe -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Set-Content release/SHA256SUMS-windows.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: |
+            release/*.exe
+            release/SHA256SUMS-windows.txt
+  sources:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node tools/fetch-core-sources.mjs
+      - run: git archive --format=tar.gz --output=release/core-sources/WebStationX-source.tar.gz HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sources
+          path: release/core-sources/*
+  draft:
+    needs: [windows, sources]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --draft --title "WebStationX $GITHUB_REF_NAME" --notes "Portable Windows x64 build. Games and BIOS are not included. Download the EXE for local play; source archives and checksums are included. See the README for setup and limitations."

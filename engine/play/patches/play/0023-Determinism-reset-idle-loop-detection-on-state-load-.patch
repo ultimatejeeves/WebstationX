@@ -1,0 +1,151 @@
+From d5c8976f43c992f6c59cd9363f4aeba8fa72745c Mon Sep 17 00:00:00 2001
+From: wsx <wsx@localhost>
+Date: Wed, 30 Sep 2026 00:05:42 -0400
+Subject: [PATCH 23/43] Determinism: reset idle loop detection on state load;
+ debug hooks (EE block IR dump, locals switch, hash timing)
+
+---
+ Source/ee/Ee_SubSystem.cpp |  5 +++
+ Source/ui_js/Main.cpp      | 68 ++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 70 insertions(+), 3 deletions(-)
+
+diff --git a/Source/ee/Ee_SubSystem.cpp b/Source/ee/Ee_SubSystem.cpp
+index 460fab0a..0bbb4393 100644
+--- a/Source/ee/Ee_SubSystem.cpp
++++ b/Source/ee/Ee_SubSystem.cpp
+@@ -578,6 +578,11 @@ void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
+ 	m_gif.LoadState(archive);
+ 	m_ipu.LoadState(archive);
+ 	m_os->GetLibMc2().LoadState(archive);
++
++	//Not part of a state: what idle loop detection counted before the load would make the machine's
++	//behaviour after it depend on how long it ran before (WebStationX's determinism check relies on this).
++	m_statusRegisterCheckers.clear();
++	m_isIdle = false;
+ }
+ 
+ void CSubSystem::SetupEePageTable()
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index b36769c6..72e05240 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -19,6 +19,10 @@
+ #include "ee/Ee_SubSystem.h"
+ #include "iop/Iop_SubSystem.h"
+ #include "ee/Vpu1Thread.h"
++#include "ee/EeExecutor.h"
++#include "ee/EeBasicBlock.h"
++#include "Jitter.h"
++#include "Jitter_CodeGen_Wasm.h"
+ #include "DefaultAppConfig.h"
+ #include "AppConfig.h"
+ #include "PS2VM_Preferences.h"
+@@ -33,6 +37,7 @@ std::atomic<uint32> g_vblankCount = 0;
+ // load, so two cores can be shown to emulate the same thing (setStateHashFrames, getStateHash).
+ static uint32 g_stateHashFrames = 0;
+ static uint32 g_stateHashTarget = 0;
++static double g_stateHashStart = 0;
+ static std::string g_stateHash;
+ static std::mutex g_stateHashMutex;
+ 
+@@ -56,7 +61,8 @@ static void CheckStateHash()
+ 	result += "\"vu0Mem\":\"" + hash(ee->m_vuMem0, PS2::VUMEM0SIZE) + "\",";
+ 	result += "\"vu1Mem\":\"" + hash(ee->m_vuMem1, PS2::VUMEM1SIZE) + "\",";
+ 	result += "\"vu1Regs\":\"" + hash(ee->m_VU1.m_State.nCOP2, sizeof(ee->m_VU1.m_State.nCOP2)) + "\",";
+-	result += "\"iopRam\":\"" + hash(iop->m_ram, PS2::IOP_RAM_SIZE) + "\"";
++	result += "\"iopRam\":\"" + hash(iop->m_ram, PS2::IOP_RAM_SIZE) + "\",";
++	result += "\"ms\":" + std::to_string(static_cast<int>(WsxFrameStats::Now() - g_stateHashStart));
+ 	result += "}";
+ 	{
+ 		std::lock_guard<std::mutex> lock(g_stateHashMutex);
+@@ -291,7 +297,11 @@ void loadState(std::string path)
+ {
+ 	g_stateOp = g_virtualMachine->LoadState(path);
+ 	g_virtualMachine->SendVmCall([]() {
+-		if(g_stateHashFrames != 0) g_stateHashTarget = g_vblankCount.load() + g_stateHashFrames;
++		if(g_stateHashFrames != 0)
++		{
++			g_stateHashTarget = g_vblankCount.load() + g_stateHashFrames;
++			g_stateHashStart = WsxFrameStats::Now();
++		}
+ 	});
+ }
+ 
+@@ -308,7 +318,11 @@ void setStateHashFrames(uint32 frames)
+ void armStateHash()
+ {
+ 	g_virtualMachine->SendVmCall([]() {
+-		if(g_stateHashFrames != 0) g_stateHashTarget = g_vblankCount.load() + g_stateHashFrames;
++		if(g_stateHashFrames != 0)
++		{
++			g_stateHashTarget = g_vblankCount.load() + g_stateHashFrames;
++			g_stateHashStart = WsxFrameStats::Now();
++		}
+ 	});
+ }
+ 
+@@ -430,6 +444,51 @@ uintptr_t getVmZoneAddress()
+ 	return reinterpret_cast<uintptr_t>(&WsxProfile::g_current);
+ }
+ 
++// Debug: the Jitter's final statement list for the EE block starting at `address` (compiled again on the
++// VM thread, not installed). Request it, then take it once it's there.
++static std::string g_eeBlockDump;
++static std::mutex g_eeBlockDumpMutex;
++
++void debugRequestEeBlockDump(uint32 address)
++{
++	g_virtualMachine->SendVmCall([address]() {
++		std::string result;
++		auto& ee = g_virtualMachine->m_ee->m_EE;
++		auto executor = static_cast<CEeExecutor*>(ee.m_executor.get());
++		auto block = executor->FindBlockStartingAt(address);
++		if(!block || block->IsEmpty())
++		{
++			result = "no block";
++		}
++		else
++		{
++			CEeBasicBlock copy(ee, block->GetBeginAddress(), block->GetEndAddress(), BLOCK_CATEGORY_PS2_EE);
++			bool verify = WsxJitCache::g_verify;
++			WsxJitCache::g_verify = true; //compile even if cached
++			Jitter::g_statementDump = &result;
++			copy.Compile();
++			Jitter::g_statementDump = nullptr;
++			WsxJitCache::g_verify = verify;
++		}
++		std::lock_guard lock(g_eeBlockDumpMutex);
++		g_eeBlockDump = result;
++	});
++}
++
++// Debug: the Jitter's register allocation onto wasm locals (on by default), before booting.
++void debugSetLocalsAsRegisters(bool enabled)
++{
++	Jitter::g_wasmLocalsAsRegisters = enabled;
++}
++
++std::string debugTakeEeBlockDump()
++{
++	std::lock_guard lock(g_eeBlockDumpMutex);
++	std::string result;
++	result.swap(g_eeBlockDump);
++	return result;
++}
++
+ // Same for the VPU1 thread (VIF1, VU1 and the GIF, CVpu1Thread).
+ uintptr_t getVpu1ZoneAddress()
+ {
+@@ -487,6 +546,9 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("getVpu1ZoneAddress", &getVpu1ZoneAddress);
+ 	function("setVpu1ThreadMode", &setVpu1ThreadMode);
+ 	function("getVpu1Stats", &getVpu1Stats);
++	function("debugRequestEeBlockDump", &debugRequestEeBlockDump);
++	function("debugTakeEeBlockDump", &debugTakeEeBlockDump);
++	function("debugSetLocalsAsRegisters", &debugSetLocalsAsRegisters);
+ 	function("setStateHashFrames", &setStateHashFrames);
+ 	function("getStateHash", &getStateHash);
+ 	function("armStateHash", &armStateHash);
+-- 
+2.51.0.windows.1
+

@@ -1,0 +1,109 @@
+From 26266f9751f623032d81994d82a6cffb4a3d6e2e Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 21:03:39 -0400
+Subject: [PATCH 40/43] EE: TLB exception checker and handler callable from
+ Wasm recompiled code (Enter the Matrix hung compiling its first checked
+ load); debugSetJitTrace
+
+---
+ Source/MIPSInstructionFactory.cpp | 11 +++++++++--
+ Source/ui_js/CMakeLists.txt       |  2 +-
+ Source/ui_js/Main.cpp             |  7 +++++++
+ Source/ui_js/Ps2VmJs.cpp          |  5 +++++
+ 4 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/Source/MIPSInstructionFactory.cpp b/Source/MIPSInstructionFactory.cpp
+index 9ef01346..89875e44 100644
+--- a/Source/MIPSInstructionFactory.cpp
++++ b/Source/MIPSInstructionFactory.cpp
+@@ -32,11 +32,18 @@ void CMIPSInstructionFactory::SetupQuickVariables(uint32 nAddress, CMipsJitter*
+ 	m_nOpcode = m_pCtx->m_pMemoryMap->GetInstruction(m_nAddress);
+ }
+ 
+-static void HandleTLBException(CMIPS*)
++//These two are called from recompiled code. They have C linkage and fixed addresses so that backends which
++//need to know every callable function ahead of time (Wasm) can register them.
++extern "C" void HandleTLBException(CMIPS*)
+ {
+ 	//Will exit CPU execution loop with an exception pending
+ }
+ 
++extern "C" uint32 TLBExceptionChecker_Proxy(CMIPS* context, uint32 vaddrLo, uint32 isWrite)
++{
++	return context->m_TLBExceptionChecker(context, vaddrLo, isWrite);
++}
++
+ void CMIPSInstructionFactory::CheckTLBExceptions(bool isWrite)
+ {
+ 	if(m_pCtx->m_pAddrTranslator == &CMIPS::TranslateAddress64) return;
+@@ -60,7 +67,7 @@ void CMIPSInstructionFactory::CheckTLBExceptions(bool isWrite)
+ 	m_codeGen->PushCst(isWrite ? 1 : 0);
+ 
+ 	//Call
+-	m_codeGen->Call(reinterpret_cast<void*>(m_pCtx->m_TLBExceptionChecker), 3, Jitter::CJitter::RETURN_VALUE_32);
++	m_codeGen->Call(reinterpret_cast<void*>(&TLBExceptionChecker_Proxy), 3, Jitter::CJitter::RETURN_VALUE_32);
+ 
+ 	m_codeGen->PushCst(MIPS_EXCEPTION_NONE);
+ 	m_codeGen->BeginIf(Jitter::CONDITION_NE);
+diff --git a/Source/ui_js/CMakeLists.txt b/Source/ui_js/CMakeLists.txt
+index 1afe83e8..1a273bbd 100644
+--- a/Source/ui_js/CMakeLists.txt
++++ b/Source/ui_js/CMakeLists.txt
+@@ -58,7 +58,7 @@ target_link_libraries(Play PUBLIC ${UI_JS_PROJECT_LIBS})
+ target_link_options(Play PRIVATE "--bind")
+ target_link_options(Play PRIVATE "-sMODULARIZE=1")
+ target_link_options(Play PRIVATE "-sEXPORT_ES6=1")
+-target_link_options(Play PRIVATE "-sEXPORTED_FUNCTIONS=['_main', '_initVm', '_EmptyBlockHandler', '_MemoryUtils_GetByteProxy', '_MemoryUtils_GetHalfProxy', '_MemoryUtils_GetWordProxy', '_MemoryUtils_GetDoubleProxy', '_MemoryUtils_SetByteProxy', '_MemoryUtils_SetHalfProxy', '_MemoryUtils_SetWordProxy', '_MemoryUtils_SetDoubleProxy', '_LWL_Proxy', '_LWR_Proxy', '_LDL_Proxy', '_LDR_Proxy', '_SWL_Proxy', '_SWR_Proxy', '_SDL_Proxy', '_SDR_Proxy']")
++target_link_options(Play PRIVATE "-sEXPORTED_FUNCTIONS=['_main', '_initVm', '_EmptyBlockHandler', '_HandleTLBException', '_TLBExceptionChecker_Proxy', '_MemoryUtils_GetByteProxy', '_MemoryUtils_GetHalfProxy', '_MemoryUtils_GetWordProxy', '_MemoryUtils_GetDoubleProxy', '_MemoryUtils_SetByteProxy', '_MemoryUtils_SetHalfProxy', '_MemoryUtils_SetWordProxy', '_MemoryUtils_SetDoubleProxy', '_LWL_Proxy', '_LWR_Proxy', '_LDL_Proxy', '_LDR_Proxy', '_SWL_Proxy', '_SWR_Proxy', '_SDL_Proxy', '_SDR_Proxy']")
+ target_link_options(Play PRIVATE "-sEXPORTED_RUNTIME_METHODS=['ccall', 'FS', 'HEAPU8', 'GL', 'AL']")
+ target_link_options(Play PRIVATE "-sFORCE_FILESYSTEM")
+ target_link_options(Play PRIVATE "-sALLOW_TABLE_GROWTH")
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index be4bf397..0d2c29f0 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -536,6 +536,12 @@ void debugSetLocalsAsRegisters(bool enabled)
+ 	Jitter::g_wasmLocalsAsRegisters = enabled;
+ }
+ 
++// Debug: print every statement list the Jitter hands to the code generator (a hang while compiling shows its block last).
++void debugSetJitTrace(bool enabled)
++{
++	Jitter::g_statementTrace = enabled;
++}
++
+ // Same for the VU1 block starting at (or containing) a microprogram address; compiled on the thread VU1 runs on.
+ void debugRequestVu1BlockDump(uint32 address)
+ {
+@@ -721,6 +727,7 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("debugTakeEeBlockDump", &debugTakeEeBlockDump);
+ 	function("debugRequestVu1BlockDump", &debugRequestVu1BlockDump);
+ 	function("debugSetLocalsAsRegisters", &debugSetLocalsAsRegisters);
++	function("debugSetJitTrace", &debugSetJitTrace);
+ 	function("setStateHashFrames", &setStateHashFrames);
+ 	function("getStateHash", &getStateHash);
+ 	function("armStateHash", &armStateHash);
+diff --git a/Source/ui_js/Ps2VmJs.cpp b/Source/ui_js/Ps2VmJs.cpp
+index 6ef7f958..0af319c9 100644
+--- a/Source/ui_js/Ps2VmJs.cpp
++++ b/Source/ui_js/Ps2VmJs.cpp
+@@ -16,11 +16,16 @@ extern "C" void SWR_Proxy(uint32, uint32, CMIPS*);
+ extern "C" void SDL_Proxy(uint32, uint64, CMIPS*);
+ extern "C" void SDR_Proxy(uint32, uint64, CMIPS*);
+ 
++extern "C" void HandleTLBException(CMIPS*);
++extern "C" uint32 TLBExceptionChecker_Proxy(CMIPS*, uint32, uint32);
++
+ void CPs2VmJs::CreateVM()
+ {
+ 	printf("Initializing PS2VM...\r\n");
+ 
+ 	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&EmptyBlockHandler), "_EmptyBlockHandler", "vi");
++	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&HandleTLBException), "_HandleTLBException", "vi");
++	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&TLBExceptionChecker_Proxy), "_TLBExceptionChecker_Proxy", "iiii");
+ 	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_GetByteProxy), "_MemoryUtils_GetByteProxy", "iii");
+ 	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_GetHalfProxy), "_MemoryUtils_GetHalfProxy", "iii");
+ 	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_GetWordProxy), "_MemoryUtils_GetWordProxy", "iii");
+-- 
+2.51.0.windows.1
+

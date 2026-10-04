@@ -1,0 +1,74 @@
+From a908dcedf62336d050f7994b8041708ba809c637 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 10:46:56 -0400
+Subject: [PATCH 09/43] JS: hosted API counters for disc waits and emulated
+ frames
+
+takeDiscWaitMs() reports how long the VM thread was blocked on disc data, getVblankCount() is a
+heartbeat for the page's stall watchdog (it counts even when the GS draws nothing).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ Source/ui_js/Main.cpp | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 3c3686c7..7d425ff4 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -1,4 +1,5 @@
+ #include <cstdio>
++#include <atomic>
+ #include <future>
+ #include <emscripten/bind.h>
+ #include <AL/al.h>
+@@ -16,6 +17,8 @@
+ 
+ CPs2VmJs* g_virtualMachine = nullptr;
+ CGSHandler::NewFrameEvent::Connection g_gsNewFrameConnection;
++CPS2VM::NewFrameEvent::Connection g_vmNewFrameConnection;
++std::atomic<uint32> g_vblankCount = 0;
+ std::shared_ptr<CInputProviderEmscripten> g_inputProvider;
+ CSH_OpenAL* g_soundHandler = nullptr;
+ std::future<bool> g_stateOp;
+@@ -68,6 +71,8 @@ static void CreateVm(int width, int height, const CPadHandler::FactoryFunction&
+ {
+ 	g_virtualMachine = new CPs2VmJs();
+ 	g_virtualMachine->Initialize();
++	//Heartbeat for the page's stall watchdog: counts emulated frames even when the GS draws nothing.
++	g_vmNewFrameConnection = g_virtualMachine->OnNewFrame.Connect([]() { g_vblankCount++; });
+ 
+ 	g_soundHandler = new CSH_OpenAL();
+ 	g_virtualMachine->CreateSoundHandler(CSH_OpenALProxy::GetFactoryFunction(g_soundHandler));
+@@ -157,6 +162,19 @@ void clearStats()
+ 	CStatsManager::GetInstance().ClearStats();
+ }
+ 
++uint32 getVblankCount()
++{
++	return g_vblankCount.load();
++}
++
++extern std::atomic<uint64> g_discWaitMicroseconds;
++
++// Time the VM thread spent blocked waiting for disc data since the last call, in milliseconds.
++double takeDiscWaitMs()
++{
++	return static_cast<double>(g_discWaitMicroseconds.exchange(0)) / 1000.0;
++}
++
+ // Never blocks the calling (main) thread: the VM thread may be waiting on the main thread (disc reads).
+ void pauseVm()
+ {
+@@ -270,6 +288,8 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("bootDiscImage", &bootDiscImage);
+ 	function("getFrames", &getFrames);
+ 	function("clearStats", &clearStats);
++	function("takeDiscWaitMs", &takeDiscWaitMs);
++	function("getVblankCount", &getVblankCount);
+ 	function("pauseVm", &pauseVm);
+ 	function("resumeVm", &resumeVm);
+ 	function("getVmStatus", &getVmStatus);
+-- 
+2.51.0.windows.1
+

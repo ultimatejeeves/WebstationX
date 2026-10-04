@@ -1,0 +1,519 @@
+From da6ae7412c3941485fb39e6eedb3e2946ab71903 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 22:24:03 -0400
+Subject: [PATCH 25/43] GS: preserve pixel formats in color and depth local
+ transfers
+
+---
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp        | 309 +++++++++++++++++++--
+ Source/gs/GSH_OpenGL/GSH_OpenGL.h          |  17 ++
+ Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp |  58 ++++
+ Source/ui_js/Main.cpp                      |   6 +
+ 4 files changed, 370 insertions(+), 20 deletions(-)
+
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 7ea3ba9f..2b118a8d 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -107,6 +107,12 @@ void CGSH_OpenGL::ReleaseImpl()
+ 	m_copyToFbTexture.Reset();
+ 	m_copyToFbVertexBuffer.Reset();
+ 	m_copyToFbVertexArray.Reset();
++	m_depthReadProgram.reset();
++	m_depthReadDepthTexture.Reset();
++	m_depthReadColorTexture.Reset();
++	m_depthReadSrcFramebuffer.Reset();
++	m_depthReadDepthFramebuffer.Reset();
++	m_depthReadColorFramebuffer.Reset();
+ 	m_primBuffer.Reset();
+ 	m_primVertexArray.Reset();
+ 	m_vertexParamsBuffer.Reset();
+@@ -1743,6 +1749,7 @@ void CGSH_OpenGL::FlushVertexBuffer()
+ 		const auto& v0 = m_vertexBuffer[0];
+ 		printf("GST draw n=%d bbox=%.0f,%.0f-%.0f,%.0f col0=%08x st0=%.3f,%.3f q0=%.3f tex=%u\n", (int)m_vertexBuffer.size(), x0, y0, x1, y1, v0.color, v0.s, v0.t, v0.q,
+ 		       (unsigned)m_renderState.texture0Handle);
++
+ 	}
+ 
+ 	assert(m_renderState.isValid == true);
+@@ -2223,9 +2230,74 @@ void CGSH_OpenGL::ProcessLocalToHostTransfer()
+ 	delete[] pixels;
+ }
+ 
++//Runs fn with the pixel indexor of a pixel storage format (false for formats without one).
++template <typename Function>
++static bool WithPixelIndexor(uint32 psm, uint8* ram, uint32 bufPtr, uint32 bufWidth, Function&& fn)
++{
++	switch(psm)
++	{
++	case CGSHandler::PSMCT32:
++	case CGSHandler::PSMCT24:
++	case CGSHandler::PSMCT24_UNK:
++	case CGSHandler::PSMCT32_UNK:
++	{
++		CGsPixelFormats::CPixelIndexorPSMCT32 indexor(ram, bufPtr, bufWidth);
++		fn(indexor);
++	}
++		return true;
++	case CGSHandler::PSMZ32:
++	case CGSHandler::PSMZ24:
++	{
++		CGsPixelFormats::CPixelIndexorPSMZ32 indexor(ram, bufPtr, bufWidth);
++		fn(indexor);
++	}
++		return true;
++	case CGSHandler::PSMCT16:
++	{
++		CGsPixelFormats::CPixelIndexorPSMCT16 indexor(ram, bufPtr, bufWidth);
++		fn(indexor);
++	}
++		return true;
++	case CGSHandler::PSMCT16S:
++	{
++		CGsPixelFormats::CPixelIndexorPSMCT16S indexor(ram, bufPtr, bufWidth);
++		fn(indexor);
++	}
++		return true;
++	case CGSHandler::PSMZ16:
++	{
++		CGsPixelFormats::CPixelIndexor<CGsPixelFormats::STORAGEPSMZ16> indexor(ram, bufPtr, bufWidth);
++		fn(indexor);
++	}
++		return true;
++	case CGSHandler::PSMZ16S:
++	{
++		CGsPixelFormats::CPixelIndexorPSMZ16S indexor(ram, bufPtr, bufWidth);
++		fn(indexor);
++	}
++		return true;
++	case CGSHandler::PSMT8:
++	{
++		CGsPixelFormats::CPixelIndexorPSMT8 indexor(ram, bufPtr, bufWidth);
++		fn(indexor);
++	}
++		return true;
++	case CGSHandler::PSMT4:
++	{
++		CGsPixelFormats::CPixelIndexorPSMT4 indexor(ram, bufPtr, bufWidth);
++		fn(indexor);
++	}
++		return true;
++	default:
++		return false;
++	}
++}
++
+ void CGSH_OpenGL::ProcessLocalToLocalTransfer()
+ {
+ 	auto bltBuf = make_convertible<BITBLTBUF>(m_nReg[GS_REG_BITBLTBUF]);
++	auto trxPos = make_convertible<TRXPOS>(m_nReg[GS_REG_TRXPOS]);
++	auto trxReg = make_convertible<TRXREG>(m_nReg[GS_REG_TRXREG]);
+ 	if(g_wsxGsTrace.load(std::memory_order_relaxed) > 0)
+ 	{
+ 		printf("GST l2l bitblt=%llx trxpos=%llx trxreg=%llx\n", (unsigned long long)m_nReg[GS_REG_BITBLTBUF], (unsigned long long)m_nReg[GS_REG_TRXPOS],
+@@ -2245,7 +2317,16 @@ void CGSH_OpenGL::ProcessLocalToLocalTransfer()
+ 	bool foundSrc = srcFramebufferIterator != std::end(m_framebuffers);
+ 	bool foundDest = dstFramebufferIterator != std::end(m_framebuffers);
+ 
+-	if(foundSrc && foundDest)
++	//A framebuffer blit preserves pixels only when both storage formats agree. Partial copies,
++	//format reinterpretation and self-copies use the format-aware memory path below.
++	bool fullCopy = foundSrc && foundDest && (srcFramebufferIterator != dstFramebufferIterator) &&
++	                (bltBuf.nSrcPsm == bltBuf.nDstPsm) &&
++	                ((*srcFramebufferIterator)->m_psm == bltBuf.nSrcPsm) &&
++	                ((*dstFramebufferIterator)->m_psm == bltBuf.nDstPsm) &&
++	                (trxPos.nSSAX == 0) && (trxPos.nSSAY == 0) && (trxPos.nDSAX == 0) && (trxPos.nDSAY == 0) &&
++	                (trxReg.nRRW == (*srcFramebufferIterator)->m_width) && (trxReg.nRRH == (*srcFramebufferIterator)->m_height) &&
++	                (trxReg.nRRW == (*dstFramebufferIterator)->m_width) && (trxReg.nRRH == (*dstFramebufferIterator)->m_height);
++	if(fullCopy)
+ 	{
+ 		FlushVertexBuffer();
+ 		m_renderState.isValid = false;
+@@ -2253,6 +2334,9 @@ void CGSH_OpenGL::ProcessLocalToLocalTransfer()
+ 		const auto& srcFramebuffer = (*srcFramebufferIterator);
+ 		const auto& dstFramebuffer = (*dstFramebufferIterator);
+ 
++		CommitFramebufferDirtyPages(srcFramebuffer, 0, srcFramebuffer->m_height);
++		m_validGlState &= ~(GLSTATE_SCISSOR | GLSTATE_FRAMEBUFFER);
++		glDisable(GL_SCISSOR_TEST);
+ 		glBindFramebuffer(GL_FRAMEBUFFER, dstFramebuffer->m_framebuffer);
+ 		glBindFramebuffer(GL_READ_FRAMEBUFFER, srcFramebuffer->m_framebuffer);
+ 
+@@ -2263,44 +2347,229 @@ void CGSH_OpenGL::ProcessLocalToLocalTransfer()
+ 		    GL_COLOR_BUFFER_BIT, GL_NEAREST);
+ 		CHECKGLERROR();
+ 
++		dstFramebuffer->m_cachedArea.ClearDirtyPages();
++		dstFramebuffer->m_resolveNeeded = true;
+ 		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+ 	}
+-	else if(foundSrc && !foundDest)
++	else
+ 	{
++		//The destination is GS memory. The pixels come from what was drawn (color or depth buffer) when the
++		//source is one of our buffers, and from GS memory otherwise. Formats matter: a game can copy a color
++		//buffer into Z buffer memory and download it from there (ATV Offroad Fury 2 builds VIF packets that way).
++		uint32 width = trxReg.nRRW;
++		uint32 height = trxReg.nRRH;
++		if((width == 0) || (height == 0)) return;
++
++		auto pixelClass = [](uint32 psm) {
++			uint32 size = CGsPixelFormats::GetPsmPixelSize(psm);
++			return (size == 24) ? 32 : size;
++		};
++		if(pixelClass(bltBuf.nSrcPsm) != pixelClass(bltBuf.nDstPsm)) return;
++
+ 		FlushVertexBuffer();
+ 		m_renderState.isValid = false;
+ 
+-		auto trxPos = make_convertible<TRXPOS>(m_nReg[GS_REG_TRXPOS]);
+-		auto trxReg = make_convertible<TRXREG>(m_nReg[GS_REG_TRXREG]);
+-		auto imgbuffer = Framework::CBitmap(trxReg.nRRW * m_fbScale, trxReg.nRRH * m_fbScale, 32);
++		std::vector<uint32> pixels(width * height);
++		if(!ReadGlPixels(bltBuf.GetSrcPtr(), bltBuf.GetSrcWidth(), bltBuf.nSrcPsm, trxPos.nSSAX, trxPos.nSSAY, width, height, pixels))
++		{
++			bool known = WithPixelIndexor(bltBuf.nSrcPsm, m_pRAM, bltBuf.GetSrcPtr(), bltBuf.nSrcWidth, [&](auto& indexor) {
++				for(uint32 y = 0; y < height; y++)
++				{
++					for(uint32 x = 0; x < width; x++)
++					{
++						pixels[x + (y * width)] = indexor.GetPixel((trxPos.nSSAX + x) % 2048, (trxPos.nSSAY + y) % 2048);
++					}
++				}
++			});
++			if(!known) return;
++		}
+ 
+-		glBindFramebuffer(GL_FRAMEBUFFER, (*srcFramebufferIterator)->m_framebuffer);
+-		glReadPixels(trxPos.nSSAX * m_fbScale, trxPos.nSSAY * m_fbScale, trxReg.nRRW * m_fbScale, trxReg.nRRH * m_fbScale, GL_RGBA, GL_UNSIGNED_BYTE, imgbuffer.GetPixels());
+-		CHECKGLERROR();
++		//24-bit formats leave the upper byte of the destination alone
++		bool keepUpperByte = CGsPixelFormats::IsPsm24Bits(bltBuf.nDstPsm) || (bltBuf.nDstPsm == PSMZ24);
++		bool written = WithPixelIndexor(bltBuf.nDstPsm, m_pRAM, bltBuf.GetDstPtr(), bltBuf.nDstWidth, [&](auto& indexor) {
++			for(uint32 y = 0; y < height; y++)
++			{
++				for(uint32 x = 0; x < width; x++)
++				{
++					uint32 dstX = (trxPos.nDSAX + x) % 2048;
++					uint32 dstY = (trxPos.nDSAY + y) % 2048;
++					uint32 pixel = pixels[x + (y * width)];
++					if(keepUpperByte)
++					{
++						pixel = (pixel & 0x00FFFFFF) | (static_cast<uint32>(indexor.GetPixel(dstX, dstY)) & 0xFF000000);
++					}
++					indexor.SetPixel(dstX, dstY, static_cast<decltype(indexor.GetPixel(0, 0))>(pixel));
++				}
++			}
++		});
++		if(!written) return;
+ 
+-		// Sample down to requested size
+-		imgbuffer = imgbuffer.Resize(trxReg.nRRW, trxReg.nRRH);
++		m_renderState.isTextureStateValid = false;
++		m_renderState.isFramebufferStateValid = false;
+ 
+ 		auto [transferAddress, transferSize] = GsTransfer::GetDstRange(bltBuf, trxReg, trxPos);
+ 		m_textureCache.InvalidateRange(transferAddress, transferSize);
++		for(const auto& framebuffer : m_framebuffers)
++		{
++			framebuffer->m_cachedArea.Invalidate(transferAddress, transferSize);
++		}
++	}
++}
++
++//Pixels of a guest buffer as the GS would hold them, read from the color or depth buffer we drew them in.
++//Returns false when the area isn't one of our buffers (GS memory has it then).
++bool CGSH_OpenGL::ReadGlPixels(uint32 bufPtr, uint32 bufWidth, uint32 psm, uint32 x, uint32 y, uint32 width, uint32 height, std::vector<uint32>& pixels)
++{
++	if(m_multisampleEnabled) return false;
++
++	bool isColor = (psm == PSMCT32) || (psm == PSMCT24);
++	bool isDepth = (psm == PSMZ32) || (psm == PSMZ24);
++
++	if(isColor)
++	{
++		auto framebufferIterator = std::find_if(m_framebuffers.begin(), m_framebuffers.end(),
++		                                        [&](const FramebufferPtr& framebuffer) {
++			                                        return (framebuffer->m_basePtr == bufPtr) && (framebuffer->m_width == bufWidth) &&
++			                                               ((framebuffer->m_psm == PSMCT32) || (framebuffer->m_psm == PSMCT24));
++		                                        });
++		if(framebufferIterator == std::end(m_framebuffers)) return false;
++		const auto& framebuffer = (*framebufferIterator);
++		if(((x + width) > framebuffer->m_width) || ((y + height) > framebuffer->m_height)) return false;
++
++		//What the game uploaded there since it was last drawn to
++		CommitFramebufferDirtyPages(framebuffer, y, y + height);
+ 
+-		//Write back to RAM
++		uint32 scale = m_fbScale;
++		std::vector<uint32> scaledPixels(width * scale * height * scale);
++		m_validGlState &= ~GLSTATE_FRAMEBUFFER;
++		glBindFramebuffer(GL_FRAMEBUFFER, framebuffer->m_framebuffer);
++		glReadPixels(x * scale, y * scale, width * scale, height * scale, GL_RGBA, GL_UNSIGNED_BYTE, scaledPixels.data());
++		CHECKGLERROR();
++
++		for(uint32 py = 0; py < height; py++)
+ 		{
+-			CGsPixelFormats::CPixelIndexorPSMCT32 indexor(m_pRAM, bltBuf.GetDstPtr(), bltBuf.nDstWidth);
+-			for(uint32 y = 0; y < trxReg.nRRH; y++)
++			for(uint32 px = 0; px < width; px++)
+ 			{
+-				for(uint32 x = 0; x < trxReg.nRRW; x++)
+-				{
+-					auto pixel = imgbuffer.GetPixel(x, y);
+-					indexor.SetPixel(trxPos.nDSAX + x, trxPos.nDSAY + y, MakeColor(pixel.r, pixel.g, pixel.b, pixel.a));
+-				}
++				uint32 pixel = scaledPixels[(px * scale) + (scale / 2) + (((py * scale) + (scale / 2)) * width * scale)];
++				//Alpha is drawn at twice its GS value (0x80 is 1.0)
++				uint32 alpha = ((pixel >> 24) + 1) >> 1;
++				pixels[px + (py * width)] = (pixel & 0x00FFFFFF) | (alpha << 24);
+ 			}
+ 		}
++		return true;
+ 	}
+-	else
++	else if(isDepth)
+ 	{
+-		assert(0);
++		auto depthbufferIterator = std::find_if(m_depthbuffers.begin(), m_depthbuffers.end(),
++		                                        [&](const DepthbufferPtr& depthbuffer) {
++			                                        return (depthbuffer->m_basePtr == bufPtr) && (depthbuffer->m_width == bufWidth);
++		                                        });
++		if(depthbufferIterator == std::end(m_depthbuffers)) return false;
++		const auto& depthbuffer = (*depthbufferIterator);
++		if(((x + width) > depthbuffer->m_width) || ((y + height) > depthbuffer->m_height)) return false;
++		return ReadDepthPixels(depthbuffer, x, y, width, height, pixels.data());
+ 	}
++	return false;
++}
++
++bool CGSH_OpenGL::ReadDepthPixels(const DepthbufferPtr& depthbuffer, uint32 x, uint32 y, uint32 width, uint32 height, uint32* pixels)
++{
++	uint32 scale = m_fbScale;
++	uint32 fullWidth = depthbuffer->m_width * scale;
++	uint32 fullHeight = depthbuffer->m_height * scale;
++
++	if(!m_depthReadProgram)
++	{
++		m_depthReadProgram = GenerateDepthReadProgram();
++		m_depthReadOriginUniform = glGetUniformLocation(*m_depthReadProgram, "g_origin");
++		m_depthReadScaleUniform = glGetUniformLocation(*m_depthReadProgram, "g_scale");
++		m_depthReadTextureUniform = glGetUniformLocation(*m_depthReadProgram, "g_texture");
++		m_depthReadDepthTexture = Framework::OpenGl::CTexture::Create();
++		m_depthReadColorTexture = Framework::OpenGl::CTexture::Create();
++		m_depthReadSrcFramebuffer = Framework::OpenGl::CFramebuffer::Create();
++		m_depthReadDepthFramebuffer = Framework::OpenGl::CFramebuffer::Create();
++		m_depthReadColorFramebuffer = Framework::OpenGl::CFramebuffer::Create();
++		m_depthReadTextureWidth = 0;
++		m_depthReadTextureHeight = 0;
++	}
++
++	m_validGlState = 0;
++	m_renderState.isValid = false;
++
++	glDisable(GL_BLEND);
++	glDisable(GL_DEPTH_TEST);
++	glDisable(GL_SCISSOR_TEST);
++	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++	glDepthMask(GL_TRUE);
++
++	glActiveTexture(GL_TEXTURE0);
++
++	//Depth renderbuffers can't be sampled: copy the area to a depth texture first
++	glBindTexture(GL_TEXTURE_2D, m_depthReadDepthTexture);
++	if((m_depthReadTextureWidth != fullWidth) || (m_depthReadTextureHeight != fullHeight))
++	{
++		glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, fullWidth, fullHeight, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
++		m_depthReadTextureWidth = fullWidth;
++		m_depthReadTextureHeight = fullHeight;
++	}
++	CHECKGLERROR();
++
++	glBindFramebuffer(GL_READ_FRAMEBUFFER, m_depthReadSrcFramebuffer);
++	glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthbuffer->m_depthBuffer);
++	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_depthReadDepthFramebuffer);
++	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, m_depthReadDepthTexture, 0);
++	bool complete = (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) &&
++	                (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
++	if(complete)
++	{
++		glBlitFramebuffer(
++		    x * scale, y * scale, (x + width) * scale, (y + height) * scale,
++		    x * scale, y * scale, (x + width) * scale, (y + height) * scale,
++		    GL_DEPTH_BUFFER_BIT, GL_NEAREST);
++	}
++	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++	CHECKGLERROR();
++	if(!complete)
++	{
++		glBindFramebuffer(GL_FRAMEBUFFER, 0);
++		return false;
++	}
++
++	//Then draw its values as bytes and read those
++	glBindTexture(GL_TEXTURE_2D, m_depthReadColorTexture);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++
++	glBindFramebuffer(GL_FRAMEBUFFER, m_depthReadColorFramebuffer);
++	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_depthReadColorTexture, 0);
++	{
++		GLenum drawBufferId = GL_COLOR_ATTACHMENT0;
++		glDrawBuffers(1, &drawBufferId);
++	}
++	glDepthMask(GL_FALSE);
++	glViewport(0, 0, width, height);
++
++	glBindTexture(GL_TEXTURE_2D, m_depthReadDepthTexture);
++	glUseProgram(*m_depthReadProgram);
++	glUniform1i(m_depthReadTextureUniform, 0);
++	glUniform2i(m_depthReadOriginUniform, (x * scale) + (scale / 2), (y * scale) + (scale / 2));
++	glUniform1i(m_depthReadScaleUniform, scale);
++
++	glBindBuffer(GL_ARRAY_BUFFER, m_copyToFbVertexBuffer);
++	glBindVertexArray(m_copyToFbVertexArray);
++	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++
++	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++	CHECKGLERROR();
++
++	glBindTexture(GL_TEXTURE_2D, 0);
++	return true;
+ }
+ 
+ void CGSH_OpenGL::ProcessClutTransfer(uint32 csa, uint32)
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index 290deb70..97805ca6 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -337,6 +337,10 @@ private:
+ 	Framework::OpenGl::CBuffer GenerateCopyToFbVertexBuffer();
+ 	Framework::OpenGl::CVertexArray GenerateCopyToFbVertexArray();
+ 
++	Framework::OpenGl::ProgramPtr GenerateDepthReadProgram();
++	bool ReadGlPixels(uint32, uint32, uint32, uint32, uint32, uint32, uint32, std::vector<uint32>&);
++	bool ReadDepthPixels(const DepthbufferPtr&, uint32, uint32, uint32, uint32, uint32*);
++
+ 	Framework::OpenGl::CVertexArray GeneratePrimVertexArray();
+ 	Framework::OpenGl::CBuffer GenerateUniformBlockBuffer(size_t);
+ 
+@@ -428,6 +432,19 @@ private:
+ 	GLint m_copyToFbSrcPositionUniform = -1;
+ 	GLint m_copyToFbSrcSizeUniform = -1;
+ 
++	//Reading a depth buffer back (local to local transfers out of a Z buffer)
++	Framework::OpenGl::ProgramPtr m_depthReadProgram;
++	Framework::OpenGl::CTexture m_depthReadDepthTexture;
++	Framework::OpenGl::CTexture m_depthReadColorTexture;
++	Framework::OpenGl::CFramebuffer m_depthReadSrcFramebuffer;
++	Framework::OpenGl::CFramebuffer m_depthReadDepthFramebuffer;
++	Framework::OpenGl::CFramebuffer m_depthReadColorFramebuffer;
++	uint32 m_depthReadTextureWidth = 0;
++	uint32 m_depthReadTextureHeight = 0;
++	GLint m_depthReadOriginUniform = -1;
++	GLint m_depthReadScaleUniform = -1;
++	GLint m_depthReadTextureUniform = -1;
++
+ 	TextureCache m_textureCache;
+ 	PaletteList m_paletteCache;
+ 	FramebufferList m_framebuffers;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
+index 3f37572a..d28d4a41 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
+@@ -706,6 +706,64 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GeneratePresentProgram()
+ 	return program;
+ }
+ 
++//Writes the depth values of a depth texture as the bytes of the 32-bit Z value they were drawn with
++//(depth = z / 2^32, see the vertex shader), one output pixel per guest pixel.
++Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateDepthReadProgram()
++{
++	Framework::OpenGl::CShader vertexShader(GL_VERTEX_SHADER);
++	Framework::OpenGl::CShader pixelShader(GL_FRAGMENT_SHADER);
++
++	{
++		std::stringstream shaderBuilder;
++		shaderBuilder << GLSL_VERSION << std::endl;
++		shaderBuilder << "in vec2 a_position;" << std::endl;
++		shaderBuilder << "void main()" << std::endl;
++		shaderBuilder << "{" << std::endl;
++		shaderBuilder << "	gl_Position = vec4(a_position, 0, 1);" << std::endl;
++		shaderBuilder << "}" << std::endl;
++
++		vertexShader.SetSource(shaderBuilder.str().c_str());
++		FRAMEWORK_MAYBE_UNUSED bool result = vertexShader.Compile();
++		assert(result);
++	}
++
++	{
++		std::stringstream shaderBuilder;
++		shaderBuilder << GLSL_VERSION << std::endl;
++		shaderBuilder << "precision highp float;" << std::endl;
++		shaderBuilder << "precision highp int;" << std::endl;
++		shaderBuilder << "out vec4 fragColor;" << std::endl;
++		shaderBuilder << "uniform highp sampler2D g_texture;" << std::endl;
++		shaderBuilder << "uniform ivec2 g_origin;" << std::endl;
++		shaderBuilder << "uniform int g_scale;" << std::endl;
++		shaderBuilder << "void main()" << std::endl;
++		shaderBuilder << "{" << std::endl;
++		shaderBuilder << "	ivec2 coord = (ivec2(gl_FragCoord.xy) * g_scale) + g_origin;" << std::endl;
++		shaderBuilder << "	highp float depth = texelFetch(g_texture, coord, 0).r;" << std::endl;
++		shaderBuilder << "	highp uint z = (depth >= 1.0) ? 0xFFFFFFFFu : uint(max(depth, 0.0) * 4294967296.0);" << std::endl;
++		shaderBuilder << "	fragColor = vec4(float(z & 0xFFu), float((z >> 8) & 0xFFu), float((z >> 16) & 0xFFu), float(z >> 24)) / 255.0;" << std::endl;
++		shaderBuilder << "}" << std::endl;
++
++		pixelShader.SetSource(shaderBuilder.str().c_str());
++		FRAMEWORK_MAYBE_UNUSED bool result = pixelShader.Compile();
++		assert(result);
++	}
++
++	auto program = std::make_shared<Framework::OpenGl::CProgram>();
++
++	{
++		program->AttachShader(vertexShader);
++		program->AttachShader(pixelShader);
++
++		glBindAttribLocation(*program, static_cast<GLuint>(PRIM_VERTEX_ATTRIB::POSITION), "a_position");
++
++		FRAMEWORK_MAYBE_UNUSED bool result = program->Link();
++		assert(result);
++	}
++
++	return program;
++}
++
+ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateCopyToFbProgram()
+ {
+ 	Framework::OpenGl::CShader vertexShader(GL_VERTEX_SHADER);
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 3ad9326b..f7c8b54e 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -375,6 +375,11 @@ uintptr_t getEePcAddress()
+ 	return reinterpret_cast<uintptr_t>(&g_virtualMachine->m_ee->m_EE.m_State.nPC);
+ }
+ 
++uintptr_t getEeRamAddress()
++{
++	return reinterpret_cast<uintptr_t>(g_virtualMachine->m_ee->m_ram);
++}
++
+ std::string disassembleEe(uint32 address, int count)
+ {
+ 	std::string result;
+@@ -602,4 +607,5 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("setEeFrequencyScale", &setEeFrequencyScale);
+ 	function("getEePcAddress", &getEePcAddress);
+ 	function("disassembleEe", &disassembleEe);
++	function("getEeRamAddress", &getEeRamAddress);
+ }
+-- 
+2.51.0.windows.1
+

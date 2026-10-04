@@ -1,0 +1,303 @@
+From 2272c99935c9fa8c90866dd0ba77a72f3f01c349 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 14:37:50 -0400
+Subject: [PATCH 49/50] Fix accurate add edge cases and enable its Wasm call
+ paths
+
+---
+ Source/ee/FpAddTruncate.cpp | 209 +++++++-----------------------------
+ Source/ee/FpAddTruncate.h   |   2 +-
+ Source/ee/VUShared.cpp      |   5 -
+ Source/ui_js/CMakeLists.txt |   2 +-
+ Source/ui_js/Ps2VmJs.cpp    |   3 +
+ 5 files changed, 41 insertions(+), 180 deletions(-)
+
+diff --git a/Source/ee/FpAddTruncate.cpp b/Source/ee/FpAddTruncate.cpp
+index 6f7e7856..615b6afa 100644
+--- a/Source/ee/FpAddTruncate.cpp
++++ b/Source/ee/FpAddTruncate.cpp
+@@ -1,178 +1,41 @@
+-//Source: The LLVM Compiler Infrastructure - lib/addsf3.c
+-//Modified to truncate result of addition
+-
+-#include <limits.h>
+-#include <cstdint>
+ #include "FpAddTruncate.h"
+-#include "BitManip.h"
+-
+-typedef uint32 rep_t;
+-typedef int32 srep_t;
+-typedef float fp_t;
+-#define REP_C UINT32_C
+-#define significandBits 23
+-
+-#define typeWidth (sizeof(rep_t) * CHAR_BIT)
+-#define exponentBits (typeWidth - significandBits - 1)
+-#define maxExponent ((1 << exponentBits) - 1)
+-#define exponentBias (maxExponent >> 1)
+-
+-#define implicitBit (REP_C(1) << significandBits)
+-#define significandMask (implicitBit - 1U)
+-#define signBit (REP_C(1) << (significandBits + exponentBits))
+-#define absMask (signBit - 1U)
+-#define exponentMask (absMask ^ significandMask)
+-#define oneRep ((rep_t)exponentBias << significandBits)
+-#define infRep exponentMask
+-#define quietBit (implicitBit >> 1)
+-#define qnanRep (exponentMask | quietBit)
+-
+-static inline int rep_clz(rep_t a)
+-{
+-	return __builtin_clz(a);
+-}
++#include <algorithm>
+ 
++// PS2 ADD alignment retains one guard bit, not IEEE guard/round/sticky bits.
++// Exponent 255 is finite; exponent zero is signed zero for arithmetic.
++// See PCSX2's "PS2 VU (Vector Unit) Documentation Part 1", note 3,
++// and PS2Tek's floating-point format. This helper does not produce U/O flags.
+ uint32 FpAddTruncate(uint32 a, uint32 b)
+ {
+-	const rep_t aAbs = a & absMask;
+-	const rep_t bAbs = b & absMask;
+-
+-	// Detect if a or b is zero, infinity, or NaN.
+-	if(aAbs - 1U >= infRep - 1U || bAbs - 1U >= infRep - 1U)
+-	{
+-
+-		// NaN + anything = qNaN
+-		if(aAbs > infRep) return (a | quietBit);
+-		// anything + NaN = qNaN
+-		if(bAbs > infRep) return (b | quietBit);
+-
+-		if(aAbs == infRep)
+-		{
+-			// +/-infinity + -/+infinity = qNaN
+-			if((a ^ b) == signBit) return qnanRep;
+-			// +/-infinity + anything remaining = +/- infinity
+-			else
+-				return a;
+-		}
+-
+-		// anything remaining + +/-infinity = +/-infinity
+-		if(bAbs == infRep) return b;
+-
+-		// zero + anything = anything
+-		if(!aAbs)
+-		{
+-			// but we need to get the sign right for zero + zero
+-			if(!bAbs)
+-				return (a & b);
+-			else
+-				return b;
+-		}
+-
+-		// anything + zero = anything
+-		if(!bAbs) return a;
+-	}
+-
+-	// Swap a and b if necessary so that a has the larger absolute value.
+-	if(bAbs > aAbs)
+-	{
+-		const uint32 temp = a;
+-		a = b;
+-		b = temp;
+-	}
+-
+-	// Extract the exponent and significand from the (possibly swapped) a and b.
+-	int aExponent = a >> significandBits & maxExponent;
+-	int bExponent = b >> significandBits & maxExponent;
+-	rep_t aSignificand = a & significandMask;
+-	rep_t bSignificand = b & significandMask;
+-
+-	// Normalize any denormals, and adjust the exponent accordingly.
+-	//if (aExponent == 0) aExponent = normalize(&aSignificand);
+-	//if (bExponent == 0) bExponent = normalize(&bSignificand);
+-
+-	// The sign of the result is the sign of the larger operand, a.  If they
+-	// have opposite signs, we are performing a subtraction; otherwise addition.
+-	const rep_t resultSign = a & signBit;
+-	const bool subtraction = (a ^ b) & signBit;
+-
+-	// Shift the significands to give us round, guard and sticky, and or in the
+-	// implicit significand bit.  (If we fell through from the denormal path it
+-	// was already set by normalize( ), but setting it twice won't hurt
+-	// anything.)
+-	aSignificand = (aSignificand | implicitBit) << 3;
+-	bSignificand = (bSignificand | implicitBit) << 3;
+-
+-	// Shift the significand of b by the difference in exponents, with a sticky
+-	// bottom bit to get rounding correct.
+-	const unsigned int align = aExponent - bExponent;
+-	if(align)
+-	{
+-		if(align < typeWidth)
+-		{
+-			//const bool sticky = bSignificand << (typeWidth - align);
+-			bSignificand = bSignificand >> align;
+-			// Mask off round and sticky bits
+-			bSignificand &= ~0x03;
+-		}
+-		else
+-		{
+-			bSignificand = 0; // sticky; b is known to be non-zero.
+-		}
+-	}
+-
+-	if(subtraction)
+-	{
+-		aSignificand -= bSignificand;
+-
+-		// If a == -b, return +zero.
+-		if(aSignificand == 0) return 0;
+-
+-		// If partial cancellation occured, we need to left-shift the result
+-		// and adjust the exponent:
+-		if(aSignificand < implicitBit << 3)
+-		{
+-			const int shift = rep_clz(aSignificand) - rep_clz(implicitBit << 3);
+-			aSignificand <<= shift;
+-			aExponent -= shift;
+-		}
+-	}
+-
+-	else /* addition */
+-	{
+-		aSignificand += bSignificand;
+-
+-		// If the addition carried up, we need to right-shift the result and
+-		// adjust the exponent:
+-		if(aSignificand & implicitBit << 4)
+-		{
+-			const bool sticky = aSignificand & 1;
+-			aSignificand = aSignificand >> 1 | sticky;
+-			aExponent += 1;
+-		}
+-	}
+-
+-	// If we have overflowed the type, return +/- infinity:
+-	if(aExponent >= maxExponent) return infRep | resultSign;
+-
+-	if(aExponent <= 0)
+-	{
+-		// Result is denormal before rounding; the exponent is zero and we
+-		// need to shift the significand.
+-		const int shift = 1 - aExponent;
+-		const bool sticky = aSignificand << (typeWidth - shift);
+-		aSignificand = aSignificand >> shift | sticky;
+-		aExponent = 0;
+-	}
+-
+-	// Low three bits are round, guard, and sticky.
+-	const int roundGuardSticky = aSignificand & 0x7;
+-
+-	// Shift the significand into place, and mask off the implicit bit.
+-	rep_t result = aSignificand >> 3 & significandMask;
+-
+-	// Insert the exponent and sign.
+-	result |= (rep_t)aExponent << significandBits;
+-	result |= resultSign;
+-
+-	return result;
++    constexpr uint32 signMask = 0x80000000;
++    constexpr uint32 magnitudeMask = 0x7FFFFFFF;
++    if((a & 0x7F800000) == 0) a &= signMask;
++    if((b & 0x7F800000) == 0) b &= signMask;
++    if((a & magnitudeMask) == 0)
++        return (b & magnitudeMask) == 0 ? a & b : b;
++    if((b & magnitudeMask) == 0) return a;
++    if((a & magnitudeMask) < (b & magnitudeMask)) std::swap(a, b);
++
++    int exponent = (a >> 23) & 255;
++    unsigned distance = exponent - ((b >> 23) & 255);
++    uint32 larger = ((a & 0x7FFFFF) | 0x800000) << 1;
++    uint32 smaller = ((b & 0x7FFFFF) | 0x800000) << 1;
++    smaller = distance < 25 ? smaller >> distance : 0;
++    uint32 result = (a ^ b) & signMask ? larger - smaller : larger + smaller;
++    if(!result) return 0;
++    uint32 sign = a & signMask;
++    if(result & 0x02000000)
++    {
++        result >>= 1;
++        ++exponent;
++    }
++    else
++    {
++        int shift = __builtin_clz(result) - 7;
++        result <<= shift;
++        exponent -= shift;
++    }
++    if(exponent > 255) return sign | magnitudeMask;
++    if(exponent <= 0) return sign;
++    return sign | (uint32(exponent) << 23) | ((result >> 1) & 0x7FFFFF);
+ }
+diff --git a/Source/ee/FpAddTruncate.h b/Source/ee/FpAddTruncate.h
+index 3cbfc878..de528558 100644
+--- a/Source/ee/FpAddTruncate.h
++++ b/Source/ee/FpAddTruncate.h
+@@ -2,4 +2,4 @@
+ 
+ #include "Types.h"
+ 
+-uint32 FpAddTruncate(uint32, uint32);
++extern "C" uint32 FpAddTruncate(uint32, uint32);
+diff --git a/Source/ee/VUShared.cpp b/Source/ee/VUShared.cpp
+index e9c6a061..c26f3f5d 100644
+--- a/Source/ee/VUShared.cpp
++++ b/Source/ee/VUShared.cpp
+@@ -740,10 +740,6 @@ void VUShared::ADDi(CMipsJitter* codeGen, uint8 nDest, uint8 nFd, uint8 nFs, uin
+ 		nFd = 32;
+ 	}
+ 
+-	//Use FpAddTruncate on all platforms, except JavaScript
+-	//On JavaScript, using it doesn't seem to help Tri-Ace games
+-	//there's probably some other rounding issue on that platform
+-#if !defined(__EMSCRIPTEN__)
+ 	if(compileHints & COMPILEHINT_USE_ACCURATE_ADDI)
+ 	{
+ 		for(unsigned int i = 0; i < 4; i++)
+@@ -757,7 +753,6 @@ void VUShared::ADDi(CMipsJitter* codeGen, uint8 nDest, uint8 nFd, uint8 nFs, uin
+ 		}
+ 	}
+ 	else
+-#endif
+ 	{
+ 		codeGen->MD_PushRel(offsetof(CMIPS, m_State.nCOP2[nFs]));
+ 		codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2I));
+diff --git a/Source/ui_js/CMakeLists.txt b/Source/ui_js/CMakeLists.txt
+index 5c0ad445..612d8171 100644
+--- a/Source/ui_js/CMakeLists.txt
++++ b/Source/ui_js/CMakeLists.txt
+@@ -58,7 +58,7 @@ target_link_libraries(Play PUBLIC ${UI_JS_PROJECT_LIBS})
+ target_link_options(Play PRIVATE "--bind")
+ target_link_options(Play PRIVATE "-sMODULARIZE=1")
+ target_link_options(Play PRIVATE "-sEXPORT_ES6=1")
+-target_link_options(Play PRIVATE "-sEXPORTED_FUNCTIONS=['_main', '_initVm', '_EmptyBlockHandler', '_Cop0_TLBRead', '_Cop0_TLBWrite', '_Cop0_TLBProbe', '_TLBException_SetPC', '_HandleTLBException', '_TLBExceptionChecker_Proxy', '_MemoryUtils_GetByteProxy', '_MemoryUtils_GetHalfProxy', '_MemoryUtils_GetWordProxy', '_MemoryUtils_GetDoubleProxy', '_MemoryUtils_SetByteProxy', '_MemoryUtils_SetHalfProxy', '_MemoryUtils_SetWordProxy', '_MemoryUtils_SetDoubleProxy', '_LWL_Proxy', '_LWR_Proxy', '_LDL_Proxy', '_LDR_Proxy', '_SWL_Proxy', '_SWR_Proxy', '_SDL_Proxy', '_SDR_Proxy']")
++target_link_options(Play PRIVATE "-sEXPORTED_FUNCTIONS=['_main', '_initVm', '_FpAddTruncate', '_EmptyBlockHandler', '_Cop0_TLBRead', '_Cop0_TLBWrite', '_Cop0_TLBProbe', '_TLBException_SetPC', '_HandleTLBException', '_TLBExceptionChecker_Proxy', '_MemoryUtils_GetByteProxy', '_MemoryUtils_GetHalfProxy', '_MemoryUtils_GetWordProxy', '_MemoryUtils_GetDoubleProxy', '_MemoryUtils_SetByteProxy', '_MemoryUtils_SetHalfProxy', '_MemoryUtils_SetWordProxy', '_MemoryUtils_SetDoubleProxy', '_LWL_Proxy', '_LWR_Proxy', '_LDL_Proxy', '_LDR_Proxy', '_SWL_Proxy', '_SWR_Proxy', '_SDL_Proxy', '_SDR_Proxy']")
+ target_link_options(Play PRIVATE "-sEXPORTED_RUNTIME_METHODS=['ccall', 'FS', 'HEAPU8', 'GL', 'AL']")
+ target_link_options(Play PRIVATE "-sFORCE_FILESYSTEM")
+ target_link_options(Play PRIVATE "-sALLOW_TABLE_GROWTH")
+diff --git a/Source/ui_js/Ps2VmJs.cpp b/Source/ui_js/Ps2VmJs.cpp
+index 05ac7fcd..ec5f459a 100644
+--- a/Source/ui_js/Ps2VmJs.cpp
++++ b/Source/ui_js/Ps2VmJs.cpp
+@@ -7,6 +7,8 @@
+ #include "ee/EeExecutor.h"
+ #include "ee/VuExecutor.h"
+ 
++extern "C" uint32 FpAddTruncate(uint32, uint32);
++
+ extern "C" uint32 LWL_Proxy(uint32, uint32, CMIPS*);
+ extern "C" uint32 LWR_Proxy(uint32, uint32, CMIPS*);
+ extern "C" uint64 LDL_Proxy(uint32, uint64, CMIPS*);
+@@ -25,6 +27,7 @@ extern "C" uint32 TLBExceptionChecker_Proxy(CMIPS*, uint32, uint32);
+ 
+ void CPs2VmJs::CreateVM()
+ {
++	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&FpAddTruncate), "_FpAddTruncate", "iii");
+ 	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&Cop0_TLBRead), "_Cop0_TLBRead", "vi");
+ 	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&Cop0_TLBWrite), "_Cop0_TLBWrite", "vi");
+ 	Jitter::CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&Cop0_TLBProbe), "_Cop0_TLBProbe", "vi");
+-- 
+2.51.0.windows.1
+

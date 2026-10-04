@@ -1,0 +1,232 @@
+From 667940e85d3384a0251e49ed552cf277ed39b0da Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 15:31:49 -0400
+Subject: [PATCH 52/52] Specialize SPU2 register dispatch into direct read and
+ write calls
+
+---
+ Source/iop/Iop_Spu2.cpp      | 24 ++++++++++--------------
+ Source/iop/Iop_Spu2.h        | 13 ++-----------
+ Source/iop/Iop_Spu2_Core.cpp | 22 ++++++++++------------
+ Source/iop/Iop_Spu2_Core.h   | 14 ++------------
+ 4 files changed, 24 insertions(+), 49 deletions(-)
+
+diff --git a/Source/iop/Iop_Spu2.cpp b/Source/iop/Iop_Spu2.cpp
+index 5daa9f61..bc6e1bf3 100644
+--- a/Source/iop/Iop_Spu2.cpp
++++ b/Source/iop/Iop_Spu2.cpp
+@@ -2,7 +2,6 @@
+ #include "make_unique.h"
+ #include "Iop_Spu2.h"
+ #include "Log.h"
+-#include "placeholder_def.h"
+ #include "states/RegisterStateFile.h"
+ 
+ #define LOG_NAME ("iop_spu2")
+@@ -21,13 +20,6 @@ CSpu2::CSpu2(CSpuBase& spuBase0, CSpuBase& spuBase1)
+ 		m_core[i] = std::make_unique<CCore>(i, base);
+ 	}
+ 
+-	m_readDispatchInfo.global = std::bind(&CSpu2::ReadRegisterImpl, this, std::placeholders::_1, std::placeholders::_2);
+-	m_writeDispatchInfo.global = std::bind(&CSpu2::WriteRegisterImpl, this, std::placeholders::_1, std::placeholders::_2);
+-	for(unsigned int i = 0; i < CORE_NUM; i++)
+-	{
+-		m_readDispatchInfo.core[i] = std::bind(&CCore::ReadRegister, m_core[i].get(), std::placeholders::_1, std::placeholders::_2);
+-		m_writeDispatchInfo.core[i] = std::bind(&CCore::WriteRegister, m_core[i].get(), std::placeholders::_1, std::placeholders::_2);
+-	}
+ }
+ 
+ void CSpu2::Reset()
+@@ -81,30 +73,34 @@ CCore* CSpu2::GetCore(unsigned int coreId)
+ 
+ uint32 CSpu2::ReadRegister(uint32 address)
+ {
+-	return ProcessRegisterAccess(m_readDispatchInfo, address, 0);
++	return ProcessRegisterAccess<false>(address, 0);
+ }
+ 
+ uint32 CSpu2::WriteRegister(uint32 address, uint32 value)
+ {
+-	return ProcessRegisterAccess(m_writeDispatchInfo, address, value);
++	return ProcessRegisterAccess<true>(address, value);
+ }
+ 
+-uint32 CSpu2::ProcessRegisterAccess(const REGISTER_DISPATCH_INFO& dispatchInfo, uint32 address, uint32 value)
++template <bool write>
++uint32 CSpu2::ProcessRegisterAccess(uint32 address, uint32 value)
+ {
+ 	uint32 tmpAddress = address - REGS_BEGIN;
+ 	if(tmpAddress < 0x760)
+ 	{
+ 		unsigned int coreId = (tmpAddress & 0x400) ? 1 : 0;
+ 		address &= ~0x400;
+-		return dispatchInfo.core[coreId](address, value);
++		if constexpr(write) return m_core[coreId]->WriteRegister(address, value);
++		else return m_core[coreId]->ReadRegister(address, value);
+ 	}
+ 	else if(tmpAddress < 0x7B0)
+ 	{
+ 		unsigned int coreId = (tmpAddress - 0x760) / 40;
+ 		address -= coreId * 40;
+-		return dispatchInfo.core[coreId](address, value);
++		if constexpr(write) return m_core[coreId]->WriteRegister(address, value);
++		else return m_core[coreId]->ReadRegister(address, value);
+ 	}
+-	return dispatchInfo.global(address, value);
++	if constexpr(write) return WriteRegisterImpl(address, value);
++	else return ReadRegisterImpl(address, value);
+ }
+ 
+ uint32 CSpu2::ReadRegisterImpl(uint32 address, uint32 value)
+diff --git a/Source/iop/Iop_Spu2.h b/Source/iop/Iop_Spu2.h
+index 6c40457e..f225c48a 100644
+--- a/Source/iop/Iop_Spu2.h
++++ b/Source/iop/Iop_Spu2.h
+@@ -1,7 +1,6 @@
+ #ifndef _SPU2_H_
+ #define _SPU2_H_
+ 
+-#include <functional>
+ #include "Iop_Spu2_Core.h"
+ 
+ namespace Iop
+@@ -38,7 +37,6 @@ namespace Iop
+ 		};
+ 
+ 	private:
+-		typedef std::function<uint32(uint32, uint32)> RegisterAccessFunction;
+ 		typedef std::unique_ptr<Spu2::CCore> CorePtr;
+ 
+ 		enum
+@@ -46,20 +44,13 @@ namespace Iop
+ 			CORE_NUM = 2
+ 		};
+ 
+-		struct REGISTER_DISPATCH_INFO
+-		{
+-			RegisterAccessFunction global;
+-			RegisterAccessFunction core[2];
+-		};
+-
+-		uint32 ProcessRegisterAccess(const REGISTER_DISPATCH_INFO&, uint32, uint32);
++		template <bool write>
++		uint32 ProcessRegisterAccess(uint32, uint32);
+ 		uint32 ReadRegisterImpl(uint32, uint32);
+ 		uint32 WriteRegisterImpl(uint32, uint32);
+ 		void LogRead(uint32);
+ 		void LogWrite(uint32, uint32);
+ 
+-		REGISTER_DISPATCH_INFO m_readDispatchInfo;
+-		REGISTER_DISPATCH_INFO m_writeDispatchInfo;
+ 		CorePtr m_core[CORE_NUM];
+ 
+ 		uint32 m_spdifOutput = 0x0000;
+diff --git a/Source/iop/Iop_Spu2_Core.cpp b/Source/iop/Iop_Spu2_Core.cpp
+index 145d1510..c997fc85 100644
+--- a/Source/iop/Iop_Spu2_Core.cpp
++++ b/Source/iop/Iop_Spu2_Core.cpp
+@@ -59,12 +59,6 @@ CCore::CCore(unsigned int coreId, CSpuBase& spuBase)
+ {
+ 	m_logName = string_format(LOG_NAME_FORMAT, m_coreId);
+ 
+-	m_readDispatch.core = &CCore::ReadRegisterCore;
+-	m_readDispatch.channel = &CCore::ReadRegisterChannel;
+-
+-	m_writeDispatch.core = &CCore::WriteRegisterCore;
+-	m_writeDispatch.channel = &CCore::WriteRegisterChannel;
+-
+ 	Reset();
+ }
+ 
+@@ -114,34 +108,38 @@ uint32 CCore::SetAddressHi(uint32 address, uint16 value)
+ 
+ uint32 CCore::ReadRegister(uint32 address, uint32 value)
+ {
+-	return ProcessRegisterAccess(m_readDispatch, address, value);
++	return ProcessRegisterAccess<false>(address, value);
+ }
+ 
+ uint32 CCore::WriteRegister(uint32 address, uint32 value)
+ {
+-	return ProcessRegisterAccess(m_writeDispatch, address, value);
++	return ProcessRegisterAccess<true>(address, value);
+ }
+ 
+-uint32 CCore::ProcessRegisterAccess(const REGISTER_DISPATCH_INFO& dispatchInfo, uint32 address, uint32 value)
++template <bool write>
++uint32 CCore::ProcessRegisterAccess(uint32 address, uint32 value)
+ {
+ 	if(address < S_REG_BASE)
+ 	{
+ 		//Channel access
+ 		unsigned int channelId = (address >> 4) & 0x3F;
+ 		address &= ~(0x3F << 4);
+-		return ((this)->*(dispatchInfo.channel))(channelId, address, value);
++		if constexpr(write) return WriteRegisterChannel(channelId, address, value);
++		else return ReadRegisterChannel(channelId, address, value);
+ 	}
+ 	else if(address >= VA_REG_BASE && address < R_REG_BASE)
+ 	{
+ 		//Channel access
+ 		unsigned int channelId = (address - VA_REG_BASE) / 12;
+ 		address -= channelId * 12;
+-		return ((this)->*(dispatchInfo.channel))(channelId, address, value);
++		if constexpr(write) return WriteRegisterChannel(channelId, address, value);
++		else return ReadRegisterChannel(channelId, address, value);
+ 	}
+ 	else
+ 	{
+ 		//Core write
+-		return ((this)->*(dispatchInfo.core))(0, address, value);
++		if constexpr(write) return WriteRegisterCore(0, address, value);
++		else return ReadRegisterCore(0, address, value);
+ 	}
+ }
+ 
+diff --git a/Source/iop/Iop_Spu2_Core.h b/Source/iop/Iop_Spu2_Core.h
+index cf763f54..9e6add89 100644
+--- a/Source/iop/Iop_Spu2_Core.h
++++ b/Source/iop/Iop_Spu2_Core.h
+@@ -1,7 +1,6 @@
+ #pragma once
+ 
+ #include <string>
+-#include <functional>
+ #include "Types.h"
+ #include "Iop_SpuBase.h"
+ 
+@@ -97,20 +96,13 @@ namespace Iop
+ 			};
+ 
+ 		private:
+-			typedef uint32 (CCore::*RegisterAccessFunction)(unsigned int, uint32, uint32);
+-
+ 			enum
+ 			{
+ 				MAX_CHANNEL = 24,
+ 			};
+ 
+-			struct REGISTER_DISPATCH_INFO
+-			{
+-				RegisterAccessFunction core;
+-				RegisterAccessFunction channel;
+-			};
+-
+-			uint32 ProcessRegisterAccess(const REGISTER_DISPATCH_INFO&, uint32, uint32);
++			template <bool write>
++			uint32 ProcessRegisterAccess(uint32, uint32);
+ 
+ 			uint32 ReadRegisterCore(unsigned int, uint32, uint32);
+ 			uint32 WriteRegisterCore(unsigned int, uint32, uint32);
+@@ -128,8 +120,6 @@ namespace Iop
+ 			uint32 SetAddressLo(uint32, uint16);
+ 			uint32 SetAddressHi(uint32, uint16);
+ 
+-			REGISTER_DISPATCH_INFO m_readDispatch;
+-			REGISTER_DISPATCH_INFO m_writeDispatch;
+ 			unsigned int m_coreId;
+ 			std::string m_logName;
+ 			uint32 m_baseSamplingRate = 0;
+-- 
+2.51.0.windows.1
+

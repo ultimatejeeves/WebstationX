@@ -1,0 +1,43 @@
+From d7c0db65ea1e32126e056214954f5beb6edcc598 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 22:24:02 -0400
+Subject: [PATCH 5/6] Wasm: account for multibyte local counts in function body
+ lengths
+
+---
+ src/WasmModuleBuilder.cpp | 18 ++++++++----------
+ 1 file changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/src/WasmModuleBuilder.cpp b/src/WasmModuleBuilder.cpp
+index 2549a6c..d03a950 100644
+--- a/src/WasmModuleBuilder.cpp
++++ b/src/WasmModuleBuilder.cpp
+@@ -184,17 +184,15 @@ void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
+ 	{
+ 		const auto& function = m_functions[0];
+ 
+-		assert(function.localI32Count < 0x80);
+-		assert(function.localI64Count < 0x80);
+-		assert(function.localF32Count < 0x80);
+-		assert(function.localV128Count < 0x80);
+-
++		//Big blocks (VU1 microprograms) can have 128 locals or more of a type: the count takes 2 LEB bytes then
+ 		uint32 localDeclCount = 0;
+-		if(function.localI32Count != 0) localDeclCount++;
+-		if(function.localI64Count != 0) localDeclCount++;
+-		if(function.localF32Count != 0) localDeclCount++;
+-		if(function.localV128Count != 0) localDeclCount++;
+-		uint32 localDeclSize = (localDeclCount * 2) + 1;
++		uint32 localDeclSize = 1;
++		for(uint32 localCount : {function.localI32Count, function.localI64Count, function.localF32Count, function.localV128Count})
++		{
++			if(localCount == 0) continue;
++			localDeclCount++;
++			localDeclSize += GetULeb128Size(localCount) + 1;
++		}
+ 		uint32 functionBodySize = function.code.size() + localDeclSize;
+ 
+ 		uint32 sectionSize =
+-- 
+2.51.0.windows.1
+

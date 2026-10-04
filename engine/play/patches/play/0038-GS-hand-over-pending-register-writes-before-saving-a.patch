@@ -1,0 +1,147 @@
+From 231a3dd0409da201c878cf84172c10b25b3b123b Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 15:31:17 -0400
+Subject: [PATCH 38/43] GS: hand over pending register writes before saving a
+ state, drop them before loading one; pipeline state dump
+
+---
+ Source/ee/Vpu1Thread.cpp            | 10 ++++++++++
+ Source/ee/Vpu1Thread.h              |  3 +++
+ Source/gs/GSH_OpenGL/GSH_OpenGL.cpp |  2 ++
+ Source/gs/GSHandler.cpp             |  9 +++++++++
+ Source/ui_js/Main.cpp               | 23 +++++++++++++++++++++++
+ 5 files changed, 47 insertions(+)
+
+diff --git a/Source/ee/Vpu1Thread.cpp b/Source/ee/Vpu1Thread.cpp
+index 43bebb16..75b4b1c5 100644
+--- a/Source/ee/Vpu1Thread.cpp
++++ b/Source/ee/Vpu1Thread.cpp
+@@ -424,6 +424,16 @@ void CVpu1Thread::Kick()
+ 	AfterSend();
+ }
+ 
++std::string CVpu1Thread::DebugState() const
++{
++	char text[256];
++	snprintf(text, sizeof(text), "{\"sent\":%llu,\"completed\":%llu,\"parked\":%d,\"parkedSent\":%llu,\"kicks\":%llu,\"parkedKicks\":%llu,\"pendingIrq\":%u,\"vif1DmaSent\":%llu,\"vif1DmaDone\":%llu,\"vblanksSent\":%llu,\"vblanksDone\":%llu}",
++	         (unsigned long long)m_sent.load(), (unsigned long long)m_completed.load(), m_parked.load() ? 1 : 0, (unsigned long long)m_parkedSent.load(),
++	         (unsigned long long)m_kicks.load(), (unsigned long long)m_parkedKicks.load(), m_pendingInterrupts.load(),
++	         (unsigned long long)m_vif1DmaSent, (unsigned long long)m_vif1DmaDone.load(), (unsigned long long)m_vblanksSent.load(), (unsigned long long)m_vblanksDone.load());
++	return text;
++}
++
+ void CVpu1Thread::PostInterrupt(uint32 line)
+ {
+ 	m_pendingInterrupts.fetch_or(1 << line);
+diff --git a/Source/ee/Vpu1Thread.h b/Source/ee/Vpu1Thread.h
+index 864dc43c..2fbbccd7 100644
+--- a/Source/ee/Vpu1Thread.h
++++ b/Source/ee/Vpu1Thread.h
+@@ -6,6 +6,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <thread>
++#include <string>
+ #include "Types.h"
+ 
+ class CVpu;
+@@ -131,6 +132,8 @@ public:
+ 
+ 	//EE thread: interrupts raised since the last call (async mode delivers them from CountTicks).
+ 	uint32 TakeInterrupts();
++	//Debug: queue and park state (racy reads, for a stall report)
++	std::string DebugState() const;
+ 	bool HasPendingInterrupts() const
+ 	{
+ 		return m_pendingInterrupts.load(std::memory_order_relaxed) != 0;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index a696213a..abfe8945 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -321,6 +321,8 @@ void CGSH_OpenGL::LoadState(Framework::CZipArchiveReader& archive)
+ 	SendGSCall(
+ 	    [this]() {
+ 		    m_textureCache.InvalidateRange(0, RAMSIZE);
++		    if(m_swRaster) m_swRaster->InvalidateTextures();
++		    m_ctxDirty = true;
+ 	    });
+ }
+ 
+diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
+index f72021d7..6cf5e25e 100644
+--- a/Source/gs/GSHandler.cpp
++++ b/Source/gs/GSHandler.cpp
+@@ -287,6 +287,9 @@ CGSHandler::PRESENTATION_VIEWPORT CGSHandler::GetPresentationViewport() const
+ 
+ void CGSHandler::SaveState(Framework::CZipArchiveWriter& archive)
+ {
++	//Register writes still waiting to be handed to the GS thread are part of the machine being saved
++	//(a state can be captured in the middle of a frame when the VPU1 thread feeds the GS)
++	SubmitWriteBuffer();
+ 	SendGSCall([&]() { SyncMemoryCache(); }, true);
+ 
+ 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_RAM, GetRam(), RAMSIZE));
+@@ -316,6 +319,12 @@ void CGSHandler::SaveState(Framework::CZipArchiveWriter& archive)
+ 
+ void CGSHandler::LoadState(Framework::CZipArchiveReader& archive)
+ {
++	//What the replaced machine wrote but didn't hand over yet isn't for this one (it would be drawn into the
++	//loaded frame later), and the GS thread finishes what it was handed before its memory is replaced
++	m_writeBufferSize = m_writeBufferSubmitIndex;
++	m_writeBufferProcessIndex = m_writeBufferSubmitIndex;
++	SendGSCall([]() {}, true);
++
+ 	archive.BeginReadFile(STATE_RAM)->Read(GetRam(), RAMSIZE);
+ 	archive.BeginReadFile(STATE_REGS)->Read(m_nReg, sizeof(uint64) * CGSHandler::REGISTER_MAX);
+ 	archive.BeginReadFile(STATE_TRXCTX)->Read(&m_trxCtx, sizeof(TRXCONTEXT));
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 52a574ce..ce6a146f 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -19,6 +19,7 @@
+ #include "ee/Ee_SubSystem.h"
+ #include "iop/Iop_SubSystem.h"
+ #include "ee/Vpu1Thread.h"
++#include "ee/Vif.h"
+ #include "ee/EeExecutor.h"
+ #include "ee/EeBasicBlock.h"
+ #include "ee/VuExecutor.h"
+@@ -641,6 +642,27 @@ void setVpu1SpinCount(int count)
+ 	CVpu1Thread::g_spinCount = static_cast<uint32>(std::max(count, 0));
+ }
+ 
++// Debug: what the vector pipeline is waiting on (registers read without stopping anything), for stall reports.
++std::string getPipelineState()
++{
++	auto& ee = *g_virtualMachine->m_ee;
++	auto& vif1 = ee.m_vpu1->GetVif();
++	char text[512];
++	snprintf(text, sizeof(text), "{\"vif1Stat\":%u,\"vif1Err\":%u,\"vif1Mark\":%u,\"vif1IrqScheduled\":%d,\"gifStat\":%u,\"d1Chcr\":%u,\"d1Qwc\":%u,\"d1Tadr\":%u,\"d2Chcr\":%u,\"dStat\":%u,\"intcStat\":%u,\"intcMask\":%u,\"eeStatus\":%u,\"eePc\":%u}",
++	         vif1.GetRegister(CVif::VIF1_STAT), vif1.GetRegister(CVif::VIF1_ERR), vif1.GetRegister(CVif::VIF1_MARK), vif1.IsInterruptScheduled() ? 1 : 0,
++	         ee.m_gif.GetRegister(CGIF::GIF_STAT),
++	         ee.m_dmac.GetRegister(0x10009000), ee.m_dmac.GetRegister(0x10009020), ee.m_dmac.GetRegister(0x10009030), ee.m_dmac.GetRegister(0x1000A000),
++	         ee.m_dmac.GetRegister(0x1000E010), ee.m_intc.GetRegister(0x1000F000), ee.m_intc.GetRegister(0x1000F010),
++	         ee.m_EE.m_State.nCOP0[12], ee.m_EE.m_State.nPC);
++	std::string result = text;
++	if(ee.m_vpu1Thread)
++	{
++		result.pop_back();
++		result += ",\"thread\":" + ee.m_vpu1Thread->DebugState() + "}";
++	}
++	return result;
++}
++
+ std::string getVpu1Stats()
+ {
+ 	auto& stats = CVpu1Thread::g_stats;
+@@ -686,6 +708,7 @@ EMSCRIPTEN_BINDINGS(Play)
+ 	function("getVpu1ZoneAddress", &getVpu1ZoneAddress);
+ 	function("setVpu1ThreadMode", &setVpu1ThreadMode);
+ 	function("getVpu1Stats", &getVpu1Stats);
++	function("getPipelineState", &getPipelineState);
+ 	function("setVpu1SpinCount", &setVpu1SpinCount);
+ 	function("getGsStats", &getGsStats);
+ 	function("debugRequestEeBlockDump", &debugRequestEeBlockDump);
+-- 
+2.51.0.windows.1
+

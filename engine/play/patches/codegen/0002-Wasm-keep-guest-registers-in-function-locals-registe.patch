@@ -1,0 +1,288 @@
+From 93df35f686e0234f7e6d51b556c918e03e04c52a Mon Sep 17 00:00:00 2001
+From: wsx <wsx@localhost>
+Date: Tue, 29 Sep 2026 21:41:17 -0400
+Subject: [PATCH 2/6] Wasm: keep guest registers in function locals (register
+ allocation onto temporaries)
+
+---
+ include/Jitter.h                |  1 +
+ include/Jitter_CodeGen.h        |  6 ++++
+ include/Jitter_CodeGen_Wasm.h   |  3 ++
+ include/WasmDefs.h              |  2 ++
+ src/Jitter_CodeGen_Wasm.cpp     | 15 +++++++++
+ src/Jitter_CodeGen_Wasm_Fpu.cpp | 54 ++++++++++++++++++++++++---------
+ src/Jitter_RegAlloc.cpp         | 49 +++++++++++++++++++++++++++++-
+ 7 files changed, 114 insertions(+), 16 deletions(-)
+
+diff --git a/include/Jitter.h b/include/Jitter.h
+index 167dc00..38733c1 100644
+--- a/include/Jitter.h
++++ b/include/Jitter.h
+@@ -365,6 +365,7 @@ namespace Jitter
+ 		void ComputeLivenessForRange(const BASIC_BLOCK&, const AllocationRange&, SymbolRegAllocInfo&) const;
+ 		void MarkAliasedSymbols(const BASIC_BLOCK&, const AllocationRange&, SymbolRegAllocInfo&) const;
+ 		void AssociateSymbolsToRegisters(SymbolRegAllocInfo&) const;
++		void AssociateSymbolsToLocals(SymbolRegAllocInfo&);
+ 
+ 		void NormalizeStatements(BASIC_BLOCK&);
+ 		unsigned int AllocateStack(BASIC_BLOCK&);
+diff --git a/include/Jitter_CodeGen.h b/include/Jitter_CodeGen.h
+index 79e5ab9..02c0457 100644
+--- a/include/Jitter_CodeGen.h
++++ b/include/Jitter_CodeGen.h
+@@ -33,6 +33,12 @@ namespace Jitter
+ 		virtual bool CanHold128BitsReturnValueInRegisters() const = 0;
+ 		virtual bool SupportsExternalJumps() const = 0;
+ 		virtual bool SupportsCmpSelect() const = 0;
++		//Targets without a fixed register file (WebAssembly) get every allocatable symbol a temporary
++		//of its own instead of a machine register (see CJitter::AssociateSymbolsToLocals).
++		virtual bool UsesLocalsAsRegisters() const
++		{
++			return false;
++		}
+ 		virtual void RegisterExternalSymbols(CObjectFile*) const = 0;
+ 		virtual uint32 GetPointerSize() const = 0;
+ 
+diff --git a/include/Jitter_CodeGen_Wasm.h b/include/Jitter_CodeGen_Wasm.h
+index 2fa7855..104448a 100644
+--- a/include/Jitter_CodeGen_Wasm.h
++++ b/include/Jitter_CodeGen_Wasm.h
+@@ -39,6 +39,7 @@ namespace Jitter
+ 		bool CanHold128BitsReturnValueInRegisters() const override;
+ 		bool SupportsExternalJumps() const override;
+ 		bool SupportsCmpSelect() const override;
++		bool UsesLocalsAsRegisters() const override;
+ 		uint32 GetPointerSize() const override;
+ 
+ 	private:
+@@ -119,6 +120,7 @@ namespace Jitter
+ 		void Emit_Break(const STATEMENT&);
+ 
+ 		void Emit_Mov_VarAny(const STATEMENT&);
++		void Emit_Mov_TmpRefRelRef(const STATEMENT&);
+ 
+ 		void Emit_RelToRef_VarCst(const STATEMENT&);
+ 
+@@ -196,6 +198,7 @@ namespace Jitter
+ 		void Emit_Fp_Rcpl_MemMem(const STATEMENT&);
+ 		void Emit_Fp_Rsqrt_MemMem(const STATEMENT&);
+ 		void Emit_Fp_Clamp_MemMem(const STATEMENT&);
++		void Emit_Fpu_Mov_MemMem(const STATEMENT&);
+ 		void Emit_Fp_ToSingleI32_MemMem(const STATEMENT&);
+ 		void Emit_Fp_ToInt32TruncS_MemMem(const STATEMENT&);
+ 		void Emit_Fp_LdCst_TmpCst(const STATEMENT&);
+diff --git a/include/WasmDefs.h b/include/WasmDefs.h
+index caceb44..6c0b181 100644
+--- a/include/WasmDefs.h
++++ b/include/WasmDefs.h
+@@ -160,6 +160,8 @@ namespace Wasm
+ 		INST_F32_DEMOTE_F64 = 0xB6,
+ 		INST_F64_CONVERT_I64_S = 0xB9,
+ 		INST_F64_PROMOTE_F32 = 0xBB,
++		INST_I32_REINTERPRET_F32 = 0xBC,
++		INST_F32_REINTERPRET_I32 = 0xBE,
+ 		INST_I32x4_TRUNC_SAT_F32x4_S = 0xF8,
+ 		INST_F32x4_CONVERT_I32x4_S = 0xFA
+ 	};
+diff --git a/src/Jitter_CodeGen_Wasm.cpp b/src/Jitter_CodeGen_Wasm.cpp
+index 324b3db..a7897cc 100644
+--- a/src/Jitter_CodeGen_Wasm.cpp
++++ b/src/Jitter_CodeGen_Wasm.cpp
+@@ -93,6 +93,7 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
+ 	{ OP_BREAK,          MATCH_NIL,            MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Break                                  },
+ 
+ 	{ OP_MOV,            MATCH_VARIABLE,       MATCH_ANY,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Mov_VarAny                             },
++	{ OP_MOV,            MATCH_TMP_REF,        MATCH_REL_REF,        MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Mov_TmpRefRelRef                       },
+ 
+ 	{ OP_RELTOREF,       MATCH_VAR_REF,        MATCH_CONSTANT,       MATCH_ANY,           MATCH_NIL,      &CCodeGen_Wasm::Emit_RelToRef_VarCst                        },
+ 
+@@ -366,6 +367,11 @@ bool CCodeGen_Wasm::SupportsCmpSelect() const
+ 	return false;
+ }
+ 
++bool CCodeGen_Wasm::UsesLocalsAsRegisters() const
++{
++	return true;
++}
++
+ uint32 CCodeGen_Wasm::GetPointerSize() const
+ {
+ 	return 4;
+@@ -928,6 +934,15 @@ void CCodeGen_Wasm::Emit_Break(const STATEMENT& statement)
+ 	m_functionStream.Write8(Wasm::INST_UNREACHABLE);
+ }
+ 
++void CCodeGen_Wasm::Emit_Mov_TmpRefRelRef(const STATEMENT& statement)
++{
++	auto dst = statement.dst->GetSymbol().get();
++	auto src1 = statement.src1->GetSymbol().get();
++
++	PushRelativeRef(src1);
++	PullTemporaryRef(dst);
++}
++
+ void CCodeGen_Wasm::Emit_Mov_VarAny(const STATEMENT& statement)
+ {
+ 	auto dst = statement.dst->GetSymbol().get();
+diff --git a/src/Jitter_CodeGen_Wasm_Fpu.cpp b/src/Jitter_CodeGen_Wasm_Fpu.cpp
+index 60e1b6b..23a4fd6 100644
+--- a/src/Jitter_CodeGen_Wasm_Fpu.cpp
++++ b/src/Jitter_CodeGen_Wasm_Fpu.cpp
+@@ -176,20 +176,36 @@ void CCodeGen_Wasm::Emit_Fp_Clamp_MemMem(const STATEMENT& statement)
+ 	CommitSymbol(dst);
+ }
+ 
+-void CCodeGen_Wasm::Emit_Fp_ToSingleI32_MemMem(const STATEMENT& statement)
++void CCodeGen_Wasm::Emit_Fpu_Mov_MemMem(const STATEMENT& statement)
+ {
+ 	auto dst = statement.dst->GetSymbol().get();
+ 	auto src1 = statement.src1->GetSymbol().get();
+ 
+-	assert(src1->m_type == SYM_FP_RELATIVE32);
++	PrepareSymbolDef(dst);
++	PrepareSymbolUse(src1);
++	CommitSymbol(dst);
++}
++
++void CCodeGen_Wasm::Emit_Fp_ToSingleI32_MemMem(const STATEMENT& statement)
++{
++	auto dst = statement.dst->GetSymbol().get();
++	auto src1 = statement.src1->GetSymbol().get();
+ 
+ 	PrepareSymbolDef(dst);
+ 
+-	//Can't use PrepareSymbolUse here because src1 is a f32 and we need an i32
+-	PushRelativeAddress(src1);
+-	m_functionStream.Write8(Wasm::INST_I32_LOAD);
+-	m_functionStream.Write8(0x02);
+-	m_functionStream.Write8(0x00);
++	//src1 holds an integer: take its bits as an i32
++	if(src1->m_type == SYM_FP_RELATIVE32)
++	{
++		PushRelativeAddress(src1);
++		m_functionStream.Write8(Wasm::INST_I32_LOAD);
++		m_functionStream.Write8(0x02);
++		m_functionStream.Write8(0x00);
++	}
++	else
++	{
++		PushTemporaryFp32(src1);
++		m_functionStream.Write8(Wasm::INST_I32_REINTERPRET_F32);
++	}
+ 
+ 	m_functionStream.Write8(Wasm::INST_F32_CONVERT_I32_S);
+ 
+@@ -201,18 +217,24 @@ void CCodeGen_Wasm::Emit_Fp_ToInt32TruncS_MemMem(const STATEMENT& statement)
+ 	auto dst = statement.dst->GetSymbol().get();
+ 	auto src1 = statement.src1->GetSymbol().get();
+ 
+-	assert(dst->m_type == SYM_FP_RELATIVE32);
+-
+ 	PrepareSymbolDef(dst);
+ 	PrepareSymbolUse(src1);
+ 
+ 	m_functionStream.Write8(Wasm::INST_PREFIX_FC);
+ 	m_functionStream.Write8(Wasm::INST_I32_TRUNC_SAT_F32_S);
+ 
+-	//Can't use CommitSymbol here since we got a i32 on the stack and our dst symbol is a f32.
+-	m_functionStream.Write8(Wasm::INST_I32_STORE);
+-	m_functionStream.Write8(0x02);
+-	m_functionStream.Write8(0x00);
++	//dst receives the integer's bits
++	if(dst->m_type == SYM_FP_RELATIVE32)
++	{
++		m_functionStream.Write8(Wasm::INST_I32_STORE);
++		m_functionStream.Write8(0x02);
++		m_functionStream.Write8(0x00);
++	}
++	else
++	{
++		m_functionStream.Write8(Wasm::INST_F32_REINTERPRET_I32);
++		PullTemporaryFp32(dst);
++	}
+ }
+ 
+ void CCodeGen_Wasm::Emit_Fp_LdCst_TmpCst(const STATEMENT& statement)
+@@ -258,8 +280,10 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_fpuConstMatchers[] =
+ 	{ OP_FP_ABS_S,           MATCH_FP_MEMORY32,      MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fpu_MemMem<Wasm::INST_F32_ABS>          },
+ 	{ OP_FP_NEG_S,           MATCH_FP_MEMORY32,      MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fpu_MemMem<Wasm::INST_F32_NEG>          },
+ 
+-	{ OP_FP_TOSINGLE_I32,    MATCH_FP_MEMORY32,      MATCH_FP_RELATIVE32, MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_ToSingleI32_MemMem                   },
+-	{ OP_FP_TOINT32_TRUNC_S, MATCH_FP_RELATIVE32,    MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_ToInt32TruncS_MemMem                 },
++	{ OP_FP_TOSINGLE_I32,    MATCH_FP_MEMORY32,      MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_ToSingleI32_MemMem                   },
++	{ OP_FP_TOINT32_TRUNC_S, MATCH_FP_MEMORY32,      MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_ToInt32TruncS_MemMem                 },
++
++	{ OP_MOV,                MATCH_FP_MEMORY32,      MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fpu_Mov_MemMem                          },
+ 
+ 	{ OP_FP_LDCST,           MATCH_FP_TEMPORARY32,   MATCH_CONSTANT,      MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_LdCst_TmpCst                         },
+ 
+diff --git a/src/Jitter_RegAlloc.cpp b/src/Jitter_RegAlloc.cpp
+index b416ed6..9d7184b 100644
+--- a/src/Jitter_RegAlloc.cpp
++++ b/src/Jitter_RegAlloc.cpp
+@@ -42,7 +42,14 @@ void CJitter::AllocateRegisters(BASIC_BLOCK& basicBlock)
+ 
+ 		MarkAliasedSymbols(basicBlock, allocRange, symbolRegAllocs);
+ 
+-		AssociateSymbolsToRegisters(symbolRegAllocs);
++		if(m_codeGen->UsesLocalsAsRegisters())
++		{
++			AssociateSymbolsToLocals(symbolRegAllocs);
++		}
++		else
++		{
++			AssociateSymbolsToRegisters(symbolRegAllocs);
++		}
+ 
+ 		//Replace all references to symbols by references to allocated registers
+ 		for(const auto& statementInfo : IndexedStatementList(basicBlock.statements))
+@@ -287,6 +294,46 @@ void CJitter::AssociateSymbolsToRegisters(SymbolRegAllocInfo& symbolRegAllocs) c
+ 	}
+ }
+ 
++void CJitter::AssociateSymbolsToLocals(SymbolRegAllocInfo& symbolRegAllocs)
++{
++	//WebAssembly has no register file to run out of: a function's locals are the registers, and the
++	//engine allocates machine registers for them. Every relative symbol used more than once in the range
++	//gets a temporary (a local) of its own, loaded at the start of the range and written back at its end
++	//like a register would be, so guest registers stop going through linear memory at every use.
++	for(auto& symbolRegAllocPair : symbolRegAllocs)
++	{
++		const auto& symbol = symbolRegAllocPair.first;
++		auto& symbolRegAlloc = symbolRegAllocPair.second;
++		if(symbolRegAlloc.aliased) continue;
++		if(symbolRegAlloc.useCount < 2) continue;
++		SYM_TYPE localType = SYM_TEMPORARY;
++		switch(symbol->m_type)
++		{
++		case SYM_RELATIVE:
++			localType = SYM_TEMPORARY;
++			break;
++		case SYM_RELATIVE64:
++			localType = SYM_TEMPORARY64;
++			break;
++		case SYM_FP_RELATIVE32:
++			localType = SYM_FP_TEMPORARY32;
++			break;
++		case SYM_RELATIVE128:
++			localType = SYM_TEMPORARY128;
++			break;
++		case SYM_REL_REFERENCE:
++			//References are only read by generated code (there is no emitter to write one back)
++			if(symbolRegAlloc.firstDef != -1) continue;
++			localType = SYM_TMP_REFERENCE;
++			break;
++		default:
++			continue;
++		}
++		symbolRegAlloc.registerType = localType;
++		symbolRegAlloc.registerId = m_nextTemporary++;
++	}
++}
++
+ CJitter::AllocationRangeArray CJitter::ComputeAllocationRanges(const BASIC_BLOCK& basicBlock)
+ {
+ 	AllocationRangeArray result;
+-- 
+2.51.0.windows.1
+

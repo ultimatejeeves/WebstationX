@@ -1,0 +1,22 @@
+services:
+  webstationx:
+    build: .
+    image: webstationx:local
+    container_name: webstationx
+    restart: unless-stopped
+    ports:
+      - "${WSX_LISTEN_ADDRESS:-127.0.0.1}:${WSX_PORT:-8090}:8090"
+    environment:
+      WSX_PORT: "8090"
+      WSX_TRUST_PROXY: "${WSX_TRUST_PROXY:-0}"
+    volumes:
+      - ./Games:/app/Games
+      - ./library:/app/library:ro
+      - ./bios:/app/bios:ro
+      - wsx-data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  wsx-data:
