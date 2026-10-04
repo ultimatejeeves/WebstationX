@@ -19,13 +19,18 @@ cmake --build "$BUILD" --target PlayCore > "$OUT/build.log" 2>&1 || { tail -60 "
 EXPORTS="['_main'$(sed -n 's/.*RegisterFunction.*"\(_[^"]*\)".*/,"\1"/p' "$SRC/Source/ui_js/Ps2VmJs.cpp" | tr -d '\r\n')]"
 mapfile -t LIBS < <(find "$BUILD/Source/ui_js/Source" -name '*.a')
 SOURCES=("$ROOT/engine/play/tests/$SUITE-test.cpp")
+DEFINES=()
+if [ "$SUITE" = spu2-state ]; then
+  # Match the hosted IOP subsystem's class layouts.
+  DEFINES+=(-D_IOP_EMULATE_MODULES=1)
+fi
 if [ "$SUITE" = vu ]; then
   SOURCES=("$ROOT/engine/play/tests/vu-test.cpp")
   while IFS= read -r file; do SOURCES+=("$file"); done < <(find "$SRC/tools/VuTest" -name '*.cpp' ! -name Main.cpp)
 fi
 em++ -O2 --profiling-funcs -std=c++17 -pthread -msimd128 -fwasm-exceptions --bind \
   -I"$SRC/Source" -I"$SRC/deps/Framework/include" -I"$SRC/deps/CodeGen/include" -I"$OUT" -I"$SRC/tools/VuTest" -I"$SRC/Source/app_shared" \
-  "${SOURCES[@]}" \
+  "${DEFINES[@]}" "${SOURCES[@]}" \
   -Wl,--start-group "${LIBS[@]}" -Wl,--end-group \
   -sALLOW_TABLE_GROWTH -sALLOW_MEMORY_GROWTH -sENVIRONMENT=node -sSTACK_SIZE=8388608 \
   -sEXPORTED_FUNCTIONS="$EXPORTS" -o "$OUT/$SUITE-test.cjs"

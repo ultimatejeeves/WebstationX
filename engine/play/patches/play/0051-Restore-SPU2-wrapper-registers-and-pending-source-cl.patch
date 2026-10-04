@@ -1,0 +1,190 @@
+From 76fbc829519ebf8181c38f6a8ba9167d702bc466 Mon Sep 17 00:00:00 2001
+From: ultimatejeeves <ultimatejeeves@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 15:28:15 -0400
+Subject: [PATCH 51/52] Restore SPU2 wrapper registers and pending source
+ clocks
+
+---
+ Source/iop/Iop_Spu2.cpp      | 36 ++++++++++++++++++++++++++++++++++++
+ Source/iop/Iop_Spu2.h        |  2 ++
+ Source/iop/Iop_Spu2_Core.cpp |  5 +++++
+ Source/iop/Iop_Spu2_Core.h   |  1 +
+ Source/iop/Iop_SpuBase.cpp   |  7 ++++++-
+ Source/iop/Iop_SpuBase.h     |  3 ++-
+ Source/iop/Iop_SubSystem.cpp |  2 ++
+ 7 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/Source/iop/Iop_Spu2.cpp b/Source/iop/Iop_Spu2.cpp
+index b7d0040f..5daa9f61 100644
+--- a/Source/iop/Iop_Spu2.cpp
++++ b/Source/iop/Iop_Spu2.cpp
+@@ -3,10 +3,12 @@
+ #include "Iop_Spu2.h"
+ #include "Log.h"
+ #include "placeholder_def.h"
++#include "states/RegisterStateFile.h"
+ 
+ #define LOG_NAME ("iop_spu2")
+ 
+ #define SPDIF_OUT_BYPASS 0x0100
++#define STATE_REGS_PATH "iop_spu/spu2.xml"
+ 
+ using namespace Iop;
+ using namespace Iop::Spu2;
+@@ -30,12 +32,46 @@ CSpu2::CSpu2(CSpuBase& spuBase0, CSpuBase& spuBase1)
+ 
+ void CSpu2::Reset()
+ {
++	m_spdifOutput = 0;
++	m_spdifMode = 0;
++	m_spdifMedia = 0;
++	m_core[0]->GetSpuBase().SetInputBypass(false);
+ 	for(unsigned int i = 0; i < CORE_NUM; i++)
+ 	{
+ 		m_core[i]->Reset();
+ 	}
+ }
+ 
++void CSpu2::SaveState(Framework::CZipArchiveWriter& archive)
++{
++	auto state = std::make_unique<CRegisterStateFile>(STATE_REGS_PATH);
++	state->SetRegister32("SpdifOutput", m_spdifOutput);
++	state->SetRegister32("SpdifMode", m_spdifMode);
++	state->SetRegister32("SpdifMedia", m_spdifMedia);
++	state->SetRegister32("Core0BaseSamplingRate", m_core[0]->GetBaseSamplingRate());
++	state->SetRegister32("Core1BaseSamplingRate", m_core[1]->GetBaseSamplingRate());
++	archive.InsertFile(std::move(state));
++}
++
++void CSpu2::LoadState(Framework::CZipArchiveReader& archive)
++{
++	// Base cores must be restored first. Old archives only retained the bypass
++	// bit in their input state; all other omitted wrapper values use defaults.
++	m_spdifOutput = m_core[0]->GetSpuBase().GetInputBypass() ? SPDIF_OUT_BYPASS : 0;
++	m_spdifMode = 0;
++	m_spdifMedia = 0;
++	for(auto& core : m_core) core->Reset();
++	if(!archive.GetFileHeader(STATE_REGS_PATH)) return;
++	CRegisterStateFile state(*archive.BeginReadFile(STATE_REGS_PATH));
++	m_spdifOutput = state.GetRegister32("SpdifOutput");
++	m_spdifMode = state.GetRegister32("SpdifMode");
++	m_spdifMedia = state.GetRegister32("SpdifMedia");
++	m_core[0]->SetBaseSamplingRate(state.GetRegister32("Core0BaseSamplingRate"));
++	m_core[1]->SetBaseSamplingRate(state.GetRegister32("Core1BaseSamplingRate"));
++	// Do not replay register writes: CORE_ATTR would apply the pending clock,
++	// and the base cores have already restored their exact input-buffer state.
++}
++
+ CCore* CSpu2::GetCore(unsigned int coreId)
+ {
+ 	assert(coreId < CORE_NUM);
+diff --git a/Source/iop/Iop_Spu2.h b/Source/iop/Iop_Spu2.h
+index 08328894..6c40457e 100644
+--- a/Source/iop/Iop_Spu2.h
++++ b/Source/iop/Iop_Spu2.h
+@@ -19,6 +19,8 @@ namespace Iop
+ 		uint32 WriteRegister(uint32, uint32);
+ 
+ 		void Reset();
++		void SaveState(Framework::CZipArchiveWriter&);
++		void LoadState(Framework::CZipArchiveReader&);
+ 		Spu2::CCore* GetCore(unsigned int);
+ 
+ 		enum
+diff --git a/Source/iop/Iop_Spu2_Core.cpp b/Source/iop/Iop_Spu2_Core.cpp
+index 617a4b50..145d1510 100644
+--- a/Source/iop/Iop_Spu2_Core.cpp
++++ b/Source/iop/Iop_Spu2_Core.cpp
+@@ -78,6 +78,11 @@ void CCore::SetBaseSamplingRate(uint32 baseSamplingRate)
+ 	m_baseSamplingRate = baseSamplingRate;
+ }
+ 
++uint32 CCore::GetBaseSamplingRate() const
++{
++	return m_baseSamplingRate;
++}
++
+ CSpuBase& CCore::GetSpuBase() const
+ {
+ 	return m_spuBase;
+diff --git a/Source/iop/Iop_Spu2_Core.h b/Source/iop/Iop_Spu2_Core.h
+index 19e6a132..cf763f54 100644
+--- a/Source/iop/Iop_Spu2_Core.h
++++ b/Source/iop/Iop_Spu2_Core.h
+@@ -25,6 +25,7 @@ namespace Iop
+ 
+ 			void Reset();
+ 			void SetBaseSamplingRate(uint32);
++			uint32 GetBaseSamplingRate() const;
+ 
+ 			CSpuBase& GetSpuBase() const;
+ 
+diff --git a/Source/iop/Iop_SpuBase.cpp b/Source/iop/Iop_SpuBase.cpp
+index e72f8f61..62a2a29c 100644
+--- a/Source/iop/Iop_SpuBase.cpp
++++ b/Source/iop/Iop_SpuBase.cpp
+@@ -389,6 +389,11 @@ void CSpuBase::SetInputBypass(bool inputBypass)
+ 	m_blockReader.SetSpdifBypass(inputBypass);
+ }
+ 
++bool CSpuBase::GetInputBypass() const
++{
++	return m_blockReader.GetSpdifBypass();
++}
++
+ void CSpuBase::SetDestinationSamplingRate(uint32 samplingRate)
+ {
+ 	m_blockReader.SetDestinationSamplingRate(samplingRate);
+@@ -1596,7 +1601,7 @@ void CSpuBase::CBlockSampleReader::SetDestinationSamplingRate(uint32 dstSampling
+ 	UpdateSampleStep();
+ }
+ 
+-bool CSpuBase::CBlockSampleReader::GetSpdifBypass()
++bool CSpuBase::CBlockSampleReader::GetSpdifBypass() const
+ {
+ 	return m_spdifBypass;
+ }
+diff --git a/Source/iop/Iop_SpuBase.h b/Source/iop/Iop_SpuBase.h
+index 681718bd..71b5d0cf 100644
+--- a/Source/iop/Iop_SpuBase.h
++++ b/Source/iop/Iop_SpuBase.h
+@@ -221,6 +221,7 @@ namespace Iop
+ 
+ 		void SetBaseSamplingRate(uint32);
+ 		void SetInputBypass(bool);
++		bool GetInputBypass() const;
+ 		void SetDestinationSamplingRate(uint32);
+ 
+ 		bool GetIrqPending() const;
+@@ -367,7 +368,7 @@ namespace Iop
+ 			void LoadState(const CRegisterState&);
+ 			void SetBaseSamplingRate(uint32);
+ 			void SetDestinationSamplingRate(uint32);
+-			bool GetSpdifBypass();
++			bool GetSpdifBypass() const;
+ 			void SetSpdifBypass(bool);
+ 
+ 			bool CanReadSamples() const;
+diff --git a/Source/iop/Iop_SubSystem.cpp b/Source/iop/Iop_SubSystem.cpp
+index 2bf46e68..6d4d8c41 100644
+--- a/Source/iop/Iop_SubSystem.cpp
++++ b/Source/iop/Iop_SubSystem.cpp
+@@ -122,6 +122,7 @@ void CSubSystem::SaveState(Framework::CZipArchiveWriter& archive)
+ 	m_spuIrqWatcher.SaveState(archive);
+ 	m_spuCore0.SaveState(archive);
+ 	m_spuCore1.SaveState(archive);
++	m_spu2.SaveState(archive);
+ 	m_ilink.SaveState(archive);
+ #ifdef _IOP_EMULATE_MODULES
+ 	m_sio2.SaveState(archive);
+@@ -167,6 +168,7 @@ void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
+ 	m_spuIrqWatcher.LoadState(archive);
+ 	m_spuCore0.LoadState(archive, m_ps2Mode ? 48000 : 44100);
+ 	m_spuCore1.LoadState(archive, m_ps2Mode ? 48000 : 44100);
++	m_spu2.LoadState(archive);
+ 	m_ilink.LoadState(archive);
+ #ifdef _IOP_EMULATE_MODULES
+ 	m_sio2.LoadState(archive);
+-- 
+2.51.0.windows.1
+

@@ -6,10 +6,10 @@ into a regression that does not need a particular commercial game. Games remain
 integration tests. A title reaching a menu, or reporting 60 vblanks per second, is
 not evidence of correct gameplay.
 
-Current installed core: **`a9435d52a35a`**, validated and installed locally on
-October 4. The third iteration below resolves the reproduced sound-clock and
-vector-multiply defects. Earlier sections retain the evidence and promotion decisions from those
-iterations.
+Current installed core: **`a89bca51359a`**, validated and installed locally on
+October 4. The fifth iteration below extends SPU2 state coverage and reduces
+register-dispatch overhead. Earlier sections retain the evidence and promotion
+decisions from those iterations.
 
 ## First implementation: EE memory access
 
@@ -390,6 +390,86 @@ gitlink. Raw results are in `work/vu-fp-edge-before.log`,
 `work/round4-thps-cycle.log`, `work/round4-etm-cycle.log`,
 and `work/patch-replay-round4/report.json`.
 
+## Fifth implementation: SPU2 wrapper state and direct register dispatch
+
+Play patches 0051/0052, source commits `76fbc829` and `667940e8`, extend the
+sound-state work through the actual IOP subsystem archive path. The trial is
+`accuracy-spu2-dispatch`, binary `a89bca51359a`. Its preserved baseline is
+`accuracy-round4-baseline`, binary `709620516e21`.
+
+### Reproduced state omissions
+
+The SPU base cores already saved their active clocks and buffered input, but the
+SPU2 wrapper omitted SPDIF output/mode/media and each core's configured clock.
+Changing those values after saving, then loading, retained the later wrapper
+values. A subsequent CORE_ATTR write could therefore replace the restored active
+clock with a clock from the previous run. Reset also left the SPDIF registers
+unchanged. The initial IOP regression reproduces 65 failures across 147 checks.
+
+The wrapper now has its own archive member, restored after the base cores. The
+configured clock is kept distinct from the active base-core clock until the guest
+writes CORE_ATTR. Loading does not replay register writes or disturb buffered
+input. Reset clears the three SPDIF registers and bypass. Archives without the
+new member reconstruct only the bypass bit from the restored input state, clear
+the remaining omitted register bits, and use each wrapper core's 48 kHz default
+configured clock. Missing historical register values cannot be recovered exactly;
+the fallback is deterministic and does not depend on pre-load execution.
+
+The final suite has 295 passing checks: the original state cases plus routing
+checks across all 48 voices, both address-register banks, and upper volume banks.
+It uses the real CSubSystem SaveState/LoadState path, including the IRQ watcher,
+both sound cores and BIOS state. IRQ cases cover each combination of pending
+cores before/after rendering, followed by read-to-acknowledge replay. IRQ behavior
+was already serialized and required no implementation change. These tests verify
+state continuity under the existing model, not hardware-accurate IRQ timing.
+The existing 112 sample/DMA/clock replay checks also pass.
+
+### Dispatch optimization
+
+Read/write routing now uses compile-time specialization and direct calls instead
+of six stored std::function bindings and per-core member-function dispatch tables.
+The register decoding and register handlers are unchanged. A Wasm microbenchmark
+alternates voice-volume and input-volume reads/writes across both cores. Each
+round performs 16 million accesses and produces checksum `2148792064` in both
+builds. Excluding the first round, median time falls from 198.7 ms to 73.7 ms
+(about 63% less); a second baseline/candidate pair measures 209.9/83.0 ms.
+The 148 routing checks pass on both implementations.
+
+These are local Node/Wasm measurements of register dispatch, not a gameplay FPS
+or mobile-performance claim. General SPU mixing, arithmetic semantics, guest
+timing, and asynchronous queue behavior are unchanged.
+
+### Integration status
+
+The candidate passes 525 EE checks and all 21 upstream VU tests plus the upload
+regression. All 52 Play patches and seven CodeGen patches replay from the pinned
+baselines to the committed sources exactly, excluding Play's separately managed
+CodeGen gitlink; replay uses the staged Git patch blobs.
+
+All six fixed-frame comparisons against `709620516e21` pass: THPS4, Mirra and ATV2,
+each with VPU1 off and synchronous, catch-up disabled, and 120 emulated frames
+from the existing gameplay snapshots. All eight fingerprint fields match; this
+does not establish byte-identical full device state or hardware equivalence.
+
+THPS4 and Enter the Matrix each passed a 35-second asynchronous VPU1 gameplay
+probe with a save/load cycle at 18 seconds. Both reported `saved loaded`, resumed
+rendering, and had no reported browser/worker exception. Their final-ten-sample
+presentation rates were 60.0 and 59.9 pictures/sec. Post-load gameplay images were
+inspected, and both saved archives contain the new SPU2 wrapper member. These are
+short lifecycle checks, not long-play or new title-compatibility claims.
+
+The tested trial files were copied byte-for-byte to `public/cores/play/`, with
+cache version `a89bca51359a`. Wasm size is 3,338,619 bytes, down 4,348 bytes from
+the baseline despite adding serialization. The production build and app PS2
+unit/audio suites pass; the existing large-bundle warning remains. No deployment
+was performed.
+
+Evidence: `work/spu2-before.log`, `work/spu2-final.log`,
+`work/spu2-dispatch-{before,after,control,repeat}.log`, `work/spu-round5.log`,
+`work/ee-round5.log`, `work/vu-round5.log`, `work/accuracy-round5/`,
+`work/round5-{thps,etm}-cycle.log`, `work/round5-{thps,etm}-cycle/`,
+and `work/patch-replay-round5/report.json`.
+
 ## Validation commands
 
 Activate Emscripten, set `PLAY_SRC` if needed, and use Git Bash on Windows:
@@ -399,6 +479,8 @@ source /d/ps2build/emsdk/emsdk_env.sh
 engine/play/tests/run-ee-memory-tests.sh
 engine/play/tests/run-vu-tests.sh
 engine/play/tests/run-spu-state-tests.sh
+engine/play/tests/run-spu2-state-tests.sh
+engine/play/tests/run-spu2-state-tests.sh --bench
 engine/play/tests/run-wasm-multiply-tests.sh
 engine/play/tests/run-vu-fp-edge-tests.sh
 engine/play/tests/run-vu-status-tests.sh
@@ -445,7 +527,7 @@ gameplay, audio and save/load tests alongside them.
 | Guest timing | `CPS2VM::TakeCatchUpTicks` advances guest time based on host lateness; the existing VU/GIF model does not account for all device work in guest cycles. | Establish cycle-based VU/VIF/GIF completion and interrupt tests. Replace host-dependent timing shortcuts only when the modeled devices can deliver the same ordering under different host loads. Always disable catch-up in accuracy comparisons. |
 | DMA/VIF/GIF ordering | The asynchronous VPU1 queue has already required completion, interrupt and snapshot fixes. | Add small command-stream tests for partial transfers, FIFO backpressure, stalled interrupt delivery, DMA STR completion, reset and save/load. Compare single-thread and synchronous modes exactly; validate asynchronous mode by observable device ordering and gameplay, not wall-time fingerprints. |
 | GS memory coherence and pixels | OpenGL readback supports only part of the color/depth/format space; the software target path remains disabled after incorrect output. | Establish transfer/readback fixtures for 16/24/32-bit color/depth, aliasing, overlap, alpha, masks and scaled targets. Compare integer pixel values against hardware results, then fix format/coherence rules. Screenshot appearance alone cannot validate GS data used as commands. |
-| IOP HLE and disc/SPU scheduling | Source-clock and input-buffer restoration now have replay tests. Past `CdSync` failure involved a waiter waking after another thread started a read. | Audit remaining SPU2 wrapper registers and IRQ state; add scheduler tests for multiple waiters, callbacks, cancellation, priorities and read completion. Keep boot delays and audio-rate variations in integration runs. |
+| IOP HLE and disc/SPU scheduling | Source clocks, input buffering, SPU2 wrapper registers and IRQ replay now have component coverage. Past `CdSync` failure involved a waiter waking after another thread started a read. | Add scheduler tests for multiple waiters, callbacks, cancellation, priorities and read completion. Keep boot delays and audio-rate variations in integration runs; IRQ replay does not establish hardware timing. |
 
 The next concrete arithmetic tranche is uniform vector add/subtract rounding and PS2
 range/denormal behavior beyond the selected accurate blocks, using hardware-derived

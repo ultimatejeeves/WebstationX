@@ -12,6 +12,8 @@ sound-state restoration, general Wasm vector multiplication, and accurate-add ed
 regressions, and `tests/compare-core-states.mjs` for fixed-frame game comparisons.
 `tests/run-vu-fp-edge-tests.sh` exercises accurate EE ADD/SUB and VU ADDI,
 and `tests/run-vu-status-tests.sh` compares complete state after flag reads.
+`tests/run-spu2-state-tests.sh` exercises full IOP sound-state restoration and
+register routing; add `--bench` for the isolated SPU2 dispatch microbenchmark.
 
 **Current validation and limitations:** see [the October 1 review](REVIEW-2026-10-01.md) (ATV Offroad Fury 2:
 correct terrain, full speed, ~40 game frames per second in a race on the desktop below; what is left and why) and
@@ -97,6 +99,8 @@ Pinned upstream: Play! `83700b2c` (0.77-12), CodeGen `a5009f7`.
 | codegen/0007 + play/0048 | General Wasm vector multiply truncation and simpler sign/zero extraction | 320,000 multiply and 40,000 flag checks; all 21 upstream VU tests now pass without changing expected results |
 | play/0049 | Honor accurate ADDI on Wasm, register the shared accurate-add helper for EE/VU calls, and handle signed zeros, denormals and extended exponents in that helper | 392,162 model-derived edge, rounding, destination and pipeline checks; existing accurate-block selection is retained |
 | play/0050 | Assemble STATUS with comparisons and shifts | 400,000 complete-state comparisons; smaller generated status modules, with flag production and timing preserved |
+| play/0051 | Save/reset SPU2 wrapper registers and configured source clocks; deterministic legacy fallback | Actual IOP snapshot tests reproduce 65 failures before the fix; IRQ replay and all 295 state/routing checks pass afterwards |
+| play/0052 | Specialize SPU2 read/write dispatch into direct calls | Matching register-loop checksums and about 60–63% less dispatch time in local Wasm microbenchmarks; no claimed gameplay FPS gain |
 
 
 ## Build
