@@ -32,7 +32,7 @@
     "@types/ws": "^8.18.1",
     "concurrently": "^9.2.1",
     "cross-env": "^10.0.0",
-    "electron": "44.5.1",
+    "electron": "44.7.0",
     "electron-builder": "26.15.3",
     "esbuild": "^0.28.2",
     "puppeteer-core": "^25.12.0",
